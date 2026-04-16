@@ -609,6 +609,12 @@ class Filter:
         # drift bugs where old embeddings become incomparable.
         self._embedding_dim: Optional[int] = None
         self._embedding_dim_warned: bool = False
+        # Embedding circuit breaker: after N consecutive failures, trip and
+        # skip embedding calls entirely for a cool-down window. Prevents
+        # the inlet from blocking ~45s per request when Fireworks embeddings
+        # are 503ing.
+        self._embedding_consec_fail: int = 0
+        self._embedding_trip_until: float = 0.0
 
         self.categories = {
             "FACTUAL": "Objective inquiries requiring real-world verification. Focus on data, laws, prices, and current events.",
@@ -792,6 +798,12 @@ class Filter:
             return f"[Web Search Failed: {e}]"
 
     async def _get_embedding(self, text: str) -> list:
+        # Circuit breaker: skip the network round-trip entirely while
+        # the provider is known-bad. Callers already treat [] as "no
+        # embedding available" and fall through gracefully (LLM classifier
+        # for routing, no memory recall for chat memory).
+        if time.time() < self._embedding_trip_until:
+            return []
         try:
 
             async def _do_embed():
@@ -808,13 +820,37 @@ class Filter:
                     data = await resp.json()
                     return data["data"][0]["embedding"]
 
-            return await _retry_request(_do_embed)
+            result = await _retry_request(_do_embed)
+            # Reset consecutive-fail counter on success.
+            self._embedding_consec_fail = 0
+            return result
         except _NonRetryableError as e:
+            self._embedding_consec_fail += 1
+            self._maybe_trip_embedding_breaker()
             logger.warning("Embedding non-retryable error for '%s…': %s", text[:50], e)
             return []
         except Exception as e:
+            self._embedding_consec_fail += 1
+            self._maybe_trip_embedding_breaker()
             logger.warning("Embedding failed after retries for '%s…': %s", text[:50], e)
             return []
+
+    def _maybe_trip_embedding_breaker(self) -> None:
+        """Trip the embedding circuit breaker after repeated failures.
+
+        Thresholds: trip on 2 consecutive fails, cool-down 60 seconds.
+        Keeps the inlet responsive during provider outages — without the
+        breaker, 5 anchor-category embeddings × 3-retry × 3s timeout can
+        block the first request of a session for ~45 seconds.
+        """
+        if self._embedding_consec_fail >= 2:
+            self._embedding_trip_until = time.time() + 60.0
+            logger.warning(
+                "Embedding circuit breaker TRIPPED — skipping embedding calls "
+                "for 60s after %d consecutive failures.",
+                self._embedding_consec_fail,
+            )
+            self._embedding_consec_fail = 0
 
     async def _call_llm(
         self,
