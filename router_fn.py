@@ -75,25 +75,38 @@ VISION_CAPABLE_MODELS = frozenset(
 # classifier/verifier, best quality first for main/caption).
 # Updated 2026-04-16 via live API testing.
 CLASSIFIER_FALLBACK_CHAIN = [
-    "accounts/fireworks/models/mixtral-8x22b-instruct",  # $1.20/1M — primary, great at classification
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",  # $0.15/$0.60 — cheap, returns just the category name
-    "accounts/fireworks/models/gpt-oss-20b",  # $0.07/$0.30 — cheapest, reasons first but works
+    # Fireworks-only fallbacks. Primary is the CLASSIFIER_MODEL Valve,
+    # which defaults to a Groq model for speed.
+    "accounts/fireworks/models/mixtral-8x22b-instruct",
+    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
+    "accounts/fireworks/models/gpt-oss-20b",
 ]
 
 VERIFIER_FALLBACK_CHAIN = [
-    # Verifier must emit a single-line PASS:/FAIL: verdict.  Reasoning models
-    # (deepseek-v3p1, gpt-oss, kimi-thinking) ignore the output-format
-    # instruction and emit prose → unparseable verdicts → fail-open.
-    # Keep this chain instruction-following-only.
-    "accounts/fireworks/models/mixtral-8x22b-instruct",   # $1.20/1M primary
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",  # $0.15/$0.60 — short replies, respects format
-    "accounts/fireworks/models/kimi-k2p5",  # $0.60/$3.00 — non-thinking Kimi, follows format
+    # Verifier must emit a single-line PASS:/FAIL: verdict. Reasoning
+    # models ignore format → unparseable verdicts → fail-open. Keep this
+    # chain instruction-following-only. Primary (the VERIFIER_MODEL Valve)
+    # defaults to a Groq model for speed.
+    "accounts/fireworks/models/mixtral-8x22b-instruct",
+    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
+    "accounts/fireworks/models/kimi-k2p5",
 ]
 
 CAPTION_FALLBACK_CHAIN = [
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",  # $0.15/$0.60 — primary, accurate concise captions
-    "accounts/fireworks/models/kimi-k2p5",  # $0.60/$3.00 — works but verbose and expensive
+    # Primary is the IMAGE_CAPTION_MODEL Valve (Fireworks qwen3-vl by
+    # default — tested and known quality). Groq Llama 4 Scout added as a
+    # secondary so captioning survives a Fireworks vision outage.
+    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    "accounts/fireworks/models/kimi-k2p5",
 ]
+
+# --- Provider routing -------------------------------------------------------
+# Models prefixed "groq/" hit api.groq.com. Anything else → Fireworks.
+# Keeps the fallback-chain abstraction unchanged while allowing a mixed stack.
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"
+GROQ_PREFIX = "groq/"
 
 THINKING_BLOCK_RE = re.compile(
     r"<think>.*?</think>|<tool_call>.*?</tool_call>", re.DOTALL
@@ -360,6 +373,13 @@ class Filter:
         FIREWORKS_API_KEY: str = Field(
             default="", description="Your Fireworks.ai API Key."
         )
+        GROQ_API_KEY: str = Field(
+            default="",
+            description="Your Groq API key. When a model name starts with "
+            "'groq/' the request goes to api.groq.com instead of Fireworks. "
+            "Leave empty to disable Groq — the fallback chain will skip any "
+            "Groq-prefixed models and go straight to Fireworks.",
+        )
         TAVILY_API_KEY: str = Field(
             default="", description="Your Tavily API Key for web search."
         )
@@ -367,18 +387,22 @@ class Filter:
             default="nomic-ai/nomic-embed-text-v1.5", description="Intent vectors."
         )
         CLASSIFIER_MODEL: str = Field(
-            default="accounts/fireworks/models/mixtral-8x22b-instruct",
-            description="Routing model. Must be present on your Fireworks account. "
-            "mixtral is the cheapest catalog option and handles intent classification fine.",
+            default="groq/llama-3.1-8b-instant",
+            description="Routing model. Defaults to Groq's Llama-3.1-8B-Instant — "
+            "~750 tok/s, $0.05/$0.08 per 1M tokens. Fireworks fallback kicks in on "
+            "Groq 503 / rate-limit. Set back to accounts/fireworks/models/"
+            "mixtral-8x22b-instruct if you want Fireworks primary.",
         )
         MAIN_MODEL: str = Field(
             default="accounts/fireworks/models/glm-5p1", description="Heavy model."
         )
         VERIFIER_MODEL: str = Field(
-            default="accounts/fireworks/models/mixtral-8x22b-instruct",
-            description="Citation auditor model. Use an instruction-following model (not a reasoning one) — "
-            "the verifier needs to emit a clean PASS/FAIL line, not chain-of-thought. "
-            "Mixtral respects output-format instructions more reliably than deepseek/glm for this task.",
+            default="groq/llama-3.3-70b-versatile",
+            description="Citation auditor. Defaults to Groq's Llama-3.3-70B-Versatile — "
+            "fast instruction-follower, emits clean PASS/FAIL verdicts. Falls back to "
+            "Fireworks mixtral/qwen3-vl/kimi-k2p5 on Groq outage. Do NOT point this at "
+            "a reasoning model (gpt-oss, deepseek thinking, kimi-thinking) — they "
+            "ignore the format instruction and produce unparseable verdicts.",
         )
         ROUTING_THRESHOLD: float = Field(
             default=0.6,
@@ -723,6 +747,30 @@ class Filter:
             self._session_lock = asyncio.Lock()
         return self._session_lock
 
+    def _dispatch_model(self, model: str) -> tuple[str, str, str, dict]:
+        """Resolve (base_url, api_key, stripped_model_id, extra_headers) for a model.
+
+        Model strings prefixed with 'groq/' are routed to api.groq.com using
+        GROQ_API_KEY. Anything else hits Fireworks with FIREWORKS_API_KEY
+        plus the x-session-affinity header for prompt-cache locality.
+
+        Returns api_key="" for Groq-prefixed models when GROQ_API_KEY is
+        unset — caller should skip such models in the fallback chain.
+        """
+        if model.startswith(GROQ_PREFIX):
+            return (
+                GROQ_BASE_URL,
+                self.valves.GROQ_API_KEY,
+                model[len(GROQ_PREFIX):],
+                {},
+            )
+        return (
+            FIREWORKS_BASE_URL,
+            self.valves.FIREWORKS_API_KEY,
+            model,
+            {"x-session-affinity": self._session_affinity_id},
+        )
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is not None and not self._session.closed:
             return self._session
@@ -877,6 +925,10 @@ class Filter:
             for fb in fallback_chain:
                 if fb != model and fb not in models_to_try:
                     models_to_try.append(fb)
+        # Drop Groq-prefixed models when no Groq key is configured —
+        # keeps the fallback chain honest without forcing a config edit.
+        if not self.valves.GROQ_API_KEY:
+            models_to_try = [m for m in models_to_try if not m.startswith(GROQ_PREFIX)]
 
         last_err = None
         for i, m in enumerate(models_to_try):
@@ -887,16 +939,18 @@ class Filter:
             try:
 
                 async def _do_call(model_name=m):
+                    base_url, api_key, model_id, extra_headers = self._dispatch_model(model_name)
                     session = await self._get_session()
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        **extra_headers,
+                    }
                     async with session.post(
-                        "https://api.fireworks.ai/inference/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.valves.FIREWORKS_API_KEY}",
-                            "Content-Type": "application/json",
-                            "x-session-affinity": self._session_affinity_id,
-                        },
+                        f"{base_url}/chat/completions",
+                        headers=headers,
                         json={
-                            "model": model_name,
+                            "model": model_id,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": max_tokens,
                             "temperature": 0.0,
@@ -1196,6 +1250,9 @@ class Filter:
         if self.valves.IMAGE_CAPTION_MODEL in models_to_try:
             models_to_try.remove(self.valves.IMAGE_CAPTION_MODEL)
         models_to_try.insert(0, self.valves.IMAGE_CAPTION_MODEL)
+        # Drop Groq-prefixed models when GROQ_API_KEY is unset.
+        if not self.valves.GROQ_API_KEY:
+            models_to_try = [m for m in models_to_try if not m.startswith(GROQ_PREFIX)]
 
         last_err = None
         for i, model_name in enumerate(models_to_try):
@@ -1205,15 +1262,18 @@ class Filter:
             try:
 
                 async def _do_vision_call(mn=model_name):
+                    base_url, api_key, model_id, extra_headers = self._dispatch_model(mn)
                     session = await self._get_session()
+                    headers = {
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        **extra_headers,
+                    }
                     async with session.post(
-                        "https://api.fireworks.ai/inference/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.valves.FIREWORKS_API_KEY}",
-                            "Content-Type": "application/json",
-                        },
+                        f"{base_url}/chat/completions",
+                        headers=headers,
                         json={
-                            "model": mn,
+                            "model": model_id,
                             "messages": [{"role": "user", "content": vision_content}],
                             "max_tokens": max_tokens,
                             "temperature": 0.0,
