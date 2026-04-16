@@ -286,6 +286,29 @@ def _memory_content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8", errors="replace")).hexdigest()
 
 
+def _first_name(raw: Optional[str]) -> str:
+    """Pull a sensible first name out of an OWUI __user__.name.
+
+    Handles common shapes:
+      "Rajarshi Ghoshal"       → "Rajarshi"
+      "Jane Doe"      → "Jane"
+      "rajarshi@example.com"   → "rajarshi"  (local-part of email)
+      "admin"                  → "admin"     (single token, as-is)
+      None / "" / punctuation  → ""
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    # Email-shaped — take local part (before @) and drop any trailing dots/digits.
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    # First alphabetic token
+    m = re.match(r"[A-Za-z][A-Za-z'\-]{0,39}", s)
+    return m.group(0) if m else ""
+
+
 def _fts5_safe_query(text: str) -> str:
     """Turn free-form text into a safe FTS5 MATCH pattern.
 
@@ -504,6 +527,14 @@ class Filter:
             default=500,
             description="Hard cap on stored turns per chat. Oldest are dropped when exceeded. "
             "Prevents a single runaway chat from eating disk space.",
+        )
+        ADDRESS_USER_BY_NAME: bool = Field(
+            default=True,
+            description="When set, the user's name (from OWUI's __user__.name) is "
+            "injected into the system prompt so the model refers to them by name "
+            "instead of 'the user'. Name is NEVER persisted to memory — it's a "
+            "per-turn transient. The prompt asks the model to avoid sycophantic "
+            "over-use (e.g., not greeting by name every turn).",
         )
         ENABLE_HYBRID_RETRIEVAL: bool = Field(
             default=True,
@@ -2219,6 +2250,13 @@ class Filter:
             header += "\n"
         return header + body_text + trailer
 
+    @staticmethod
+    def _extract_user_name(user_obj: Optional[dict]) -> str:
+        """Pull a first name out of OWUI's __user__ context. Empty on failure."""
+        if not user_obj:
+            return ""
+        return _first_name(user_obj.get("name") or user_obj.get("username"))
+
     async def inlet(
         self,
         body: dict,
@@ -2461,6 +2499,17 @@ class Filter:
                 await self._emit_status(
                     __event_emitter__,
                     f"🧠 Recalled {len(recalled)} prior turn(s) from this chat.",
+                )
+
+        if self.valves.ADDRESS_USER_BY_NAME:
+            user_name = self._extract_user_name(__user__)
+            if user_name:
+                system_content += (
+                    f"USER IDENTITY: You are chatting with {user_name}. "
+                    f"In any reply or internal reasoning, refer to them as "
+                    f"{user_name}, not as 'the user'. Do not greet by name "
+                    f"every turn and never use their name more than once per "
+                    f"reply — natural mention only, no sycophancy.\n\n"
                 )
 
         system_content += (
