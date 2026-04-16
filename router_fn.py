@@ -514,6 +514,27 @@ class Filter:
             "standalone form before embedding for recall. Fails open — uses the original "
             "query if the rewrite call fails.",
         )
+        ENABLE_CHAT_MEMORY_COMPRESSION: bool = Field(
+            default=True,
+            description="When a chat exceeds CHAT_MEMORY_COMPRESS_WHEN_OVER stored turns, "
+            "summarize the oldest CHAT_MEMORY_COMPRESS_CHUNK turns into a single "
+            "role='summary' row via the main model, then delete the originals. Lossy but "
+            "keeps the chat's long-horizon context available without unbounded growth. "
+            "Fires as a background task (asyncio.create_task) so it never delays replies.",
+        )
+        CHAT_MEMORY_COMPRESS_WHEN_OVER: int = Field(
+            default=60,
+            description="Trigger compression when a chat has more than N stored turns. "
+            "Below this threshold we rely on raw recall — compression only kicks in for "
+            "genuinely long chats.",
+        )
+        CHAT_MEMORY_COMPRESS_CHUNK: int = Field(
+            default=20,
+            description="Number of oldest turns summarized into a single summary each "
+            "time compression fires. With defaults (trigger=60, chunk=20), after the "
+            "first compression the chat has ~40 raw turns + 1 summary covering the "
+            "pre-40 era.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -1612,6 +1633,110 @@ class Filter:
             return None
         return cleaned
 
+    async def _maybe_compress_old_turns(self, chat_id: str) -> None:
+        """When a chat grows large, summarize its oldest turns into one row.
+
+        Runs as a background task from outlet (asyncio.create_task) so the
+        LLM call doesn't block the user's reply. Lossy compaction — the
+        original turns are DELETED after the summary is successfully stored.
+
+        Safety:
+          - Only fires when total stored turns > CHAT_MEMORY_COMPRESS_WHEN_OVER
+          - Never touches role='summary' rows (avoids summarizing summaries
+            on repeated runs, at least until they too age past the chunk).
+          - If summary-LLM fails, returns without modifying anything.
+          - All DB operations in one commit, so partial failures don't
+            half-delete rows.
+        """
+        if not self.valves.ENABLE_CHAT_MEMORY_COMPRESSION or not chat_id:
+            return
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return
+        try:
+            trigger = self.valves.CHAT_MEMORY_COMPRESS_WHEN_OVER
+            chunk = self.valves.CHAT_MEMORY_COMPRESS_CHUNK
+            # Total non-summary rows; summaries are themselves compact already.
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chat_turns "
+                "WHERE chat_id=? AND role != 'summary'",
+                (chat_id,),
+            ).fetchone()[0]
+            if total <= trigger:
+                return
+            # Pick the oldest `chunk` non-summary turns. Post-compression we'll
+            # still have (total - chunk) raw turns + any existing summaries.
+            candidates = list(
+                conn.execute(
+                    "SELECT id, role, content FROM chat_turns "
+                    "WHERE chat_id=? AND role != 'summary' "
+                    "ORDER BY created_at ASC LIMIT ?",
+                    (chat_id, chunk),
+                )
+            )
+            if len(candidates) < 5:
+                # Not enough to make a meaningful summary; skip.
+                return
+            block = "\n".join(
+                f"[{role}]: {content[:500]}" for _, role, content in candidates
+            )
+            prompt = (
+                "Summarize the following conversation turns into a concise, "
+                "information-dense paragraph suitable for later semantic recall. "
+                "Preserve: facts, decisions, user preferences, code/commands discussed, "
+                "URLs, paper titles. Omit: greetings, pleasantries, exact phrasing. "
+                "Target 200–400 words, single paragraph.\n\n"
+                "CONVERSATION TURNS:\n"
+                f"{block}\n\n"
+                "SUMMARY:"
+            )
+            summary = await self._call_llm(
+                prompt,
+                self.valves.MAIN_MODEL,
+                max_tokens=500,
+            )
+            if not summary:
+                return
+            summary_clean = _strip_thinking_blocks(summary).strip()
+            if len(summary_clean) < 50:
+                return
+            ch = _memory_content_hash(summary_clean)
+            # If by rare chance this exact summary already exists for this
+            # chat, skip rather than INSERT OR IGNORE (which would orphan
+            # the originals we're about to delete).
+            already = conn.execute(
+                "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=? LIMIT 1",
+                (chat_id, ch),
+            ).fetchone()
+            vec = await self._get_embedding(summary_clean[:2000])
+            emb_blob = _f32_pack(vec) if vec else None
+            ids_to_delete = [c[0] for c in candidates]
+            qs = ",".join("?" * len(ids_to_delete))
+            # Single transaction: insert summary + delete originals
+            if not already:
+                conn.execute(
+                    "INSERT INTO chat_turns "
+                    "(chat_id, role, content, content_hash, embedding, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (chat_id, "summary", summary_clean, ch, emb_blob, time.time()),
+                )
+            conn.execute(
+                f"DELETE FROM chat_turns WHERE id IN ({qs})",
+                tuple(ids_to_delete),
+            )
+            conn.commit()
+            logger.info(
+                "Chat memory compression: chat=%s summarized %d turns",
+                str(chat_id)[:20],
+                len(ids_to_delete),
+            )
+        except Exception as e:
+            logger.warning(
+                "Chat memory compression failed (chat=%s): %s",
+                str(chat_id)[:20],
+                e,
+            )
+
     async def _maybe_cleanup_memories(self) -> None:
         """Probabilistic GC (~1% of outlet calls). Two sweeps:
 
@@ -2293,6 +2418,13 @@ class Filter:
                 asst_text = _extract_text(body["messages"][-1].get("content", ""))
                 await self._store_chat_turn(chat_id_out, "assistant", asst_text)
                 await self._maybe_cleanup_memories()
+                # Compression runs as a background task — it calls the main
+                # model which can take several seconds. Firing-and-forgetting
+                # keeps the user's reply latency at zero cost from this path.
+                if self.valves.ENABLE_CHAT_MEMORY_COMPRESSION:
+                    asyncio.create_task(
+                        self._maybe_compress_old_turns(chat_id_out)
+                    )
 
         return body
 
