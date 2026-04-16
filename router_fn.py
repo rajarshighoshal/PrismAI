@@ -1737,12 +1737,63 @@ class Filter:
                 e,
             )
 
-    async def _maybe_cleanup_memories(self) -> None:
-        """Probabilistic GC (~1% of outlet calls). Two sweeps:
+    async def _referential_sweep(self) -> None:
+        """Delete memory rows for chat_ids that no longer exist in webui.db.
 
-        1. TTL: delete rows older than CHAT_MEMORY_TTL_DAYS.
-        2. Referential: delete rows for chat_ids that no longer exist in
-           OWUI's webui.db 'chat' table (user deleted the chat in the UI).
+        Runs on EVERY outlet (deterministic, NOT probabilistic). Cheap:
+        two small SELECTs + set difference. When no orphans exist, the
+        DELETE is skipped entirely — total overhead is well under 5 ms.
+
+        This is the privacy-critical path: when a user deletes a chat in
+        the OWUI UI, their memory rows must disappear promptly, not
+        after 100+ outlet calls' worth of dice rolls.
+        """
+        conn = await self._get_memory_conn()
+        if conn is None:
+            return
+        webui_db = "/app/backend/data/webui.db"
+        if not os.path.exists(webui_db):
+            return
+        try:
+            alive = sqlite3.connect(
+                f"file:{webui_db}?mode=ro", uri=True, timeout=2
+            )
+            try:
+                alive_ids = {r[0] for r in alive.execute("SELECT id FROM chat")}
+            finally:
+                alive.close()
+            # Defensive: if webui.db's chat table looks empty, assume it's
+            # momentarily locked/unavailable and skip. Better to leave rows
+            # intact for a moment than to mass-delete based on stale read.
+            if not alive_ids:
+                return
+            memory_ids = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT DISTINCT chat_id FROM chat_turns"
+                )
+            }
+            orphans = memory_ids - alive_ids
+            if not orphans:
+                return
+            qs = ",".join("?" * len(orphans))
+            removed = conn.execute(
+                f"DELETE FROM chat_turns WHERE chat_id IN ({qs})",
+                tuple(orphans),
+            ).rowcount
+            conn.commit()
+            logger.info(
+                "Chat memory referential sweep: %d rows across %d orphan chat(s)",
+                removed,
+                len(orphans),
+            )
+        except Exception as e:
+            logger.warning("Chat memory referential sweep failed: %s", e)
+
+    async def _maybe_ttl_sweep(self) -> None:
+        """TTL-based deletion. Still probabilistic (~1% of outlet calls)
+        because it can touch many rows and age-based deletion isn't a
+        privacy concern — just hygiene for the very-old tail.
         """
         if random.random() > 0.01:
             return
@@ -1750,50 +1801,15 @@ class Filter:
         if conn is None:
             return
         try:
-            # 1. TTL sweep
             cutoff = time.time() - self.valves.CHAT_MEMORY_TTL_DAYS * 86400
-            ttl_removed = conn.execute(
+            removed = conn.execute(
                 "DELETE FROM chat_turns WHERE created_at < ?", (cutoff,)
             ).rowcount
-
-            # 2. Referential sweep — cross-check against webui.db.chat.
-            orphan_removed = 0
-            webui_db = "/app/backend/data/webui.db"
-            if os.path.exists(webui_db):
-                try:
-                    alive = sqlite3.connect(
-                        f"file:{webui_db}?mode=ro", uri=True, timeout=2
-                    )
-                    try:
-                        alive_ids = {r[0] for r in alive.execute("SELECT id FROM chat")}
-                    finally:
-                        alive.close()
-                    if alive_ids:
-                        memory_ids = {
-                            r[0]
-                            for r in conn.execute(
-                                "SELECT DISTINCT chat_id FROM chat_turns"
-                            )
-                        }
-                        orphans = memory_ids - alive_ids
-                        if orphans:
-                            qs = ",".join("?" * len(orphans))
-                            orphan_removed = conn.execute(
-                                f"DELETE FROM chat_turns WHERE chat_id IN ({qs})",
-                                tuple(orphans),
-                            ).rowcount
-                except Exception as e:
-                    logger.warning("Chat memory referential GC failed: %s", e)
-
             conn.commit()
-            if ttl_removed or orphan_removed:
-                logger.info(
-                    "Chat memory GC: ttl_removed=%d orphan_removed=%d",
-                    ttl_removed,
-                    orphan_removed,
-                )
+            if removed:
+                logger.info("Chat memory TTL sweep: %d old rows removed", removed)
         except Exception as e:
-            logger.warning("Chat memory cleanup failed: %s", e)
+            logger.warning("Chat memory TTL sweep failed: %s", e)
 
     def _build_classifier_prompt(self, messages: list, image_caption: str = "") -> str:
         recent = messages[-3:]
@@ -2417,7 +2433,11 @@ class Filter:
                 # storing — the memory entry is just the actual answer.
                 asst_text = _extract_text(body["messages"][-1].get("content", ""))
                 await self._store_chat_turn(chat_id_out, "assistant", asst_text)
-                await self._maybe_cleanup_memories()
+                # Referential sweep every outlet — privacy-critical, cheap.
+                # Deleted chats must lose their memory rows promptly.
+                await self._referential_sweep()
+                # TTL sweep probabilistic — not privacy-critical.
+                await self._maybe_ttl_sweep()
                 # Compression runs as a background task — it calls the main
                 # model which can take several seconds. Firing-and-forgetting
                 # keeps the user's reply latency at zero cost from this path.
