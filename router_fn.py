@@ -81,9 +81,13 @@ CLASSIFIER_FALLBACK_CHAIN = [
 ]
 
 VERIFIER_FALLBACK_CHAIN = [
-    "accounts/fireworks/models/mixtral-8x22b-instruct",  # $1.20/1M — primary, follows output format instructions
-    "accounts/fireworks/models/deepseek-v3p1",  # $0.56/$1.68 — good instruction following
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",  # $0.15/$0.60 — last resort
+    # Verifier must emit a single-line PASS:/FAIL: verdict.  Reasoning models
+    # (deepseek-v3p1, gpt-oss, kimi-thinking) ignore the output-format
+    # instruction and emit prose → unparseable verdicts → fail-open.
+    # Keep this chain instruction-following-only.
+    "accounts/fireworks/models/mixtral-8x22b-instruct",   # $1.20/1M primary
+    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",  # $0.15/$0.60 — short replies, respects format
+    "accounts/fireworks/models/kimi-k2p5",  # $0.60/$3.00 — non-thinking Kimi, follows format
 ]
 
 CAPTION_FALLBACK_CHAIN = [
@@ -535,6 +539,14 @@ class Filter:
             "first compression the chat has ~40 raw turns + 1 summary covering the "
             "pre-40 era.",
         )
+        COMPRESSION_MODEL: str = Field(
+            default="",
+            description="Model used for memory compression summaries. Leave empty "
+            "to use MAIN_MODEL (billed at normal chat rate). For cost savings, set "
+            "this to a cheap instruction-following model — e.g. "
+            "accounts/fireworks/models/mixtral-8x22b-instruct — since summarization "
+            "doesn't need a reasoning model.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -556,6 +568,16 @@ class Filter:
         self._memory_conn: Optional[sqlite3.Connection] = None
         self._memory_conn_lock: Optional[asyncio.Lock] = None
         self._memory_disabled: bool = False
+        # Per-chat compression locks — prevents two outlet callbacks on the
+        # same chat_id from running simultaneous compression jobs, which
+        # would cost double LLM tokens and produce duplicate summary rows.
+        self._compression_locks: dict[str, asyncio.Lock] = {}
+        # Expected embedding dimension, captured on the first stored row of
+        # this process. Subsequent rows with a different dim are flagged
+        # via a single logged warning — silence would hide EMBEDDING_MODEL
+        # drift bugs where old embeddings become incomparable.
+        self._embedding_dim: Optional[int] = None
+        self._embedding_dim_warned: bool = False
 
         self.categories = {
             "FACTUAL": "Objective inquiries requiring real-world verification. Focus on data, laws, prices, and current events.",
@@ -1526,14 +1548,38 @@ class Filter:
             if already:
                 return
             vec = await self._get_embedding(content[:2000])
-            emb_blob = _f32_pack(vec) if vec else None
+            emb_blob = None
+            if vec:
+                # Capture the expected dim on the first embedded row. Later
+                # rows with a mismatched dim get a single-shot warning — this
+                # surfaces EMBEDDING_MODEL drift that otherwise silently
+                # makes old embeddings incomparable to new queries.
+                if self._embedding_dim is None:
+                    self._embedding_dim = len(vec)
+                elif (
+                    len(vec) != self._embedding_dim
+                    and not self._embedding_dim_warned
+                ):
+                    logger.warning(
+                        "Embedding dimension changed: expected %d, got %d. "
+                        "EMBEDDING_MODEL may have been updated — old stored "
+                        "vectors are now incomparable to new queries and will "
+                        "be silently skipped at recall. Consider clearing "
+                        "chat_turns.embedding or switching back.",
+                        self._embedding_dim,
+                        len(vec),
+                    )
+                    self._embedding_dim_warned = True
+                emb_blob = _f32_pack(vec)
+
+            # Insert + cap enforcement in a single commit — no crash-window
+            # where INSERT lands but cap doesn't fire.
             conn.execute(
                 "INSERT OR IGNORE INTO chat_turns "
                 "(chat_id, role, content, content_hash, embedding, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (chat_id, role, content, ch, emb_blob, time.time()),
             )
-            # Per-chat size cap — keep newest CHAT_MEMORY_MAX_TURNS_PER_CHAT.
             max_n = self.valves.CHAT_MEMORY_MAX_TURNS_PER_CHAT
             conn.execute(
                 "DELETE FROM chat_turns WHERE id IN ("
@@ -1598,12 +1644,19 @@ class Filter:
             # cosine similarity (shifted from [-1,1]).
             content_by_hash: dict[str, tuple[str, str]] = {}
             cos_by_hash: dict[str, float] = {}
+            qdim = len(qvec)
             for role, content, ch, emb_blob in rows:
                 if ch in exclude_hashes or not emb_blob:
                     continue
                 try:
                     vec = _f32_unpack(emb_blob)
                 except Exception:
+                    continue
+                # Dim-mismatch guard: cosine similarity of mismatched vectors
+                # raises ValueError (numpy) or returns garbage (pure python).
+                # Silently skip rather than let old/new embedder rows poison
+                # the score distribution.
+                if len(vec) != qdim:
                     continue
                 cos = _cosine_similarity(qvec, vec)
                 content_by_hash[ch] = (role, content)
@@ -1740,6 +1793,21 @@ class Filter:
             return None
         return cleaned
 
+    def _get_compression_lock(self, chat_id: str) -> asyncio.Lock:
+        """Return a per-chat asyncio.Lock, creating on first access.
+
+        Storing one lock per chat (rather than a single global lock)
+        means concurrent compressions on DIFFERENT chats can still
+        proceed in parallel. Locks are never garbage-collected — for a
+        family server with O(hundreds) of chats, the footprint stays
+        negligible.
+        """
+        lock = self._compression_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._compression_locks[chat_id] = lock
+        return lock
+
     async def _maybe_compress_old_turns(self, chat_id: str) -> None:
         """When a chat grows large, summarize its oldest turns into one row.
 
@@ -1760,6 +1828,20 @@ class Filter:
         conn = await self._get_memory_conn()
         if conn is None:
             return
+        # Per-chat lock: two concurrent outlets on the same chat won't both
+        # launch compression jobs. For different chats the locks are distinct,
+        # so parallel compressions across chats are unaffected.
+        lock = self._get_compression_lock(chat_id)
+        if lock.locked():
+            # Another compression already in flight for this chat — skip.
+            return
+        async with lock:
+            await self._run_compression_unlocked(conn, chat_id)
+
+    async def _run_compression_unlocked(
+        self, conn: sqlite3.Connection, chat_id: str
+    ) -> None:
+        """Body of _maybe_compress_old_turns; caller holds the per-chat lock."""
         try:
             trigger = self.valves.CHAT_MEMORY_COMPRESS_WHEN_OVER
             chunk = self.valves.CHAT_MEMORY_COMPRESS_CHUNK
@@ -1799,7 +1881,7 @@ class Filter:
             )
             summary = await self._call_llm(
                 prompt,
-                self.valves.MAIN_MODEL,
+                self.valves.COMPRESSION_MODEL or self.valves.MAIN_MODEL,
                 max_tokens=500,
                 log_role="summary",
                 log_chat_id=chat_id,
@@ -2045,6 +2127,30 @@ class Filter:
         if fail_match:
             reason = fail_match.group(1).strip() or "unspecified"
             return False, reason
+
+        # No explicit PASS/FAIL marker. Reasoning/chatty models often emit
+        # prose like "The citations appear accurate" or "The response contains
+        # hallucinated URLs". Keyword-based fallback before fail-opening.
+        # IMPORTANT: word-boundary matching, NOT substring — otherwise
+        # "unsupported" matches "supported" and both verdicts collide.
+        lower = cleaned.lower()
+        # Stems that are unambiguously fail-leaning. Multi-word phrases
+        # matched with a flexible space.
+        fail_re = re.compile(
+            r"\b(hallucinat\w*|fabricat\w*|invent(?:ed|s|ing)?|incorrect|"
+            r"unsupported|uncited|mismatch\w*|wrong|fail(?:ed|s|ing)?)\b"
+            r"|\bnot\s+supported\b|\bdoes(?:n'?t|\s+not)\s+match\b"
+            r"|\bmissing\s+citation\b"
+        )
+        pass_re = re.compile(
+            r"\b(accurate|correct|verified|matches|valid|legitimate|genuine)\b"
+        )
+        has_fail = bool(fail_re.search(lower))
+        has_pass = bool(pass_re.search(lower))
+        if has_fail and not has_pass:
+            return False, f"keyword-fallback FAIL: {cleaned[:120]}"
+        if has_pass and not has_fail:
+            return True, f"keyword-fallback PASS: {cleaned[:120]}"
 
         logger.warning(
             "Verifier verdict unparseable — fail-open. Raw: %s", cleaned[:200]
