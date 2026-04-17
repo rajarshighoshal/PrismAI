@@ -303,9 +303,9 @@ def _first_name(raw: Optional[str]) -> str:
     """Pull a sensible first name out of an OWUI __user__.name.
 
     Handles common shapes:
-      "Rajarshi Ghoshal"       → "Rajarshi"
-      "Jane Doe"      → "Jane"
-      "rajarshi@example.com"   → "rajarshi"  (local-part of email)
+      "Jane Doe"               → "Jane"
+      "Alex Chen"              → "Alex"
+      "jane@example.com"       → "jane"      (local-part of email)
       "admin"                  → "admin"     (single token, as-is)
       None / "" / punctuation  → ""
     """
