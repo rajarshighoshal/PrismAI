@@ -2,7 +2,7 @@
 title: Advanced Hybrid Router & Interceptor
 description: Accuracy-first router. Semantic routing + sticky follow-up + contextual classifier + strict citation enforcement (inlet prompts + outlet regen) + WebUI status emission.
 author: rajarshi
-version: 9.5
+version: 9.6
 """
 
 import asyncio
@@ -59,46 +59,51 @@ FORCE_SEARCH_PATTERNS = [
 
 CATEGORY_NAMES = frozenset({"FACTUAL", "REASONING", "CODING", "RESEARCH", "CASUAL"})
 
-# Models confirmed to natively accept image_url content parts on Fireworks.
+# Models confirmed to natively accept image_url content parts. Verified
+# 2026-05-23 via live probes against the Fireworks /chat/completions and
+# Groq /chat/completions endpoints on this account.
 # All other models will have images replaced with text captions (vision proxy).
-# Updated 2026-04-15 via live API testing — Fireworks metadata is unreliable.
+# NOTE: deepseek-v4-pro/v4-flash exist on Fireworks but are TEXT-ONLY
+# ("This model does not support image inputs"); GLM-5.1 and GPT-OSS-120B
+# are also text-only. They must NOT be in this set — the proxy will caption
+# their images first, which is the correct behavior.
 VISION_CAPABLE_MODELS = frozenset(
     {
-        "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
         "accounts/fireworks/models/kimi-k2p5",
-        "accounts/fireworks/models/deepseek-v3p1",
+        "accounts/fireworks/models/kimi-k2p6",
+        "groq/meta-llama/llama-4-scout-17b-16e-instruct",
     }
 )
 
 # Fallback model chains — when the primary model is down (503, timeout),
-# try the next one in the chain. Ordered by cost (cheapest first for
-# classifier/verifier, best quality first for main/caption).
-# Updated 2026-04-16 via live API testing.
+# try the next one in the chain. Every entry below is verified accessible
+# on this account 2026-05-23 (Fireworks /models endpoint + live probe).
 CLASSIFIER_FALLBACK_CHAIN = [
     # Fireworks-only fallbacks. Primary is the CLASSIFIER_MODEL Valve,
-    # which defaults to a Groq model for speed.
-    "accounts/fireworks/models/mixtral-8x22b-instruct",
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
-    "accounts/fireworks/models/gpt-oss-20b",
+    # which defaults to a Groq model for speed. Ordered cheapest first.
+    "accounts/fireworks/models/gpt-oss-120b",   # $0.15/$0.60
+    "accounts/fireworks/models/kimi-k2p5",      # $0.60/$3.00
+    "accounts/fireworks/models/glm-5p1",        # $1.40/$4.40
 ]
 
 VERIFIER_FALLBACK_CHAIN = [
-    # Verifier must emit a single-line PASS:/FAIL: verdict. Reasoning
-    # models ignore format → unparseable verdicts → fail-open. Keep this
-    # chain instruction-following-only. Primary (the VERIFIER_MODEL Valve)
-    # defaults to a Groq model for speed.
-    "accounts/fireworks/models/mixtral-8x22b-instruct",
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
+    # Verifier must emit a single-line PASS:/FAIL: verdict. Reasoning /
+    # thinking models ignore format → unparseable verdicts → fail-open.
+    # Keep this chain instruction-following-only. gpt-oss is instruction-
+    # tuned (safe); DeepSeek V4's thinking variants would break the format
+    # so they're excluded. Primary (VERIFIER_MODEL Valve) defaults to Groq.
+    "accounts/fireworks/models/gpt-oss-120b",
     "accounts/fireworks/models/kimi-k2p5",
+    "accounts/fireworks/models/glm-5p1",
 ]
 
 CAPTION_FALLBACK_CHAIN = [
-    # Primary is the IMAGE_CAPTION_MODEL Valve (Fireworks qwen3-vl by
-    # default — tested and known quality). Groq Llama 4 Scout added as a
-    # secondary so captioning survives a Fireworks vision outage.
-    "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
-    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    # All vision-capable, verified live. Primary is the IMAGE_CAPTION_MODEL
+    # Valve. Groq Llama 4 Scout is the cross-provider failover so captioning
+    # survives a full Fireworks outage.
     "accounts/fireworks/models/kimi-k2p5",
+    "groq/meta-llama/llama-4-scout-17b-16e-instruct",
+    "accounts/fireworks/models/kimi-k2p6",
 ]
 
 # --- Provider routing -------------------------------------------------------
@@ -389,20 +394,24 @@ class Filter:
         CLASSIFIER_MODEL: str = Field(
             default="groq/llama-3.1-8b-instant",
             description="Routing model. Defaults to Groq's Llama-3.1-8B-Instant — "
-            "~750 tok/s, $0.05/$0.08 per 1M tokens. Fireworks fallback kicks in on "
-            "Groq 503 / rate-limit. Set back to accounts/fireworks/models/"
-            "mixtral-8x22b-instruct if you want Fireworks primary.",
+            "~840 tok/s, $0.05/$0.08 per 1M tokens. Fireworks fallback kicks in on "
+            "Groq 503 / rate-limit (gpt-oss-120b → kimi-k2p5 → glm-5p1).",
         )
         MAIN_MODEL: str = Field(
-            default="accounts/fireworks/models/glm-5p1", description="Heavy model."
+            default="accounts/fireworks/models/deepseek-v4-pro",
+            description="Heavy model. Defaults to DeepSeek V4 Pro — 1.6T params "
+            "(49B active MoE), 1M-token context, SOTA on SWE-bench (80.6) and "
+            "LiveCodeBench (93.5). Fireworks serverless: $1.74/$3.48 per 1M tokens. "
+            "Text-only — image inputs are captioned by the vision proxy first.",
         )
         VERIFIER_MODEL: str = Field(
             default="groq/llama-3.3-70b-versatile",
             description="Citation auditor. Defaults to Groq's Llama-3.3-70B-Versatile — "
             "fast instruction-follower, emits clean PASS/FAIL verdicts. Falls back to "
-            "Fireworks mixtral/qwen3-vl/kimi-k2p5 on Groq outage. Do NOT point this at "
-            "a reasoning model (gpt-oss, deepseek thinking, kimi-thinking) — they "
-            "ignore the format instruction and produce unparseable verdicts.",
+            "Fireworks gpt-oss-120b/kimi-k2p5/glm-5p1 on Groq outage. Do NOT "
+            "point this at a reasoning model (deepseek-v4 thinking, kimi-thinking, "
+            "qwen3 thinking) — they ignore the format and produce unparseable verdicts. "
+            "gpt-oss models are safe (instruction-tuned, not thinking).",
         )
         ROUTING_THRESHOLD: float = Field(
             default=0.6,
@@ -489,14 +498,15 @@ class Filter:
             "the Tavily search query — never sent to the main model. Has no effect on text-only messages.",
         )
         IMAGE_CAPTION_MODEL: str = Field(
-            default="accounts/fireworks/models/qwen3-vl-30b-a3b-instruct",
-            description="Vision model for captioning images during routing. Must be serverless "
-            "on your Fireworks account and accept image_url content parts. "
-            "Qwen3 VL 30B A3B ($0.15/$0.60 per 1M tokens) is the cheapest serverless vision model "
-            "on Fireworks — MoE architecture means only 3B params are active per token, so it's fast "
-            "and cheap for short captions. kimi-k2p5 also works with images but costs 4x more. "
-            "NOTE: Most Fireworks vision models (llama-v3p2-11b, qwen2p5-vl-7b) require dedicated GPU, "
-            "NOT serverless — they return 404.",
+            default="accounts/fireworks/models/kimi-k2p5",
+            description="Vision model for captioning images during routing. Must accept "
+            "image_url content parts. Defaults to Kimi K2.5 ($0.60/$3.00 per 1M tokens) — "
+            "cheapest VERIFIED-accessible vision model on this Fireworks account "
+            "(per 2026-05-23 live probe). K2.6 also works at $0.95/$4.00. "
+            "For lower latency + cost, set this to "
+            "'groq/meta-llama/llama-4-scout-17b-16e-instruct' ($0.11/$0.34 @ 594 t/s) "
+            "if a Groq key is configured. NOTE: qwen3-vl-30b-a3b-instruct (previous default) "
+            "is no longer deployed on this account.",
         )
         IMAGE_CAPTION_MAX_TOKENS: int = Field(
             default=80,
@@ -505,12 +515,12 @@ class Filter:
         )
         ENABLE_VISION_PROXY: bool = Field(
             default=True,
-            description="When a non-vision model (e.g. GLM-5.1, DeepSeek V3.2) receives a message "
-            "with images, automatically caption each image with a rich description and replace "
-            "the image parts with text so the model can 'see' it. Runs on EVERY turn to handle "
-            "images in conversation history too. Captions are cached per chat so follow-up turns "
-            "don't re-caption the same images. Vision-capable models (Qwen3 VL, Kimi K2.5) "
-            "always receive images natively — the proxy is a no-op for them.",
+            description="When a non-vision model (e.g. GLM-5.1, DeepSeek V4 Pro/Flash) receives "
+            "a message with images, automatically caption each image with a rich description and "
+            "replace the image parts with text so the model can 'see' it. Runs on EVERY turn to "
+            "handle images in conversation history too. Captions are cached per chat so follow-up "
+            "turns don't re-caption the same images. Vision-capable models (Qwen3 VL, Kimi K2.5/K2.6, "
+            "DeepSeek V3.1/V3.2) always receive images natively — the proxy is a no-op for them.",
         )
         IMAGE_PROXY_MAX_TOKENS: int = Field(
             default=300,
@@ -595,12 +605,14 @@ class Filter:
             "pre-40 era.",
         )
         COMPRESSION_MODEL: str = Field(
-            default="",
-            description="Model used for memory compression summaries. Leave empty "
-            "to use MAIN_MODEL (billed at normal chat rate). For cost savings, set "
-            "this to a cheap instruction-following model — e.g. "
-            "accounts/fireworks/models/mixtral-8x22b-instruct — since summarization "
-            "doesn't need a reasoning model.",
+            default="accounts/fireworks/models/deepseek-v4-flash",
+            description="Model used for memory compression summaries. Defaults to "
+            "DeepSeek V4 Flash — the efficient V4 variant (284B/13B-active MoE, "
+            "1M context), keeps DeepSeek family consistency with MAIN_MODEL. "
+            "Thinking model: emits hidden reasoning tokens that improve summary "
+            "quality but cost extra completion tokens. For minimum cost set this "
+            "to 'accounts/fireworks/models/gpt-oss-120b' ($0.15/$0.60 per 1M, no "
+            "hidden thinking). Set to empty string to fall back to MAIN_MODEL.",
         )
 
     def __init__(self):

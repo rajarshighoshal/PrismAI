@@ -11,7 +11,7 @@
 set -euo pipefail
 
 CONTAINER_NAME="${1:-open-webui}"
-IMAGE="${2:-ghcr.io/open-webui/open-webui:main}"
+IMAGE="${2:-ghcr.io/open-webui/open-webui:v0.9.5}"
 OLD_PORT=8080
 NEW_PORT=8081
 NETWORK="${3:-}"  # optional docker network name
@@ -42,6 +42,19 @@ RESTART_POLICY=$(docker inspect "$OLD_ID" --format '{{.HostConfig.RestartPolicy.
 echo "Old container: ${OLD_ID}"
 echo "Volumes: ${VOLUMES}"
 echo "Network: ${NET_FLAG}"
+
+# Backup webui.db before the new container touches the shared volume.
+# v0.9.0 ships a DB schema migration — once the new container starts it
+# migrates in place, and the old container can no longer read the schema.
+# This backup is the rollback path.
+BACKUP_PATH="webui.db.backup-$(date +%Y%m%d-%H%M%S)"
+echo ""
+echo "--- Backing up webui.db to ${BACKUP_PATH} ---"
+if docker cp "${OLD_ID}:/app/backend/data/webui.db" "${BACKUP_PATH}" 2>/dev/null; then
+    echo "Backup size: $(ls -lh "${BACKUP_PATH}" | awk '{print $5}')"
+else
+    echo "WARNING: Could not back up webui.db (path may differ in this deploy). Proceeding."
+fi
 
 # Step 1: Start new container on NEW_PORT
 NEW_NAME="${CONTAINER_NAME}-new"
