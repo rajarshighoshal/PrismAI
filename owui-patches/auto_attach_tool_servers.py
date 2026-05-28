@@ -29,13 +29,11 @@ NEW_PATCH = (
     + "\n"
     + "        " + NEW_MARKER + "\n"
     + "        if not tool_ids:\n"
-    + "            # Auto-attach all enabled tool servers when the frontend\n"
-    + "            # doesn't specify any. Uses the standard server-side path so\n"
-    + "            # callables are wired correctly for execution.\n"
-    + "            _auto_servers = getattr(request.app.state, 'TOOL_SERVERS', None) or []\n"
-    + "            _auto = [f\"server:openapi:{s['id']}\" for s in _auto_servers if s.get('id')]\n"
-    + "            if _auto:\n"
-    + "                tool_ids = _auto"
+    + "            tool_ids = [\n"
+    + "                f\"server:openapi:{s['id']}\"\n"
+    + "                for s in (getattr(request.app.state, 'TOOL_SERVERS', None) or [])\n"
+    + "                if s.get('id')\n"
+    + "            ] or None"
 )
 
 

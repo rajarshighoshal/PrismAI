@@ -16,7 +16,12 @@ for patch in "$PATCH_DIR"/*.py; do
     echo "--- Applying $name ---"
     docker cp "$patch" "${CONTAINER}:/tmp/${name}"
     if docker exec "$CONTAINER" python3 "/tmp/${name}" | tee /tmp/_patch_out; then
-        if grep -q "^patched " /tmp/_patch_out; then
+        # Treat any of these as "file was modified, needs restart":
+        # - "patched ..." (legacy single-line scripts)
+        # - "wrote ..."   (multi-step scripts that rewrite the file)
+        # - "applied ..."  (multi-step scripts that announce per-stage)
+        # - "removed ..."  (cleanup phases)
+        if grep -qE "^(patched|wrote|applied|removed) " /tmp/_patch_out; then
             CHANGED=$((CHANGED + 1))
         fi
     else
