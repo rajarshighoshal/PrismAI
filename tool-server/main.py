@@ -78,7 +78,7 @@ def _convert(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
         out_path.unlink(missing_ok=True)
 
 
-@app.get("/health", summary="Liveness check")
+@app.get("/health", summary="Liveness check", operation_id="health")
 def health() -> dict:
     return {"status": "ok", "pandoc": pypandoc.get_pandoc_version()}
 
@@ -92,6 +92,7 @@ def health() -> dict:
         "document, .docx export, or 'export to Word'."
     ),
     response_description="Binary .docx file",
+    operation_id="export_docx",
 )
 def export_docx(req: ExportRequest) -> StreamingResponse:
     filename = _safe_filename(req.filename, "document")
@@ -121,6 +122,7 @@ def export_docx(req: ExportRequest) -> StreamingResponse:
         "read-only share."
     ),
     response_description="Binary PDF file",
+    operation_id="export_pdf",
 )
 def export_pdf(req: ExportRequest) -> StreamingResponse:
     filename = _safe_filename(req.filename, "document")
