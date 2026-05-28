@@ -54,9 +54,24 @@ def remove_old_patch(src: str) -> str:
     return pattern.sub("", src)
 
 
-def apply_new_patch(src: str) -> str:
-    if NEW_MARKER in src:
+# Patch block ends at this landmark line (the next line in stock OWUI
+# after the tool_ids read). Used to strip any existing patch body so
+# we can always re-apply the current desired body — keeps the live
+# file in sync with the repo even when only the body changes.
+PATCH_END_LANDMARK = "        # Client side tools"
+
+
+def strip_current_patch(src: str) -> str:
+    """Remove any existing NEW_MARKER block. No-op if not present."""
+    marker_line = "        " + NEW_MARKER + "\n"
+    if marker_line not in src:
         return src
+    start = src.index(marker_line)
+    end = src.index(PATCH_END_LANDMARK, start)
+    return src[:start] + src[end:]
+
+
+def apply_new_patch(src: str) -> str:
     if NEW_ANCHOR not in src:
         raise RuntimeError(
             "anchor line not found - OWUI version may have shifted; review middleware.py"
@@ -72,24 +87,18 @@ def main() -> int:
     original = src
 
     src = remove_old_patch(src)
-    if src != original:
-        print("removed old broken direct_tool_servers patch")
+    src = strip_current_patch(src)
+    try:
+        src = apply_new_patch(src)
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
-    if NEW_MARKER in src:
-        print("new tool_ids patch already present - no-op")
+    if src == original:
+        print("file already in desired state - no-op")
     else:
-        try:
-            src = apply_new_patch(src)
-        except RuntimeError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 1
-        print("applied new tool_ids auto-attach patch")
-
-    if src != original:
         PATH.write_text(src)
         print(f"wrote {PATH}")
-    else:
-        print("file already in desired state")
     return 0
 
 
