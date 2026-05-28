@@ -2,7 +2,7 @@
 title: Advanced Hybrid Router & Interceptor
 description: Accuracy-first router. Semantic routing + sticky follow-up + contextual classifier + strict citation enforcement (inlet prompts + outlet regen) + WebUI status emission.
 author: rajarshi
-version: 9.6
+version: 9.7
 """
 
 import asyncio
@@ -802,9 +802,52 @@ class Filter:
             self._last_tavily_key = self.valves.TAVILY_API_KEY
             logger.info("Tavily API key changed — cleared search cache.")
 
-    async def _search_tavily(self, query: str, max_results: int = 4) -> str:
+    async def _compress_search_query(
+        self, query: str, log_chat_id: Optional[str] = None
+    ) -> str:
+        """LLM-compress an over-long query into a Tavily-safe ≤400-char form.
+
+        Tavily returns HTTP 400 for queries >400 chars. Hard truncation loses
+        intent (cuts mid-thought, drops trailing entities). Sending the full
+        text to the cheap classifier model and asking for a concise rewrite
+        preserves the search-relevant entities and dates. Falls back to
+        word-boundary truncation if the LLM is unavailable or still over the
+        limit.
+        """
+        if len(query) <= 400:
+            return query
+        snippet = query[:4000]  # bound LLM input to keep token cost predictable
+        prompt = (
+            "Compress the text below into a concise web search query. "
+            "Keep all key entities, dates, technical terms, and intent. "
+            "Drop conversational filler and pronouns. Output ONLY the search "
+            "query — no explanation, no quotes, no prefix. Strict 400-character "
+            "maximum.\n\n"
+            f"Text:\n{snippet}"
+        )
+        compressed = await self._call_llm(
+            prompt=prompt,
+            model=self.valves.CLASSIFIER_MODEL,
+            max_tokens=140,
+            fallback_chain=CLASSIFIER_FALLBACK_CHAIN,
+            log_role="search_compress",
+            log_chat_id=log_chat_id,
+        )
+        if compressed and len(compressed) <= 400:
+            return compressed
+        # Last-resort: word-boundary truncation of whichever is shorter.
+        target = compressed if compressed else query
+        return target[:400].rsplit(" ", 1)[0]
+
+    async def _search_tavily(
+        self, query: str, max_results: int = 4, log_chat_id: Optional[str] = None
+    ) -> str:
         if not self.valves.TAVILY_API_KEY:
             return "[No Tavily API Key Provided]"
+        # Tavily hard-caps queries at 400 chars. Compress via LLM rather than
+        # truncating, to preserve search-relevant entities/dates/intent.
+        if len(query) > 400:
+            query = await self._compress_search_query(query, log_chat_id=log_chat_id)
         # Hash the query so raw user text never sits in RAM as a dict key.
         # Content is public Tavily data, but the KEY preserved the original
         # query verbatim for up to SEARCH_CACHE_TTL. On a shared family server
@@ -2525,7 +2568,9 @@ class Filter:
                     for m in messages
                     if m.get("role") == "user" and m.get("content")
                 ][-2:]
-                search_query = " ".join(prior_user_turns)[:500] or routing_query
+                # _search_tavily LLM-compresses anything >400 chars, so we
+                # can pass more context here without risking the Tavily cap.
+                search_query = " ".join(prior_user_turns)[:2000] or routing_query
             else:
                 search_query = routing_query
             await self._emit_status(
