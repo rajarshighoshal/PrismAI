@@ -1,11 +1,12 @@
-"""Tool server for OpenWebUI: markdown -> docx/pdf via pandoc.
+"""Tool server for OpenWebUI: file export + web fetch + citation lookup.
 
-OpenAPI-discoverable so OpenWebUI can auto-register the endpoints as
-tools the model can invoke. Stateless: each request is a self-contained
-conversion. Listens on the internal docker network only — no auth.
+OpenAPI-discoverable so OpenWebUI auto-registers each endpoint as a tool
+the model can invoke. Stateless: each request is self-contained. Listens
+on the internal docker network only — no auth.
 """
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import re
@@ -13,7 +14,9 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import pypandoc
+import trafilatura
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -22,21 +25,23 @@ logger = logging.getLogger("tool-server")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
-    title="OWUI Export Tool Server",
+    title="OWUI Tool Server",
     description=(
-        "Convert markdown to .docx / .pdf for OpenWebUI chats. Used by the "
-        "model via tool calls when the user asks to export a draft."
+        "File export (docx/pdf/md/csv), readable web extraction, and DOI→APA "
+        "citation lookup. Used by OpenWebUI models via tool calls."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
+
+# --- Request models -------------------------------------------------------
 
 class ExportRequest(BaseModel):
     markdown: str = Field(
         ...,
         description=(
             "The markdown content to convert. May include headings, lists, "
-            "in-text citations like (Author, 2024), code blocks, tables, and links."
+            "in-text citations like (Author, 2024), code blocks, tables, links."
         ),
     )
     filename: Optional[str] = Field(
@@ -49,11 +54,51 @@ class ExportRequest(BaseModel):
     title: Optional[str] = Field(
         None,
         description=(
-            "Document title shown in Word/PDF metadata (Properties pane) and "
-            "rendered on the first page if the template includes {{title}}."
+            "Document title for Word/PDF metadata. Shows in the Properties "
+            "pane and on the first page if the template includes {{title}}."
         ),
     )
 
+
+class CsvExportRequest(BaseModel):
+    rows: list[dict] = Field(
+        ...,
+        description=(
+            "List of row dicts. The keys of the first row become the column "
+            "headers; all rows should share the same keys."
+        ),
+    )
+    filename: Optional[str] = Field(
+        None,
+        description="Output filename WITHOUT extension. Defaults to 'data'.",
+    )
+
+
+class FetchUrlRequest(BaseModel):
+    url: str = Field(
+        ...,
+        description="The full URL to fetch. Must include http:// or https://.",
+    )
+    max_chars: int = Field(
+        8000,
+        description=(
+            "Maximum characters to return. Pages longer than this are truncated "
+            "with a [...truncated] marker. Default 8000."
+        ),
+    )
+
+
+class CitationRequest(BaseModel):
+    doi: str = Field(
+        ...,
+        description=(
+            "Digital Object Identifier (e.g. '10.1037/0033-2909.131.6.803'). "
+            "Leading 'doi:' or 'https://doi.org/' is stripped automatically."
+        ),
+    )
+
+
+# --- Helpers --------------------------------------------------------------
 
 def _safe_filename(name: Optional[str], default: str) -> str:
     raw = (name or default).strip() or default
@@ -61,8 +106,7 @@ def _safe_filename(name: Optional[str], default: str) -> str:
     return safe or default
 
 
-def _convert(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
-    """Run pandoc and return the binary output. Always cleans up the temp file."""
+def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
@@ -78,6 +122,16 @@ def _convert(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
         out_path.unlink(missing_ok=True)
 
 
+def _attach(data: bytes, media_type: str, filename: str) -> StreamingResponse:
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# --- Endpoints ------------------------------------------------------------
+
 @app.get("/health", summary="Liveness check", operation_id="health")
 def health() -> dict:
     return {"status": "ok", "pandoc": pypandoc.get_pandoc_version()}
@@ -87,8 +141,8 @@ def health() -> dict:
     "/export/docx",
     summary="Export markdown to a Microsoft Word .docx file",
     description=(
-        "Convert APA-formatted (or any) markdown to a Word document. Returns the "
-        "binary .docx as a download. Use this when the user asks for a Word "
+        "Convert APA-formatted (or any) markdown to a Word document. Returns "
+        "the binary .docx as a download. Use when the user asks for a Word "
         "document, .docx export, or 'export to Word'."
     ),
     response_description="Binary .docx file",
@@ -100,16 +154,14 @@ def export_docx(req: ExportRequest) -> StreamingResponse:
     if req.title:
         extra_args += ["--metadata", f"title={req.title}"]
     try:
-        data = _convert(req.markdown, "docx", extra_args)
+        data = _convert_pandoc(req.markdown, "docx", extra_args)
     except Exception as e:
         logger.exception("docx export failed")
         raise HTTPException(status_code=500, detail=f"docx conversion failed: {e}")
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type=(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ),
-        headers={"Content-Disposition": f'attachment; filename="{filename}.docx"'},
+    return _attach(
+        data,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        f"{filename}.docx",
     )
 
 
@@ -118,26 +170,178 @@ def export_docx(req: ExportRequest) -> StreamingResponse:
     summary="Export markdown to a PDF file",
     description=(
         "Convert markdown to a PDF document. Returns the binary PDF as a "
-        "download. Use when the user asks for a PDF, a printable version, or a "
-        "read-only share."
+        "download. Use when the user asks for a PDF, a printable version, or "
+        "a read-only share."
     ),
     response_description="Binary PDF file",
     operation_id="export_pdf",
 )
 def export_pdf(req: ExportRequest) -> StreamingResponse:
     filename = _safe_filename(req.filename, "document")
-    # weasyprint is the lightest reasonable PDF engine; xelatex would give
-    # publication-grade typography but bloats the image by ~3GB.
+    # weasyprint = lightweight; xelatex would give publication-grade output
+    # but bloats the image by ~3GB.
     extra_args = ["--standalone", "--pdf-engine=weasyprint"]
     if req.title:
         extra_args += ["--metadata", f"title={req.title}"]
     try:
-        data = _convert(req.markdown, "pdf", extra_args)
+        data = _convert_pandoc(req.markdown, "pdf", extra_args)
     except Exception as e:
         logger.exception("pdf export failed")
         raise HTTPException(status_code=500, detail=f"pdf conversion failed: {e}")
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}.pdf"'},
+    return _attach(data, "application/pdf", f"{filename}.pdf")
+
+
+@app.post(
+    "/export/markdown",
+    summary="Save content as a .md file",
+    description=(
+        "Save markdown content as a downloadable .md file. Use when the user "
+        "asks for a markdown export, a .md file, or wants to download the "
+        "raw markdown of a draft."
+    ),
+    response_description="Binary .md file",
+    operation_id="export_markdown",
+)
+def export_markdown(req: ExportRequest) -> StreamingResponse:
+    filename = _safe_filename(req.filename, "document")
+    return _attach(
+        req.markdown.encode("utf-8"),
+        "text/markdown; charset=utf-8",
+        f"{filename}.md",
     )
+
+
+@app.post(
+    "/export/csv",
+    summary="Export tabular data to a .csv file",
+    description=(
+        "Convert a list of dictionaries to a CSV file. The keys of the first "
+        "row become the column headers. Use when the user asks for CSV, "
+        "spreadsheet export, or wants tabular data they can open in Excel."
+    ),
+    response_description="Binary .csv file",
+    operation_id="export_csv",
+)
+def export_csv(req: CsvExportRequest) -> StreamingResponse:
+    if not req.rows:
+        raise HTTPException(status_code=400, detail="rows cannot be empty")
+    filename = _safe_filename(req.filename, "data")
+    fieldnames = list(req.rows[0].keys())
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(req.rows)
+    return _attach(
+        buf.getvalue().encode("utf-8"),
+        "text/csv; charset=utf-8",
+        f"{filename}.csv",
+    )
+
+
+@app.post(
+    "/fetch_url",
+    summary="Fetch a URL and return its readable text content",
+    description=(
+        "Download a webpage and extract the main readable text (stripping nav, "
+        "ads, boilerplate). Use when the user gives a specific URL to summarise "
+        "or quote, or when web search results need deeper context from one page."
+    ),
+    operation_id="fetch_url",
+)
+def fetch_url(req: FetchUrlRequest) -> dict:
+    if not re.match(r"^https?://", req.url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+    try:
+        downloaded = trafilatura.fetch_url(req.url)
+    except Exception as e:
+        logger.exception("fetch_url failed at download")
+        raise HTTPException(status_code=502, detail=f"fetch failed: {e}")
+    if not downloaded:
+        raise HTTPException(status_code=502, detail=f"could not fetch {req.url}")
+    text = trafilatura.extract(downloaded, include_links=True, include_tables=True) or ""
+    truncated = False
+    if len(text) > req.max_chars:
+        text = text[: req.max_chars] + "\n\n[...truncated]"
+        truncated = True
+    return {
+        "url": req.url,
+        "chars": len(text),
+        "truncated": truncated,
+        "text": text,
+    }
+
+
+@app.post(
+    "/lookup_doi_citation",
+    summary="Look up a DOI on CrossRef and return an APA citation",
+    description=(
+        "Query CrossRef for a DOI and return the work as an APA-formatted "
+        "citation string plus structured metadata (authors, year, title, "
+        "journal). Use when the user gives a DOI and wants the formatted "
+        "reference, or when verifying a citation she's planning to use."
+    ),
+    operation_id="lookup_doi_citation",
+)
+def lookup_doi_citation(req: CitationRequest) -> dict:
+    doi = req.doi.strip()
+    for prefix in ("doi:", "https://doi.org/", "http://doi.org/", "https://dx.doi.org/"):
+        if doi.lower().startswith(prefix):
+            doi = doi[len(prefix):]
+            break
+    try:
+        r = httpx.get(
+            f"https://api.crossref.org/works/{doi}",
+            headers={"User-Agent": "owui-tool-server/0.2"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        msg = r.json()["message"]
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=404, detail=f"CrossRef returned {e.response.status_code} for DOI {doi}")
+    except Exception as e:
+        logger.exception("DOI lookup failed")
+        raise HTTPException(status_code=502, detail=f"CrossRef lookup failed: {e}")
+
+    authors = msg.get("author", []) or []
+    def _author_str(a: dict) -> str:
+        family = a.get("family", "").strip()
+        given = a.get("given", "").strip()
+        initials = "".join(f"{p[0]}." for p in given.split() if p)
+        return f"{family}, {initials}".strip(", ")
+    author_parts = [_author_str(a) for a in authors[:20] if a.get("family")]
+    if len(authors) > 20:
+        author_parts.append("...")
+    author_str = ", ".join(author_parts) if author_parts else "Unknown"
+
+    issued = msg.get("issued") or msg.get("published") or {}
+    date_parts = issued.get("date-parts") or [[None]]
+    year = date_parts[0][0] if date_parts and date_parts[0] else "n.d."
+
+    title = (msg.get("title") or [""])[0]
+    container = (msg.get("container-title") or [""])[0]
+    volume = msg.get("volume", "")
+    issue = msg.get("issue", "")
+    pages = msg.get("page", "")
+    doi_canonical = msg.get("DOI", doi)
+
+    parts = [f"{author_str} ({year}). {title}."]
+    if container:
+        loc = f"*{container}*"
+        if volume:
+            loc += f", *{volume}*"
+            if issue:
+                loc += f"({issue})"
+        if pages:
+            loc += f", {pages}"
+        parts.append(f"{loc}.")
+    parts.append(f"https://doi.org/{doi_canonical}")
+    apa = " ".join(parts)
+
+    return {
+        "doi": doi_canonical,
+        "apa": apa,
+        "title": title,
+        "year": year,
+        "container": container,
+        "authors": [{"family": a.get("family"), "given": a.get("given")} for a in authors],
+    }
