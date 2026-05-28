@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pypandoc==1.16.2
+python-docx==1.2.0
+weasyprint==63.1
+pydantic==2.10.4
