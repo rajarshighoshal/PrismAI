@@ -33,5 +33,15 @@ print(f'Updated {cur.rowcount} row(s), {len(content)} chars')
 conn.close()
 "
 
+if [ -x tool-server/deploy.sh ]; then
+    echo "--- Rebuilding/restarting tool server ---"
+    ./tool-server/deploy.sh
+fi
+
+if [ -x owui-patches/apply.sh ]; then
+    echo "--- Re-applying OWUI patches ---"
+    ./owui-patches/apply.sh
+fi
+
 echo ""
-echo "=== Update complete. No restart needed — function hot-loaded from DB. ==="
+echo "=== Update complete. Function hot-loaded; tool server and patches synced. ==="

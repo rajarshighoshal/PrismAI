@@ -5,8 +5,8 @@
 # 1. Starts a new container on a different port
 # 2. Waits for it to be healthy
 # 3. Stops the old container
-# 4. Renames the new one to take its place
-# 5. Removes the old one
+# 4. Moves the old container aside and renames the new one into place
+# 5. Removes the old container after the swap succeeds
 
 set -euo pipefail
 
@@ -104,16 +104,20 @@ fi
 # Step 4: Swap — stop old, rename new
 echo ""
 echo "--- Step 4: Swapping containers ---"
+OLD_BACKUP="${CONTAINER_NAME}-old-$(date +%Y%m%d-%H%M%S)"
 docker stop "$OLD_ID"
-docker rename "${NEW_NAME}" "${CONTAINER_NAME}"
+docker rename "$OLD_ID" "$OLD_BACKUP"
 
-# Re-map the port if needed (the new container was on NEW_PORT internally)
-# Actually we need to recreate with the correct port mapping
-# For simplicity, if using a reverse proxy, just update the upstream
+if ! docker rename "${NEW_NAME}" "${CONTAINER_NAME}"; then
+    echo "ERROR: Could not rename ${NEW_NAME} to ${CONTAINER_NAME}; rolling back old container"
+    docker rename "$OLD_BACKUP" "${CONTAINER_NAME}" || true
+    docker start "${CONTAINER_NAME}" || true
+    exit 1
+fi
 
 echo ""
 echo "--- Step 5: Cleanup ---"
-docker rm "$OLD_ID"
+docker rm "$OLD_BACKUP"
 echo ""
 echo "=== Deploy complete ==="
 echo "New container: ${CONTAINER_NAME} ($(docker ps -q -f name=^${CONTAINER_NAME}$))"

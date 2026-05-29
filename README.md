@@ -27,11 +27,11 @@ Intercepts every message in OpenWebUI and adds:
 ## Deployment
 
 ```bash
-# Update function on a running server (no restart needed)
+# Sync router function, tool-server, and OWUI patches on a running server
 ./update.sh
 ```
 
-`update.sh` pulls from git, copies the file into the container, and updates the function row in `webui.db`. OpenWebUI hot-reloads.
+`update.sh` pulls from git, updates the function row in `webui.db`, rebuilds/restarts the external tool-server, and re-applies OWUI middleware patches. `auto-deploy.sh` is a cron-friendly wrapper for servers that should track `origin/main`.
 
 ## Configuration
 
@@ -46,6 +46,8 @@ All behavior is controlled via Valves (OpenWebUI's per-function config):
 | `CHAT_MEMORY_TOP_K` | `8` | Recalled turns per query |
 | `ENABLE_HYBRID_RETRIEVAL` | `true` | BM25 + cosine combined scoring |
 | `ENABLE_QUERY_REWRITE` | `true` | Rewrite follow-up queries for better recall |
+| `ENABLE_DOCUMENT_STYLE_GUIDANCE` | `true` | Voice-preserving guidance for cover letters, statements, emails, and drafts |
+| `DOCUMENT_STYLE_GUIDE` | empty | Optional user-specific writing voice notes |
 | `ENABLE_CHAT_MEMORY_COMPRESSION` | `true` | Summarize oldest turns on long chats |
 | `ADDRESS_USER_BY_NAME` | `true` | Use logged-in user's name |
 

@@ -6,19 +6,21 @@ on the internal docker network only — no auth.
 """
 from __future__ import annotations
 
+import base64
 import csv
-import io
+import ipaddress
 import logging
 import re
+import socket
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 import pypandoc
 import trafilatura
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("tool-server")
@@ -30,7 +32,7 @@ app = FastAPI(
         "File export (docx/pdf/md/csv), readable web extraction, and DOI→APA "
         "citation lookup. Used by OpenWebUI models via tool calls."
     ),
-    version="0.2.0",
+    version="0.2.1",
 )
 
 
@@ -81,6 +83,8 @@ class FetchUrlRequest(BaseModel):
     )
     max_chars: int = Field(
         8000,
+        ge=500,
+        le=50000,
         description=(
             "Maximum characters to return. Pages longer than this are truncated "
             "with a [...truncated] marker. Default 8000."
@@ -122,12 +126,83 @@ def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
         out_path.unlink(missing_ok=True)
 
 
-def _attach(data: bytes, media_type: str, filename: str) -> StreamingResponse:
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+def _file_result(data: bytes, media_type: str, filename: str) -> list[Any]:
+    b64 = base64.b64encode(data).decode("ascii")
+    return [
+        f"data:{media_type};base64,{b64}",
+        {
+            "status": "success",
+            "filename": filename,
+            "mime_type": media_type,
+            "bytes": len(data),
+        },
+    ]
+
+
+def _is_blocked_ip(ip: str) -> bool:
+    parsed = ipaddress.ip_address(ip)
+    return (
+        parsed.is_private
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_multicast
+        or parsed.is_reserved
+        or parsed.is_unspecified
     )
+
+
+def _validate_public_http_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise HTTPException(
+            status_code=400,
+            detail="url must start with http:// or https://",
+        )
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(status_code=400, detail="url must include a hostname")
+    host_l = host.lower().rstrip(".")
+    if host_l in {"localhost", "host.docker.internal", "docker.for.mac.localhost"}:
+        raise HTTPException(
+            status_code=400,
+            detail="private/internal URLs are not allowed",
+        )
+    try:
+        if _is_blocked_ip(host_l):
+            raise HTTPException(
+                status_code=400,
+                detail="private/internal URLs are not allowed",
+            )
+        return
+    except ValueError:
+        pass
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port)
+    except socket.gaierror as e:
+        raise HTTPException(status_code=400, detail=f"could not resolve hostname: {e}")
+    for info in infos:
+        resolved_ip = info[4][0]
+        if _is_blocked_ip(resolved_ip):
+            raise HTTPException(
+                status_code=400,
+                detail="private/internal URLs are not allowed",
+            )
+
+
+def _download_public_url(url: str) -> str:
+    current = url
+    headers = {"User-Agent": "owui-tool-server/0.2.1"}
+    with httpx.Client(timeout=15.0, follow_redirects=False, headers=headers) as client:
+        for _ in range(5):
+            _validate_public_http_url(current)
+            response = client.get(current)
+            if 300 <= response.status_code < 400 and response.headers.get("location"):
+                current = urljoin(str(response.url), response.headers["location"])
+                continue
+            response.raise_for_status()
+            return response.text
+    raise HTTPException(status_code=508, detail="too many redirects")
 
 
 # --- Endpoints ------------------------------------------------------------
@@ -142,13 +217,13 @@ def health() -> dict:
     summary="Export markdown to a Microsoft Word .docx file",
     description=(
         "Convert APA-formatted (or any) markdown to a Word document. Returns "
-        "the binary .docx as a download. Use when the user asks for a Word "
+        "an OpenWebUI-compatible file payload. Use when the user asks for a Word "
         "document, .docx export, or 'export to Word'."
     ),
-    response_description="Binary .docx file",
+    response_description="OWUI file payload for a .docx file",
     operation_id="export_docx",
 )
-def export_docx(req: ExportRequest) -> StreamingResponse:
+def export_docx(req: ExportRequest) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     extra_args = ["--standalone"]
     if req.title:
@@ -158,7 +233,7 @@ def export_docx(req: ExportRequest) -> StreamingResponse:
     except Exception as e:
         logger.exception("docx export failed")
         raise HTTPException(status_code=500, detail=f"docx conversion failed: {e}")
-    return _attach(
+    return _file_result(
         data,
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         f"{filename}.docx",
@@ -169,14 +244,14 @@ def export_docx(req: ExportRequest) -> StreamingResponse:
     "/export/pdf",
     summary="Export markdown to a PDF file",
     description=(
-        "Convert markdown to a PDF document. Returns the binary PDF as a "
-        "download. Use when the user asks for a PDF, a printable version, or "
+        "Convert markdown to a PDF document. Returns an OpenWebUI-compatible "
+        "file payload. Use when the user asks for a PDF, a printable version, or "
         "a read-only share."
     ),
-    response_description="Binary PDF file",
+    response_description="OWUI file payload for a PDF file",
     operation_id="export_pdf",
 )
-def export_pdf(req: ExportRequest) -> StreamingResponse:
+def export_pdf(req: ExportRequest) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     # weasyprint = lightweight; xelatex would give publication-grade output
     # but bloats the image by ~3GB.
@@ -188,7 +263,7 @@ def export_pdf(req: ExportRequest) -> StreamingResponse:
     except Exception as e:
         logger.exception("pdf export failed")
         raise HTTPException(status_code=500, detail=f"pdf conversion failed: {e}")
-    return _attach(data, "application/pdf", f"{filename}.pdf")
+    return _file_result(data, "application/pdf", f"{filename}.pdf")
 
 
 @app.post(
@@ -199,14 +274,14 @@ def export_pdf(req: ExportRequest) -> StreamingResponse:
         "asks for a markdown export, a .md file, or wants to download the "
         "raw markdown of a draft."
     ),
-    response_description="Binary .md file",
+    response_description="OWUI file payload for a .md file",
     operation_id="export_markdown",
 )
-def export_markdown(req: ExportRequest) -> StreamingResponse:
+def export_markdown(req: ExportRequest) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
-    return _attach(
+    return _file_result(
         req.markdown.encode("utf-8"),
-        "text/markdown; charset=utf-8",
+        "text/markdown",
         f"{filename}.md",
     )
 
@@ -219,10 +294,10 @@ def export_markdown(req: ExportRequest) -> StreamingResponse:
         "row become the column headers. Use when the user asks for CSV, "
         "spreadsheet export, or wants tabular data they can open in Excel."
     ),
-    response_description="Binary .csv file",
+    response_description="OWUI file payload for a .csv file",
     operation_id="export_csv",
 )
-def export_csv(req: CsvExportRequest) -> StreamingResponse:
+def export_csv(req: CsvExportRequest) -> list[Any]:
     if not req.rows:
         raise HTTPException(status_code=400, detail="rows cannot be empty")
     filename = _safe_filename(req.filename, "data")
@@ -231,9 +306,9 @@ def export_csv(req: CsvExportRequest) -> StreamingResponse:
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     writer.writerows(req.rows)
-    return _attach(
+    return _file_result(
         buf.getvalue().encode("utf-8"),
-        "text/csv; charset=utf-8",
+        "text/csv",
         f"{filename}.csv",
     )
 
@@ -249,10 +324,15 @@ def export_csv(req: CsvExportRequest) -> StreamingResponse:
     operation_id="fetch_url",
 )
 def fetch_url(req: FetchUrlRequest) -> dict:
-    if not re.match(r"^https?://", req.url, re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
     try:
-        downloaded = trafilatura.fetch_url(req.url)
+        downloaded = _download_public_url(req.url)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"fetch failed with HTTP {e.response.status_code}: {req.url}",
+        )
     except Exception as e:
         logger.exception("fetch_url failed at download")
         raise HTTPException(status_code=502, detail=f"fetch failed: {e}")
@@ -278,7 +358,7 @@ def fetch_url(req: FetchUrlRequest) -> dict:
         "Query CrossRef for a DOI and return the work as an APA-formatted "
         "citation string plus structured metadata (authors, year, title, "
         "journal). Use when the user gives a DOI and wants the formatted "
-        "reference, or when verifying a citation she's planning to use."
+        "reference, or when verifying a citation they plan to use."
     ),
     operation_id="lookup_doi_citation",
 )
@@ -290,8 +370,8 @@ def lookup_doi_citation(req: CitationRequest) -> dict:
             break
     try:
         r = httpx.get(
-            f"https://api.crossref.org/works/{doi}",
-            headers={"User-Agent": "owui-tool-server/0.2"},
+            f"https://api.crossref.org/works/{quote(doi, safe='')}",
+            headers={"User-Agent": "owui-tool-server/0.2.1"},
             timeout=15.0,
         )
         r.raise_for_status()

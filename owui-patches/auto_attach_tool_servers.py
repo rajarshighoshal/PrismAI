@@ -5,10 +5,9 @@ sends `metadata.tool_ids` containing `server:openapi:<id>` refs.
 That requires per-chat UI opt-in — friction we don't want.
 
 This patch makes the backend fall back: when no `tool_ids` were
-specified, auto-populate them with `server:openapi:<id>` for every
-registered tool server in `app.state.TOOL_SERVERS`. The standard
-server-side execution path (which DOES wire up callables) then
-handles invocation correctly.
+specified, auto-populate them from `TOOL_SERVER_CONNECTIONS`. The
+standard server-side execution path (which DOES wire up callables)
+then handles invocation correctly.
 
 Idempotent. Also cleans up an earlier broken version of this patch
 that targeted `direct_tool_servers` (which is a frontend-only path
@@ -29,11 +28,14 @@ NEW_PATCH = (
     + "\n"
     + "        " + NEW_MARKER + "\n"
     + "        if not tool_ids:\n"
-    + "            tool_ids = [\n"
-    + "                f\"server:openapi:{s['id']}\"\n"
-    + "                for s in (getattr(request.app.state, 'TOOL_SERVERS', None) or [])\n"
-    + "                if s.get('id')\n"
-    + "            ] or None"
+    + "            tool_ids = []\n"
+    + "            for idx, connection in enumerate(getattr(request.app.state.config, 'TOOL_SERVER_CONNECTIONS', []) or []):\n"
+    + "                if not connection.get('config', {}).get('enable', True):\n"
+    + "                    continue\n"
+    + "                server_type = connection.get('type') or 'openapi'\n"
+    + "                server_id = (connection.get('info') or {}).get('id') or str(idx)\n"
+    + "                tool_ids.append(f\"server:{server_type}:{server_id}\")\n"
+    + "            tool_ids = tool_ids or None"
 )
 
 

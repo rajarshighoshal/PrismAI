@@ -7,6 +7,7 @@ set -euo pipefail
 TOOL_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE="owui-tool-server:latest"
 CONTAINER="owui-tool-server"
+BACKUP_IMAGE="owui-tool-server:rollback"
 HOST_PORT=8001
 
 # Discover the network the existing open-webui container lives on.
@@ -19,6 +20,11 @@ if [ -z "$NETWORK" ]; then
 fi
 echo "Joining network: $NETWORK"
 
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "--- Saving rollback image ---"
+    docker tag "$IMAGE" "$BACKUP_IMAGE"
+fi
+
 echo "--- Building image ---"
 docker build -t "$IMAGE" "$TOOL_DIR"
 
@@ -29,12 +35,23 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
 fi
 
 echo "--- Running new container ---"
-docker run -d \
-    --name "$CONTAINER" \
-    --network "$NETWORK" \
-    --restart unless-stopped \
-    -p "127.0.0.1:${HOST_PORT}:8001" \
-    "$IMAGE"
+if ! docker run -d \
+        --name "$CONTAINER" \
+        --network "$NETWORK" \
+        --restart unless-stopped \
+        -p "127.0.0.1:${HOST_PORT}:8001" \
+        "$IMAGE"; then
+    echo "ERROR: failed to start new tool-server container"
+    if docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
+        docker run -d \
+            --name "$CONTAINER" \
+            --network "$NETWORK" \
+            --restart unless-stopped \
+            -p "127.0.0.1:${HOST_PORT}:8001" \
+            "$BACKUP_IMAGE" >/dev/null
+    fi
+    exit 1
+fi
 
 echo "--- Waiting for /health (max 60s) ---"
 for i in $(seq 1 30); do
@@ -51,4 +68,14 @@ done
 
 echo "FAILED to become healthy. Last logs:"
 docker logs --tail 50 "$CONTAINER"
+docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+if docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
+    echo "--- Rolling back to previous tool-server image ---"
+    docker run -d \
+        --name "$CONTAINER" \
+        --network "$NETWORK" \
+        --restart unless-stopped \
+        -p "127.0.0.1:${HOST_PORT}:8001" \
+        "$BACKUP_IMAGE" >/dev/null
+fi
 exit 1

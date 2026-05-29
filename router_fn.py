@@ -1,7 +1,7 @@
 """
 title: Advanced Hybrid Router & Interceptor
 description: Accuracy-first router. Semantic routing + sticky follow-up + contextual classifier + strict citation enforcement (inlet prompts + outlet regen) + WebUI status emission.
-author: rajarshi
+author: open-webui-community
 version: 9.7
 """
 
@@ -57,11 +57,36 @@ FORCE_SEARCH_PATTERNS = [
     re.compile(r"\bwhat'?s\s+the\s+latest\b", re.IGNORECASE),
 ]
 
+DOCUMENT_REQUEST_PATTERNS = [
+    re.compile(
+        r"\b("
+        r"cover\s+letter|resume|cv|personal\s+statement|statement\s+of\s+purpose|"
+        r"sop|motivation\s+letter|bio|profile|linkedin|email|letter|proposal|"
+        r"essay|draft|rewrite|edit|polish|document|docx|pdf"
+        r")\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(write|draft|polish|tailor|personalize|personalise)\b",
+        re.IGNORECASE,
+    ),
+]
+
+DOCUMENT_STYLE_PROMPT = (
+    "DOCUMENT WRITING MODE:\n"
+    "- Preserve the user's personal voice. Mirror their level of directness, energy, and vocabulary when there is enough prior context.\n"
+    "- For cover letters, personal statements, bios, emails, and similar writing, use first person unless the user asks otherwise.\n"
+    "- Avoid generic polished filler: no 'I am writing to express my interest', no empty enthusiasm, no buzzword stacks.\n"
+    "- Use concrete details from the prompt and recalled chat context: role, company, project, skills, constraints, motivation, and stakes.\n"
+    "- If web search results are provided, use them as background context. Do not put citations or a sources section into cover letters, personal statements, bios, or emails unless the user explicitly asks for cited writing.\n"
+    "- Do not invent personal history, credentials, employers, publications, grades, locations, or achievements. If a required detail is missing, write [NEEDS DETAIL: ...].\n"
+    "- Make the result feel authored by this user, not by a template: specific, human, and purposeful.\n"
+)
+
 CATEGORY_NAMES = frozenset({"FACTUAL", "REASONING", "CODING", "RESEARCH", "CASUAL"})
 
-# Models confirmed to natively accept image_url content parts. Verified
-# 2026-05-23 via live probes against the Fireworks /chat/completions and
-# Groq /chat/completions endpoints on this account.
+# Models confirmed to natively accept image_url content parts via live probes
+# against Fireworks /chat/completions and Groq /chat/completions.
 # All other models will have images replaced with text captions (vision proxy).
 # NOTE: deepseek-v4-pro/v4-flash exist on Fireworks but are TEXT-ONLY
 # ("This model does not support image inputs"); GLM-5.1 and GPT-OSS-120B
@@ -76,8 +101,8 @@ VISION_CAPABLE_MODELS = frozenset(
 )
 
 # Fallback model chains — when the primary model is down (503, timeout),
-# try the next one in the chain. Every entry below is verified accessible
-# on this account 2026-05-23 (Fireworks /models endpoint + live probe).
+# try the next one in the chain. Entries were verified with Fireworks /models
+# endpoint checks plus live probes.
 CLASSIFIER_FALLBACK_CHAIN = [
     # Fireworks-only fallbacks. Primary is the CLASSIFIER_MODEL Valve,
     # which defaults to a Groq model for speed. Ordered cheapest first.
@@ -127,7 +152,7 @@ _PRONOUN_REF = re.compile(
 )
 
 _ROUTE_HEADER_RE = re.compile(
-    r"\A`[^\n`]*\b(?:FACTUAL|REASONING|CODING|RESEARCH|CASUAL)\b[^\n`]*`\s*\n(?:>\s*[^\n]*\n)?\s*",
+    r"\A`[^\n`]*\b(?:FACTUAL|REASONING|CODING|RESEARCH|CASUAL|WRITING)\b[^\n`]*`\s*\n(?:>\s*[^\n]*\n)?\s*",
     re.IGNORECASE,
 )
 
@@ -154,6 +179,12 @@ def _is_followup_query(query: str) -> bool:
     if len(words) <= 6 and _PRONOUN_REF.search(query):
         return True
     return False
+
+
+def _is_document_request(query: str) -> bool:
+    if not query or len(query) < 8:
+        return False
+    return any(p.search(query) for p in DOCUMENT_REQUEST_PATTERNS)
 
 
 class _NonRetryableError(Exception):
@@ -500,13 +531,11 @@ class Filter:
         IMAGE_CAPTION_MODEL: str = Field(
             default="accounts/fireworks/models/kimi-k2p5",
             description="Vision model for captioning images during routing. Must accept "
-            "image_url content parts. Defaults to Kimi K2.5 ($0.60/$3.00 per 1M tokens) — "
-            "cheapest VERIFIED-accessible vision model on this Fireworks account "
-            "(per 2026-05-23 live probe). K2.6 also works at $0.95/$4.00. "
+            "image_url content parts. Defaults to Kimi K2.5 ($0.60/$3.00 per 1M tokens). "
+            "K2.6 also works at $0.95/$4.00. "
             "For lower latency + cost, set this to "
             "'groq/meta-llama/llama-4-scout-17b-16e-instruct' ($0.11/$0.34 @ 594 t/s) "
-            "if a Groq key is configured. NOTE: qwen3-vl-30b-a3b-instruct (previous default) "
-            "is no longer deployed on this account.",
+            "if a Groq key is configured.",
         )
         IMAGE_CAPTION_MAX_TOKENS: int = Field(
             default=80,
@@ -582,6 +611,18 @@ class Filter:
             "'what about that'), ask the classifier LLM to rewrite the query into a "
             "standalone form before embedding for recall. Fails open — uses the original "
             "query if the rewrite call fails.",
+        )
+        ENABLE_DOCUMENT_STYLE_GUIDANCE: bool = Field(
+            default=True,
+            description="For writing/editing/export requests such as cover letters, "
+            "personal statements, emails, and drafts, inject a voice-preserving style "
+            "guide so the model avoids generic template prose.",
+        )
+        DOCUMENT_STYLE_GUIDE: str = Field(
+            default="",
+            description="Optional user-specific writing preferences or voice notes. "
+            "Example: 'Direct, specific, first-person, no corporate filler.' "
+            "Leave empty to use the built-in generic anti-template guidance.",
         )
         ENABLE_CHAT_MEMORY_COMPRESSION: bool = Field(
             default=True,
@@ -2442,7 +2483,7 @@ class Filter:
 
         messages = body["messages"]
         query_raw = _extract_text(messages[-1]["content"]).strip()
-        query_lower = query_raw.lower()
+        document_request = _is_document_request(query_raw)
 
         # --- Image-based routing augmentation ---
         # If the last user message contains images, generate a short caption
@@ -2532,8 +2573,14 @@ class Filter:
             )
             best_match = "CASUAL"
 
+        search_category = best_match
+        if document_request and best_match in ["FACTUAL", "RESEARCH"]:
+            best_match = "CASUAL"
+
         will_search = (
-            best_match in ["FACTUAL", "RESEARCH"] or force_search or sticky_searched
+            (search_category in ["FACTUAL", "RESEARCH"] and not document_request)
+            or force_search
+            or sticky_searched
         )
         search_flag = "_SEARCH" if will_search else ""
         self._set_sticky(chat_id, best_match, will_search)
@@ -2542,6 +2589,7 @@ class Filter:
         body["metadata"]["_router_state"] = {
             "category": best_match,
             "searched": will_search,
+            "document_request": document_request,
         }
 
         # Triple fallback for routing state: metadata (primary) → sticky_routes (2nd) → tag (3rd).
@@ -2559,7 +2607,7 @@ class Filter:
         if will_search:
             depth = (
                 self.valves.SEARCH_RESULTS_RESEARCH
-                if best_match == "RESEARCH"
+                if search_category == "RESEARCH"
                 else self.valves.SEARCH_RESULTS_FACTUAL
             )
             if sticky_searched and is_followup:
@@ -2665,6 +2713,14 @@ class Filter:
                     f"reply — natural mention only, no sycophancy.\n\n"
                 )
 
+        if self.valves.ENABLE_DOCUMENT_STYLE_GUIDANCE and _is_document_request(query_raw):
+            system_content += f"{DOCUMENT_STYLE_PROMPT}\n"
+            if self.valves.DOCUMENT_STYLE_GUIDE.strip():
+                system_content += (
+                    "USER WRITING PREFERENCES:\n"
+                    f"{self.valves.DOCUMENT_STYLE_GUIDE.strip()}\n\n"
+                )
+
         system_content += (
             f"{self.prompts[best_match]}\n\n"
             f"ANTI-REFUSAL: Do NOT say 'I do not have internet access'. If search results were provided above, use them. "
@@ -2704,11 +2760,18 @@ class Filter:
                         all_image_parts.append((i, part))
 
             if all_image_parts:
-                # Step 2: Resolve any internal URLs → base64 data URIs
-                resolved = await self._resolve_image_urls(
-                    [p for _, p in all_image_parts],
-                    event_emitter=__event_emitter__,
-                )
+                # Step 2: Resolve any internal URLs to base64 data URIs while
+                # keeping the original URL as the replacement key.
+                resolved_pairs: list[tuple[str, dict]] = []
+                for _, original_part in all_image_parts:
+                    original_url = (original_part.get("image_url") or {}).get(
+                        "url", ""
+                    )
+                    for resolved_part in await self._resolve_image_urls(
+                        [original_part],
+                        event_emitter=__event_emitter__,
+                    ):
+                        resolved_pairs.append((original_url, resolved_part))
 
                 # Step 3: Caption each unique image (with caching)
                 # Use a cache keyed by chat_id + image URL to avoid re-captioning
@@ -2717,15 +2780,14 @@ class Filter:
                 image_url_to_caption: dict[str, str] = {}
 
                 # Group by URL to avoid duplicate caption calls
-                unique_urls: dict[str, list[dict]] = {}  # url → list of resolved parts
-                for part in resolved:
-                    url = (part.get("image_url") or {}).get("url", "")
-                    if url and url not in unique_urls:
-                        unique_urls[url] = [part]
+                unique_images: dict[str, dict] = {}
+                for original_url, resolved_part in resolved_pairs:
+                    if original_url and original_url not in unique_images:
+                        unique_images[original_url] = resolved_part
 
                 new_captions = 0
                 cached_captions = 0
-                for url in unique_urls:
+                for url, resolved_part in unique_images.items():
                     # SHA-256 the URL so that huge data: URIs and long internal
                     # paths can never collide via prefix match. Still chat-scoped.
                     url_digest = hashlib.sha256(url.encode()).hexdigest()[:32]
@@ -2735,9 +2797,8 @@ class Filter:
                         cached_captions += 1
                     else:
                         # Generate a new detailed caption
-                        parts_for_url = unique_urls[url]
                         caption = await self._detailed_caption(
-                            parts_for_url,
+                            [resolved_part],
                             user_text=query_raw,
                             event_emitter=__event_emitter__,
                         )
@@ -2817,6 +2878,7 @@ class Filter:
         category = router_state.get("category")
         search_results_injected = bool(router_state.get("searched"))
         search_context_from_inlet = router_state.get("search_context", "")
+        document_request = bool(router_state.get("document_request"))
 
         # Fallback 1: Filter-instance sticky cache (survives even if OWUI strips body metadata).
         if not category:
@@ -2849,7 +2911,11 @@ class Filter:
             display_response = display_response.strip()
 
         final_content = self._build_route_content(
-            category, searched=search_results_injected, body_text=display_response
+            category,
+            searched=search_results_injected,
+            body_text=display_response,
+            override_label="WRITING" if document_request else None,
+            override_emoji="✍️" if document_request else None,
         )
         body["messages"][-1]["content"] = final_content
         await self._emit_replace(__event_emitter__, final_content)
