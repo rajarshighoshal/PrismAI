@@ -9,11 +9,17 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONTAINER_NAME="${1:-open-webui}"
 IMAGE="${2:-ghcr.io/open-webui/open-webui:v0.9.5}"
 CONTAINER_PORT=8080
 TEMP_PORT="${TEMP_PORT:-8081}"
 NETWORK="${3:-}"  # optional docker network name
+ENV_FILE="${OPENWEBUI_ENV_FILE:-${SCRIPT_DIR}/open-webui.env}"
+EXTRA_ENV_ARGS=()
+if [ -f "$ENV_FILE" ]; then
+    EXTRA_ENV_ARGS=(--env-file "$ENV_FILE")
+fi
 
 echo "=== Blue-Green Deploy for ${CONTAINER_NAME} ==="
 
@@ -80,6 +86,7 @@ docker run -d \
     --name "${NEW_NAME}" \
     ${VOLUMES} \
     ${ENV_VARS} \
+    "${EXTRA_ENV_ARGS[@]}" \
     ${NET_FLAG} \
     -p "${TEMP_PORT}:${CONTAINER_PORT}" \
     --restart="${RESTART_POLICY:-unless-stopped}" \
@@ -129,6 +136,7 @@ if ! docker run -d \
     --name "${CONTAINER_NAME}" \
     ${VOLUMES} \
     ${ENV_VARS} \
+    "${EXTRA_ENV_ARGS[@]}" \
     ${NET_FLAG} \
     -p "${HOST_PORT}:${CONTAINER_PORT}" \
     --restart="${RESTART_POLICY:-unless-stopped}" \
