@@ -31,9 +31,15 @@ Intercepts every message in OpenWebUI and adds:
 ./update.sh
 ```
 
-`update.sh` pulls from git, updates the function row in `webui.db`, rebuilds/restarts the external tool-server, and re-applies OWUI middleware patches. `auto-deploy.sh` is a cron-friendly wrapper for servers that should track `origin/main`.
+`update.sh` pulls from git, updates the function row in `webui.db`, rebuilds/restarts the external tool-server, and re-applies OWUI compatibility patches. `auto-deploy.sh` is a cron-friendly wrapper for servers that should track `origin/main`.
 
-The tool server can attach exported DOCX/PDF/CSV/Markdown files directly to the assistant message when OpenWebUI forwards tool headers and auth is configured. Keep these settings in an untracked `tool-server/tool-server.env`:
+Attach the tool server through OpenWebUI model metadata instead of global middleware injection. Models that should use these tools need:
+
+```json
+{"toolIds": ["server:openapi:owui-tool-server"]}
+```
+
+The compatibility patch promotes exported DOCX/PDF/CSV/Markdown data URI outputs into normal OpenWebUI message files. The tool server also has an optional direct-attach fallback when OpenWebUI forwards tool headers and auth is configured. Keep these settings in an untracked `tool-server/tool-server.env`:
 
 ```bash
 OPENWEBUI_BASE_URL=http://open-webui:8080
