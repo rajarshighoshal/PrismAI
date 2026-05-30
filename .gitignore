@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 .opencode-memory/
 *.env
+webui.db.backup-*
+.local-backups/

@@ -53,7 +53,12 @@ echo "Public port: ${HOST_PORT}->${CONTAINER_PORT}"
 # v0.9.0 ships a DB schema migration — once the new container starts it
 # migrates in place, and the old container can no longer read the schema.
 # This backup is the rollback path.
-BACKUP_PATH="webui.db.backup-$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/owui-hybrid-router}"
+if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
+    BACKUP_DIR="$(pwd)/.local-backups"
+    mkdir -p "$BACKUP_DIR"
+fi
+BACKUP_PATH="${BACKUP_DIR}/webui.db.backup-$(date +%Y%m%d-%H%M%S)"
 echo ""
 echo "--- Backing up webui.db to ${BACKUP_PATH} ---"
 if docker cp "${OLD_ID}:/app/backend/data/webui.db" "${BACKUP_PATH}" 2>/dev/null; then
