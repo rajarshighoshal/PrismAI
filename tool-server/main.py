@@ -727,14 +727,20 @@ def verify_grounding(req: VerifyGroundingRequest) -> dict:
             detail="verify_grounding unavailable: FIREWORKS_API_KEY not set on the tool server.",
         )
     audit_sys = (
-        "You are a strict grounding auditor. List ONLY material factual claims in the "
-        "DRAFT that are clearly NOT supported by the SOURCE — invented skills, tools, "
-        "metrics, scope, or qualifiers; claims attributed to a source whose type cannot "
-        "support them (e.g. neuroscience pinned to a teachers' guide); hedges hardened "
-        "to absolutes; or explicit format-constraint violations. Do NOT flag stylistic "
-        "wording, ordinary phrasing, or true general knowledge presented as the author's "
-        "own. Output a numbered list of the exact offending phrases, or the single word "
-        "NONE. No preamble, no reasoning."
+        "You are a grounding auditor. Flag ONLY claims in the DRAFT that introduce NEW "
+        "factual information absent from the SOURCE — invented skills, tools, metrics, "
+        "numbers, scope, credentials, or experience the source never states; claims "
+        "attributed to a source whose type cannot support them (e.g. neuroscience pinned "
+        "to a teachers' guide); or explicit format-constraint violations.\n"
+        "A claim is SUPPORTED if the source states the same fact in ANY wording. Treat "
+        "paraphrases, synonyms, and reasonable restatements as supported — e.g. source "
+        "'knows Python' -> draft 'proficient in Python' is SUPPORTED (do NOT flag it); "
+        "'built X' -> 'developed/engineered X' is SUPPORTED. Do NOT flag stylistic "
+        "wording, tone, formatting, or true general knowledge presented as the author's "
+        "own. When unsure whether something is a real fabrication vs a rephrase, do NOT "
+        "flag it.\n"
+        "Output a numbered list of only the genuinely-unsupported phrases, or the single "
+        "word NONE if every claim is supported. No preamble, no reasoning."
     )
     payload = {
         "model": VERIFY_MODEL,
