@@ -145,7 +145,56 @@ def _safe_filename(name: Optional[str], default: str) -> str:
     return safe or default
 
 
+# Reasoning/tool-call markup that some models (notably DeepSeek V4) leak into
+# tool arguments. If it reaches the exported file it corrupts the user-facing
+# document, so every export path is sanitized at the choke point below.
+_LEAK_PATTERNS = [
+    # DeepSeek DSML tool-call markup, incl. the fullwidth-pipe variant seen live
+    re.compile(r"<[｜|]?\s*DSML[｜|]?[^>]*>.*?(?=\n|$)", re.IGNORECASE | re.DOTALL),
+    re.compile(r"</?\s*[｜|]?\s*(?:tool_calls?|invoke|parameter)\b[^>]*>", re.IGNORECASE),
+    # Reasoning blocks
+    re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL),
+    re.compile(r"<reasoning>.*?</reasoning>", re.IGNORECASE | re.DOTALL),
+    re.compile(r"<\|?(?:assistant|channel|analysis)\|?>", re.IGNORECASE),
+]
+# A leading planning preamble like "Let me analyze this carefully..." or
+# "The user wants a ... paragraph. ... I'll condense." — strip the planning
+# block when it appears at the very start of the content.
+_PREAMBLE_CUE = re.compile(
+    r"^(?:\s*(?:let me|i'?ll|i will|first,? let me|okay,? let me|now,? let me|"
+    r"the user (?:wants|is asking|asked|needs)|we need to|here'?s my (?:plan|analysis)|"
+    r"let'?s)\b.*?)(?=\n\s*\n)",
+    re.IGNORECASE | re.DOTALL,
+)
+# A "Draft:" / "Here is the draft:" label that some models emit right before the
+# real content. If it sits in the first part of the text, drop everything up to
+# and including the label so only the deliverable remains.
+_DRAFT_LABEL = re.compile(
+    r"^.{0,600}?\b(?:here(?:'?s| is) the (?:draft|final|letter|response)|draft)\s*:\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_reasoning_leak(markdown: str) -> str:
+    """Remove model reasoning / tool-call markup that leaked into content."""
+    if not markdown:
+        return markdown
+    cleaned = markdown
+    for pat in _LEAK_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    # Drop a single leading planning preamble paragraph if present.
+    m = _PREAMBLE_CUE.match(cleaned.lstrip("\n"))
+    if m and len(m.group(0)) < 1200:
+        cleaned = cleaned.lstrip("\n")[m.end():]
+    # Drop a leading "Draft:"/"Here is the draft:" label if it sits up front.
+    dm = _DRAFT_LABEL.match(cleaned.lstrip("\n"))
+    if dm:
+        cleaned = cleaned.lstrip("\n")[dm.end():]
+    return cleaned.strip() + "\n"
+
+
 def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
+    markdown = _strip_reasoning_leak(markdown)
     with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
@@ -396,7 +445,7 @@ def export_pdf(req: ExportRequest, request: Request) -> list[Any]:
 def export_markdown(req: ExportRequest, request: Request) -> list[Any]:
     filename = _safe_filename(req.filename, "document")
     return _file_result(
-        req.markdown.encode("utf-8"),
+        _strip_reasoning_leak(req.markdown).encode("utf-8"),
         "text/markdown",
         f"{filename}.md",
         request,
