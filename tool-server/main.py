@@ -45,6 +45,11 @@ OPENWEBUI_ATTACH_EXPORTS = os.getenv("OPENWEBUI_ATTACH_EXPORTS", "true").lower()
     "no",
 }
 
+# For /verify_grounding: the auditor LLM. Key from env; endpoint no-ops with a
+# clear error if unset, so the server still starts without it.
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
+VERIFY_MODEL = os.getenv("VERIFY_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+
 
 # --- Request models -------------------------------------------------------
 
@@ -682,5 +687,87 @@ def search_citation(req: CitationSearchRequest) -> dict:
             "match_score is title-token overlap with your query, not authority. "
             "A low top score (< 0.3) likely means the work is not well indexed in "
             "CrossRef; prefer citing from knowledge over forcing a weak match."
+        ),
+    }
+
+
+class VerifyGroundingRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "The ground-truth material the draft must stay faithful to — the "
+            "user's resume, the cited source's scope, the notes, or the posting. "
+            "Every claim in the draft will be checked against ONLY this."
+        ),
+    )
+    draft: str = Field(
+        ...,
+        description="The draft text to audit for unsupported / fabricated claims.",
+    )
+
+
+@app.post(
+    "/verify_grounding",
+    summary="Audit a draft for claims not supported by a source (anti-fabrication)",
+    description=(
+        "Strict grounding auditor. Returns the list of MATERIAL claims in the draft "
+        "that are NOT supported by the source — invented skills/tools/metrics/scope, "
+        "claims attributed to a source whose type cannot support them, hardened "
+        "hedges, or format-constraint violations. Call this on your own draft BEFORE "
+        "finalizing any source-bound document (cover letters, summaries of a cited "
+        "work, resume bullets) so you can remove fabrications. Returns grounded=true "
+        "with an empty list when every claim is supported."
+    ),
+    operation_id="verify_grounding",
+)
+def verify_grounding(req: VerifyGroundingRequest) -> dict:
+    if not FIREWORKS_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="verify_grounding unavailable: FIREWORKS_API_KEY not set on the tool server.",
+        )
+    audit_sys = (
+        "You are a strict grounding auditor. List ONLY material factual claims in the "
+        "DRAFT that are clearly NOT supported by the SOURCE — invented skills, tools, "
+        "metrics, scope, or qualifiers; claims attributed to a source whose type cannot "
+        "support them (e.g. neuroscience pinned to a teachers' guide); hedges hardened "
+        "to absolutes; or explicit format-constraint violations. Do NOT flag stylistic "
+        "wording, ordinary phrasing, or true general knowledge presented as the author's "
+        "own. Output a numbered list of the exact offending phrases, or the single word "
+        "NONE. No preamble, no reasoning."
+    )
+    payload = {
+        "model": VERIFY_MODEL,
+        "max_tokens": 1500,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": audit_sys},
+            {"role": "user", "content": f"SOURCE:\n{req.source}\n\nDRAFT:\n{req.draft}\n\nUnsupported claims:"},
+        ],
+    }
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(
+                "https://api.fireworks.ai/inference/v1/chat/completions",
+                headers={"Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                         "Content-Type": "application/json"},
+                json=payload,
+            )
+            r.raise_for_status()
+            content = (r.json()["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        logger.exception("verify_grounding failed")
+        raise HTTPException(status_code=502, detail=f"auditor call failed: {e}")
+
+    grounded = content.upper().strip().startswith("NONE") or not content
+    return {
+        "grounded": grounded,
+        "unsupported_claims": "" if grounded else content,
+        "guidance": (
+            "All claims are supported by the source."
+            if grounded
+            else "Remove or honestly hedge each listed claim, then re-finalize. "
+            "For an out-of-scope citation, keep the true statement but drop the wrong "
+            "citation rather than deleting the sentence."
         ),
     }
