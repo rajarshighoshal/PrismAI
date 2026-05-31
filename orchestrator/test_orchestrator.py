@@ -8,7 +8,7 @@ any API calls.
 """
 import asyncio
 
-from orchestrator import config, fireworks, pipeline, toolserver
+from orchestrator import config, fireworks, pipeline, search, toolserver
 from orchestrator.depth import classify_depth, CHAT, GROUNDED, DELIVERABLE
 
 _calls = {"models": []}
@@ -27,6 +27,26 @@ async def _fake_verify_grounded(source, draft, *, session=None):
 
 async def _fake_verify_ungrounded(source, draft, *, session=None):
     return {"grounded": False, "unsupported_claims": "1. invented metric"}
+
+
+async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None):
+    sys = messages[0]["content"] if messages else ""
+    if "search query" in sys:
+        return "mars latest news"
+    if "Revise the draft" in sys:
+        return "CORRECTED DOCUMENT BODY"
+    return "completion"
+
+
+async def _fake_search(query, *, max_results=None, session=None):
+    return [
+        {"title": "T1", "url": "https://a.com", "snippet": "snippet one"},
+        {"title": "T2", "url": "https://b.com", "snippet": "snippet two"},
+    ]
+
+
+async def _fake_search_empty(query, *, max_results=None, session=None):
+    return []
 
 
 async def _collect(messages, **kw):
@@ -61,9 +81,11 @@ async def _run_tests():
     check("depth: export intent sets wants_export",
           classify_depth("export this as a docx").wants_export is True)
 
-    # patch the network-touching pieces
+    # patch ALL network-touching pieces up front so no test hits the wire
     fireworks.stream = _fake_stream
+    fireworks.complete = _fake_complete
     config.ENABLE_VERIFICATION = True
+    config.ENABLE_REFINE = False  # warn-only first; the refine test flips this on
     config.MIN_SOURCE_CHARS = 20
 
     # --- CHAT: one streamed call on the CHAT model, content passes through ---
@@ -103,12 +125,51 @@ async def _run_tests():
     check("deliverable: warning footer appended", "⚠ Verification" in body)
     check("deliverable: lists the unsupported claim", "invented metric" in body)
 
-    # --- DELIVERABLE with no prior source -> no footer, no fake check ---
+    # --- DELIVERABLE with no source -> no footer, no fake check ---
     toolserver.verify_grounding = _fake_verify_ungrounded
-    ev = await _collect([{"role": "user", "content": "write me a haiku about the sea"}])
+    ev = await _collect([{"role": "user", "content": "write me an essay about the ocean"}])
     body = _content(ev)
     check("deliverable: no source -> no verification footer",
           "Verification" not in body and "✓" not in body)
+
+    # --- DELIVERABLE ungrounded + refine -> corrected version appended ---
+    fireworks.complete = _fake_complete
+    config.ENABLE_REFINE = True
+    toolserver.verify_grounding = _fake_verify_ungrounded
+    ev = await _collect(deliv)
+    body = _content(ev)
+    check("refine: corrected version appended", "Corrected version below" in body)
+    check("refine: corrected body present", "CORRECTED DOCUMENT BODY" in body)
+    check("refine: original flagged claim listed", "invented metric" in body)
+
+    # --- same-message source (paste + instruction in one turn) is verified ---
+    toolserver.verify_grounding = _fake_verify_grounded
+    one_msg = [{"role": "user", "content":
+        "write me a cover letter from these notes.\n\n"
+        "Notes: Rajarshi is a mechanical engineer who taught himself Python and "
+        "built an internal RAG email-triage tool at REAL Brokerage that cut "
+        "response time substantially."}]
+    ev = await _collect(one_msg)
+    check("same-message source: verification fires", "✓ Checked against your source" in _content(ev))
+
+    # --- GROUNDED with search results -> answer + cited sources footer ---
+    _calls["models"].clear()
+    search.search = _fake_search
+    fireworks.complete = _fake_complete
+    config.ENABLE_WEB_SEARCH = True
+    config.ENABLE_GROUNDED_VERIFY = False
+    ev = await _collect([{"role": "user", "content": "what's the latest news on mars"}])
+    body = _content(ev)
+    check("grounded: answer streamed", body.startswith("Hello from the model."))
+    check("grounded: sources footer present", "**Sources**" in body and "a.com" in body)
+    check("grounded: answered on CHAT_MODEL", _calls["models"] == [config.CHAT_MODEL])
+
+    # --- GROUNDED with no results -> careful answer, NO sources footer ---
+    search.search = _fake_search_empty
+    ev = await _collect([{"role": "user", "content": "what's the latest news on mars"}])
+    body = _content(ev)
+    check("grounded: no results -> no sources footer", "**Sources**" not in body)
+    check("grounded: no results -> still answers", body == "Hello from the model.")
 
     print()
     if fails:

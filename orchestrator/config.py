@@ -52,3 +52,22 @@ ENABLE_VERIFICATION = _flag("ENABLE_VERIFICATION", "true")
 
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
+
+# On an ungrounded deliverable, run one refine pass that strips/fixes the
+# unsupported claims and append the corrected version. Off -> warn-only footer.
+ENABLE_REFINE = _flag("ENABLE_REFINE", "true")
+
+# --- GROUNDED-tier web search (free-first, provider-pluggable) ---
+ENABLE_WEB_SEARCH = _flag("ENABLE_WEB_SEARCH", "true")
+# auto = first configured of searxng -> tavily -> duckduckgo. Or pin one.
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "auto").lower()
+SEARXNG_URL = os.getenv("SEARXNG_URL", "").rstrip("/")  # self-hosted, OSS (preferred)
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")        # hosted fallback
+SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
+SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "20"))
+# Cheap, no-CoT-leak model to compress the turn into a <=400-char search query.
+QUERY_MODEL = os.getenv("QUERY_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+QUERY_MAX_CHARS = int(os.getenv("QUERY_MAX_CHARS", "400"))
+# Also audit GROUNDED answers against retrieved snippets (extra call). Default off
+# to keep GROUNDED cheap; verification is reserved for deliverables.
+ENABLE_GROUNDED_VERIFY = _flag("ENABLE_GROUNDED_VERIFY", "false")
