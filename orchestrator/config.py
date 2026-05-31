@@ -55,6 +55,16 @@ ENABLE_STYLE_MEMORY = _flag("ENABLE_STYLE_MEMORY", "true")
 # Verification: run verify_grounding on deliverables that have source material.
 ENABLE_VERIFICATION = _flag("ENABLE_VERIFICATION", "true")
 ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
+
+# Honesty audit: catch claims about the USER (experience, seniority, credentials,
+# metrics, revenue) that the user never actually stated — an INSTRUCTION to assert
+# X is not evidence X is true. Runs on the final draft regardless of the grounding
+# gate (which wrongly waves through "creative writing" that inflates a resume).
+# Bake-off (2026-05-31) showed deepseek-v4-pro / glm-5p1 / gpt-oss-120b / gemini
+# all catch it; kimi leaks chain-of-thought. Default to the strong model; set
+# HONESTY_MODEL=accounts/fireworks/models/gpt-oss-120b for a cheaper auditor.
+ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
+HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))

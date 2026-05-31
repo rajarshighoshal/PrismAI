@@ -191,6 +191,22 @@ SYSTEM_GATE = (
     "with no external factual claims."
 )
 
+SYSTEM_HONESTY = (
+    "You are an honesty auditor for an assistant's draft written for a user. You are "
+    "given the full USER REQUEST (which mixes facts the user states about themselves "
+    "with instructions about what to write) and the DRAFT.\n"
+    "Flag every claim in the DRAFT that asserts something about the USER — years of "
+    "experience, seniority, leadership, employers, education, credentials, metrics, "
+    "revenue, achievements — that the user did NOT actually state as true about "
+    "themselves. CRITICAL: an INSTRUCTION to include or 'emphasize' a claim is NOT "
+    "evidence the claim is true. If the user says 'emphasize my 8 years of leadership' "
+    "but never states they HAVE 8 years, a draft asserting it is UNSUPPORTED. Do not "
+    "flag genuine stylistic wording, the user's real stated facts, or reasonable "
+    "paraphrase of them.\n"
+    "Output strict JSON only: {\"unsupported\": [\"exact phrase\", ...], \"verdict\": "
+    "\"FABRICATION\" if any unsupported self-claims exist, else \"CLEAN\"}."
+)
+
 SYSTEM_TOOL_GUARD = (
     "Decide whether a proposed tool call is necessary for the user's actual "
     "request. Return JSON only: {\"allow\": boolean, \"reason\": string}. "
@@ -488,9 +504,94 @@ async def _refine_to_source(source: str, candidate: str, claims: str, *, session
         return ""
 
 
+def _all_user_text(messages) -> str:
+    """Every user turn joined — facts AND instructions. The honesty auditor needs
+    the instructions too, so it can tell 'emphasize my 8 years' (an instruction)
+    apart from a stated fact."""
+    return "\n\n".join(
+        _text_of(m.get("content")).strip()
+        for m in messages
+        if m.get("role") == "user" and _text_of(m.get("content")).strip()
+    )
+
+
+async def _honesty_audit(full_request: str, candidate: str, *, session=None):
+    """Flag claims about the USER the user never stated. Returns the auditor dict
+    {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
+    if not candidate.strip():
+        return None
+    user = f"USER REQUEST:\n{full_request}\n\nDRAFT:\n{candidate[:6000]}"
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_HONESTY},
+             {"role": "user", "content": user}],
+            config.HONESTY_MODEL,
+            max_tokens=700,
+            temperature=0.0,
+            session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+async def _refine_honesty(full_request: str, candidate: str, unsupported, *, session=None) -> str:
+    """Rewrite the draft to drop unsupported self-claims WITHOUT inventing replacements."""
+    listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported self-claims)"
+    prompt = (
+        "Revise the draft so it makes NO claim about the user that the user did not "
+        "actually state. Remove or neutrally rephrase each listed unsupported claim "
+        "WITHOUT inventing replacements or new facts. Keep the requested format and "
+        "polished prose. If removing claims leaves the draft thin, that is acceptable "
+        "— do not pad with invented detail. Output only the revised final answer."
+    )
+    user = f"USER REQUEST:\n{full_request}\n\nUNSUPPORTED CLAIMS TO REMOVE:\n{listed}\n\nDRAFT:\n{candidate}"
+    try:
+        return await fireworks.complete(
+            [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
+            config.REFINE_MODEL,
+            max_tokens=config.DRAFT_MAX_TOKENS,
+            temperature=config.TEMPERATURE,
+            session=session,
+        )
+    except Exception:
+        return ""
+
+
+def _honesty_block_msg(unsupported) -> str:
+    listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else ""
+    return (
+        "I can't include claims about you that you haven't actually told me — that "
+        "would be fabrication, and avoiding exactly that is the point of this "
+        "assistant. These weren't supported by anything you stated:\n\n" + listed
+        + "\n\nGive me the real details (or confirm them) and I'll write it accurately."
+    )
+
+
 async def _verified_or_blocked(messages, candidate: str, source: str, *, session=None):
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
+
+    # Honesty audit FIRST — independent of the grounding gate, which wrongly waves
+    # through "creative writing" that inflates the user's credentials. This is the
+    # founding can't-lie guarantee: a request to assert experience the user never
+    # stated must not produce a confident fabrication.
+    if getattr(config, "ENABLE_HONESTY_AUDIT", True):
+        full_request = _all_user_text(messages)
+        honesty = await _honesty_audit(full_request, candidate, session=session)
+        if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
+            unsupported = honesty.get("unsupported") or []
+            refined = await _refine_honesty(full_request, candidate, unsupported, session=session)
+            if refined:
+                recheck = await _honesty_audit(full_request, refined, session=session)
+                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("FAB"):
+                    candidate = refined  # cleaned draft continues through grounding checks
+                else:
+                    return "unsupported_self_claims", _honesty_block_msg(unsupported)
+            else:
+                return "unsupported_self_claims", _honesty_block_msg(unsupported)
 
     if not source.strip() and _has_citation_markers(candidate):
         return (
