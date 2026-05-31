@@ -33,6 +33,10 @@ def _user_id(request: Request) -> str:
     )
 
 
+def _request_headers(request: Request) -> dict:
+    return {k.lower(): v for k, v in request.headers.items()}
+
+
 def _chunk(cid, model, *, role=None, content=None, reasoning=None, finish=None) -> str:
     delta = {}
     if role is not None:
@@ -74,6 +78,7 @@ async def chat_completions(request: Request):
     want_stream = bool(body.get("stream"))
     model = body.get("model") or config.ADVERTISED_CHAT_ID
     user_id = _user_id(request)
+    request_headers = _request_headers(request)
     cid = "chatcmpl-" + uuid.uuid4().hex
 
     if want_stream:
@@ -81,7 +86,12 @@ async def chat_completions(request: Request):
             session = aiohttp.ClientSession()
             try:
                 yield _chunk(cid, model, role="assistant")
-                async for kind, text in pipeline.run(messages, user_id=user_id, session=session):
+                async for kind, text in pipeline.run(
+                    messages,
+                    user_id=user_id,
+                    session=session,
+                    request_headers=request_headers,
+                ):
                     if kind == "content":
                         yield _chunk(cid, model, content=text)
                     elif kind == "reasoning":
@@ -101,7 +111,12 @@ async def chat_completions(request: Request):
     session = aiohttp.ClientSession()
     try:
         parts = []
-        async for kind, text in pipeline.run(messages, user_id=user_id, session=session):
+        async for kind, text in pipeline.run(
+            messages,
+            user_id=user_id,
+            session=session,
+            request_headers=request_headers,
+        ):
             if kind == "content":
                 parts.append(text)
         content = "".join(parts)

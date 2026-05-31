@@ -24,6 +24,11 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "accounts/fireworks/models/deepseek-v4-pro"
 VISION_MODEL = os.getenv("VISION_MODEL", "accounts/fireworks/models/kimi-k2p6")
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", CHAT_MODEL)          # deliverable first draft
 REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
+# Agentic harness model roles. The controller decides tool use; the final model
+# shifts to GLM after source-bearing tools because it measured stronger there.
+AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
+GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/glm-5p1")
+GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/gpt-oss-120b")
 # The auditor model lives in the tool-server (gpt-oss-120b); we just call it.
 
 # Advertised model ids — what OWUI shows in this connection's model list.
@@ -49,6 +54,12 @@ ENABLE_STYLE_MEMORY = _flag("ENABLE_STYLE_MEMORY", "true")
 
 # Verification: run verify_grounding on deliverables that have source material.
 ENABLE_VERIFICATION = _flag("ENABLE_VERIFICATION", "true")
+ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))
+AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
+GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
+MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "6"))
+MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "2"))
 
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))

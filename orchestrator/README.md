@@ -1,82 +1,95 @@
 # Orchestrator
 
-A standalone **OpenAI-compatible** service that sits behind OpenWebUI and
-replaces the `router_fn` filter. OWUI becomes a pure chat UI; this service makes
-the decisions — classify turn depth, pick the best model per task, draft, verify
-grounding, and stream the result.
+A standalone **OpenAI-compatible** service that sits behind OpenWebUI. OWUI
+becomes the chat UI; this service runs a model-driven tool loop, picks models
+per step, and enforces verification before source-bound factual output is shown.
 
-Founding reason: closed assistants make factual mistakes and present them with
-confidence and **no verification**. This puts a verification step into the turn
-itself, so deliverables grounded in the user's own material get checked before
-they're trusted.
+The goal is not prompt engineering. The harness gives the model the tools and
+keeps the hard guarantees in code:
 
-## Design (harness, not prompting)
+- the model decides whether to call tools and which tools to chain
+- all existing server tools are exposed: search, fetch, exports, citation lookup,
+  citation search, and grounding verification
+- source-bearing answers are checked before display
+- web citations are limited to URL-backed retrieved sources; search summaries
+  are not treated as citable evidence
+- unsupported drafts are withheld, repaired, or blocked
+- costs scale with the task: plain chat can finish with one model call; research
+  and exports pay for the extra tool and verification work
 
-Prompts are short and plain on purpose — the prompt is just the prior. The value
-is in the control flow:
+## Model Roles
 
-| Tier | Trigger | Machinery | Cost |
-|------|---------|-----------|------|
-| **CHAT** | default | one streamed completion (`deepseek-v4-pro`) | 1 call |
-| **GROUNDED** | factual/research ask | one streamed completion with a careful-with-facts prior (web search planned) | 1 call |
-| **DELIVERABLE** | "write a …", "turn this into …", export intent | stream the draft live → if the user supplied source material, audit it with the tool-server and append an honest verification footer | 1 call + 1 audit |
+Defaults are env-driven in `config.py`:
 
-Cost is **task-dependent**, not a fixed multiplier: plain chat stays at one call;
-only real document turns pay for verification, and only when there's actual
-source material to check against (no source → no fake check).
+- `AGENT_MODEL`: tool-use controller, default `deepseek-v4-pro`
+- `GROUNDED_MODEL`: final model after source-gathering tools, default `glm-5p1`
+- `GROUNDING_GATE_MODEL`: cheap final gate, default `gpt-oss-120b`
+- auditor model: lives in the tool-server `verify_grounding` endpoint
 
-Vision turns (messages with images) route to the vision model
-(`kimi-k2p6`) as a single streamed pass.
+Vision turns still route to `VISION_MODEL` because image input support is a
+modality constraint, not a task-flow router.
 
 ## Files
 
-- `app.py` — OpenAI wire format: `GET /v1/models`, `POST /v1/chat/completions`
+- `app.py` - OpenAI wire format: `GET /v1/models`, `POST /v1/chat/completions`
   (streaming + non-streaming), `/health`.
-- `pipeline.py` — the depth-routed control flow (the harness).
-- `depth.py` — pure, tested turn-depth classifier.
-- `fireworks.py` — streaming/non-streaming Fireworks client. Reads
-  `message.content` for the answer; forwards `reasoning_content` only as the
-  collapsible thinking UI, never as final output.
-- `toolserver.py` — client for `verify_grounding` (fails soft).
-- `style.py` — reads per-user writing-style profiles from `webui.db`
-  (populated by the weekly `consolidate_style` job; read-only here).
-- `config.py` — all env-driven.
-- `deploy.sh` — build + run the container on OWUI's docker network.
-- `test_orchestrator.py` — offline contract tests (no network).
+- `agent.py` - model-driven tool-call loop and verification gate.
+- `pipeline.py` - compatibility wrapper exposing `agent.run`.
+- `fireworks.py` - Fireworks chat client, including OpenAI-compatible tool calls.
+- `search.py` - provider-pluggable web search; Tavily path keeps advanced search
+  and AI summary parity with the proven `router_fn.py` behavior.
+- `toolserver.py` - async client for the existing tool-server endpoints.
+- `style.py` - reads per-user writing-style profiles from `webui.db`, style only.
+- `ab_eval.py` - Claude-vs-agent A/B harness with judge output.
+- `test_orchestrator.py` - offline contract tests, no network.
 
-## Configure (env / `orchestrator.env`)
+## Configure
 
 `orchestrator.env` is git-ignored and holds secrets. Minimum:
 
-```
+```env
 FIREWORKS_API_KEY=...
 ```
 
-Other knobs (with defaults) live in `config.py`: `CHAT_MODEL`, `VISION_MODEL`,
-`DRAFT_MODEL`, `TOOL_SERVER_URL`, `ENABLE_VERIFICATION`, `ENABLE_STYLE_MEMORY`,
-`MIN_SOURCE_CHARS`, `ORCH_API_KEY`.
+Common knobs:
+
+```env
+TOOL_SERVER_URL=http://owui-tool-server:8001
+TAVILY_API_KEY=...
+AGENT_MAX_STEPS=8
+GROUNDING_REPAIR_STEPS=2
+ENABLE_VERIFICATION=true
+ENABLE_GROUNDING_GATE=true
+```
+
+For export attachment, the tool-server still needs OpenWebUI chat/message
+headers or its own `OPENWEBUI_API_KEY`. The orchestrator forwards the relevant
+headers when OWUI provides them.
 
 ## Test
 
-```
+```bash
 python -m orchestrator.test_orchestrator
+python -m py_compile orchestrator/*.py
 ```
+
+## A/B Eval
+
+```bash
+python -m orchestrator.ab_eval --out ab_results.json
+```
+
+This calls `claude -p <prompt>` by default, runs the same prompt through the
+local agent, then asks a judge model to compare intent, prose, grounding, and
+verification honesty. Override the Claude command with `CLAUDE_CMD` or
+`--claude-cmd`. Override the judge with `JUDGE_MODEL`.
 
 ## Deploy
 
-```
+```bash
 ./orchestrator/deploy.sh
 ```
 
-Then in OWUI: **Admin → Settings → Connections → add an OpenAI connection** with
-base URL `http://owui-orchestrator:8002/v1` and any API key (set `ORCH_API_KEY`
-to enforce one). For per-user style memory, set
-`ENABLE_FORWARD_USER_INFO_HEADERS=true` on the `open-webui` container so the
-logged-in user's id is forwarded.
-
-## Status
-
-MVP: CHAT + GROUNDED + DELIVERABLE-with-verification all wired and streaming.
-Planned follow-ups: web search on the GROUNDED tier, same-message source
-detection, optional draft→verify→**refine** loop for a clean grounded final, and
-export (docx/pdf) hand-off on export intent.
+Then in OWUI: **Admin -> Settings -> Connections -> add an OpenAI connection**
+with base URL `http://owui-orchestrator:8002/v1`. Prod deploy remains
+user-gated.

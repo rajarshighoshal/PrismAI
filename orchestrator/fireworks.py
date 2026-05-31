@@ -9,9 +9,17 @@ Two hard-won rules baked in:
 """
 import json
 
-import aiohttp
+try:
+    import aiohttp
+except ImportError:  # lets offline tests run without installed service deps
+    aiohttp = None
 
 from . import config
+
+
+def _require_aiohttp():
+    if aiohttp is None:
+        raise RuntimeError("aiohttp is required for live Fireworks calls")
 
 
 def _headers() -> dict:
@@ -23,8 +31,34 @@ def _headers() -> dict:
 
 async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
     """Non-streaming completion. Returns the final answer text (content only)."""
+    result = await chat(
+        messages,
+        model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        session=session,
+    )
+    return (result.get("message", {}).get("content") or "").strip()
+
+
+async def chat(
+    messages,
+    model,
+    *,
+    max_tokens,
+    temperature=None,
+    session=None,
+    tools=None,
+    tool_choice=None,
+) -> dict:
+    """Non-streaming chat completion.
+
+    Returns {"message": ..., "finish_reason": ...}. When `tools` is supplied,
+    the returned message may contain OpenAI-compatible `tool_calls`.
+    """
     own = session is None
     if own:
+        _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
         payload = {
@@ -33,6 +67,10 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
             "max_tokens": max_tokens,
             "temperature": config.TEMPERATURE if temperature is None else temperature,
         }
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
             headers=_headers(),
@@ -42,7 +80,10 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
             resp.raise_for_status()
             data = await resp.json()
         choice = data["choices"][0]
-        return (choice["message"].get("content") or "").strip()
+        return {
+            "message": choice.get("message") or {},
+            "finish_reason": choice.get("finish_reason"),
+        }
     finally:
         if own:
             await session.close()
@@ -55,6 +96,7 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
     """
     own = session is None
     if own:
+        _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
         payload = {

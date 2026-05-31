@@ -8,9 +8,19 @@ Order when SEARCH_PROVIDER=auto (first configured wins):
 Every provider returns a list of {"title", "url", "snippet"} and fails soft to
 [] so a search hiccup degrades to an ungrounded answer rather than an error.
 """
-import aiohttp
+import asyncio
+
+try:
+    import aiohttp
+except ImportError:  # lets offline tests run without installed service deps
+    aiohttp = None
 
 from . import config
+
+
+def _require_aiohttp():
+    if aiohttp is None:
+        raise RuntimeError("aiohttp is required for live web search calls")
 
 
 def _provider() -> str:
@@ -46,20 +56,40 @@ async def _searxng(query, n, session):
 
 
 async def _tavily(query, n, session):
+    # Parity with the proven router_fn path: advanced depth + the AI summary,
+    # with a small retry on transient failures. Tavily rejects queries >400 chars.
     payload = {
         "api_key": config.TAVILY_API_KEY,
-        "query": query[:400],  # Tavily rejects queries over 400 chars
+        "query": query[:400],
+        "search_depth": "advanced",
+        "include_answer": True,
         "max_results": n,
-        "search_depth": "basic",
     }
-    async with session.post(
-        "https://api.tavily.com/search",
-        json=payload,
-        timeout=aiohttp.ClientTimeout(total=config.SEARCH_TIMEOUT),
-    ) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            async with session.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=config.SEARCH_TIMEOUT),
+            ) as resp:
+                if resp.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientError(f"tavily {resp.status}")
+                resp.raise_for_status()
+                data = await resp.json()
+            break
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_exc = e
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                raise
     out = []
+    # Tavily's synthesized answer is high-signal grounding — surface it as [1]
+    # so the model can cite it, mirroring router_fn's "Tavily AI Summary".
+    answer = (data.get("answer") or "").strip()
+    if answer:
+        out.append({"title": "Tavily AI summary", "url": "", "snippet": answer})
     for r in (data.get("results") or [])[:n]:
         out.append(
             {
@@ -104,6 +134,7 @@ async def search(query, *, max_results=None, session=None):
     n = max_results or config.SEARCH_MAX_RESULTS
     own = session is None
     if own:
+        _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
         provider = _provider()
