@@ -7,3 +7,5 @@ __pycache__/
 *.env
 webui.db.backup-*
 .local-backups/
+orchestrator/orchestrator.env
+orchestrator/__pycache__/
