@@ -92,7 +92,8 @@ def _llm(messages: list[dict], budget: int = 700) -> str:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=120) as r:
-        return (r.json()["choices"][0]["message"].get("content") or "").strip()
+        data = json.load(r)
+    return (data["choices"][0]["message"].get("content") or "").strip()
 
 
 def consolidate() -> dict:
