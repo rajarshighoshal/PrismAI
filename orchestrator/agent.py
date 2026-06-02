@@ -173,7 +173,11 @@ SYSTEM_AGENT = (
     "mechanism, metrics, or outcomes beyond those facts; keep every concrete "
     "claim traceable to the supplied text. "
     "If evidence is insufficient, say what cannot be verified. Final answers "
-    "should be polished, direct, and natural."
+    "should be polished, direct, and natural.\n"
+    "Return ONLY what the user asked for: no preamble (no 'Here's a...'), no "
+    "sign-off commentary, no offers to tailor it further. Match the requested "
+    "format and length exactly. Add nothing beyond the given or verified facts — "
+    "no invented flourish or padding."
 )
 
 SYSTEM_VISION = (
