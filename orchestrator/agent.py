@@ -349,6 +349,25 @@ def _select_model(has_sources: bool) -> str:
     return config.GROUNDED_MODEL if has_sources else config.AGENT_MODEL
 
 
+def _tool_status(name: str, args: dict) -> str:
+    """Human-readable 'show your work' line for a tool call, streamed to the UI
+    as reasoning so the chat visibly narrates what the agent is doing."""
+    q = (args.get("query") or "").strip()
+    url = (args.get("url") or "").strip()
+    doi = (args.get("doi") or "").strip()
+    return {
+        "web_search": f"🔍 Searching the web: {q}" if q else "🔍 Searching the web…",
+        "fetch_url": f"📄 Reading {url}" if url else "📄 Reading the page…",
+        "lookup_doi_citation": f"📚 Looking up DOI {doi}" if doi else "📚 Looking up the citation…",
+        "search_citation": f"📚 Searching for the citation: {q}" if q else "📚 Searching citations…",
+        "verify_grounding": "✅ Verifying the draft against the sources…",
+        "export_docx": "📝 Exporting a Word document…",
+        "export_pdf": "📝 Exporting a PDF…",
+        "export_markdown": "📝 Exporting a markdown file…",
+        "export_csv": "📊 Exporting a CSV…",
+    }.get(name, f"🔧 Using {name}…")
+
+
 def _tool_path(name: str) -> str:
     return {
         "fetch_url": "/fetch_url",
@@ -691,6 +710,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 tool_call_count += 1
                 if name == "web_search":
                     web_search_count += 1
+                if config.SHOW_WORK:
+                    yield ("reasoning", _tool_status(name, args) + "\n")
                 allowed, reason = await _tool_allowed(
                     name,
                     args,
@@ -736,6 +757,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             )
             continue
 
+        if config.SHOW_WORK:
+            yield ("reasoning", "✍️ Writing and verifying the answer…\n")
         status, text = await _verified_or_blocked(
             messages,
             candidate,

@@ -65,11 +65,15 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # HONESTY_MODEL=accounts/fireworks/models/gpt-oss-120b for a cheaper auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
 HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
-AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
-MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "6"))
-MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "2"))
+MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10"))
+MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
+
+# Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
+# to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
+SHOW_WORK = _flag("SHOW_WORK", "true")
 
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
