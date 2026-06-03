@@ -846,6 +846,23 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             )
             continue
 
+        if gemini.available() and not use_gemini:
+            if prose_tier_cached is None:
+                prose_tier_cached = await _classify_prose_tier(messages, session=session)
+            if prose_tier_cached == "formal" or export_requested:
+                if config.SHOW_WORK:
+                    yield ("reasoning", "✨ Using premium prose model…\n")
+                gemini_result = await gemini.chat(
+                    scratch,
+                    config.GEMINI_PROSE_MODEL,
+                    max_tokens=config.AGENT_MAX_TOKENS,
+                    temperature=config.WRITER_TEMPERATURE,
+                    session=session,
+                )
+                gemini_candidate = (gemini_result.get("message", {}).get("content") or "").strip()
+                if gemini_candidate:
+                    candidate = gemini_candidate
+
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Writing and verifying the answer…\n")
         status, text = await _verified_or_blocked(
