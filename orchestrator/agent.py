@@ -852,8 +852,15 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             if prose_tier_cached == "formal" or export_requested:
                 if config.SHOW_WORK:
                     yield ("reasoning", "✨ Polishing…\n")
+                # Filter out tool messages - Gemini doesn't support them
+                gemini_messages = [
+                    {"role": m["role"], "content": _text_of(m.get("content"))}
+                    for m in scratch
+                    if m.get("role") in ("system", "user", "assistant")
+                    and not m.get("tool_calls")
+                ]
                 gemini_result = await gemini.chat(
-                    scratch,
+                    gemini_messages,
                     config.GEMINI_PROSE_MODEL,
                     max_tokens=config.AGENT_MAX_TOKENS,
                     temperature=config.WRITER_TEMPERATURE,
