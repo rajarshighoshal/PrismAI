@@ -761,7 +761,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
 
         if use_gemini:
             if config.SHOW_WORK:
-                yield ("reasoning", "✨ Using premium prose model…\n")
+                yield ("reasoning", "✨ Polishing…\n")
             result = await gemini.chat(
                 scratch,
                 config.GEMINI_PROSE_MODEL,
@@ -851,7 +851,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 prose_tier_cached = await _classify_prose_tier(messages, session=session)
             if prose_tier_cached == "formal" or export_requested:
                 if config.SHOW_WORK:
-                    yield ("reasoning", "✨ Using premium prose model…\n")
+                    yield ("reasoning", "✨ Polishing…\n")
                 gemini_result = await gemini.chat(
                     scratch,
                     config.GEMINI_PROSE_MODEL,
