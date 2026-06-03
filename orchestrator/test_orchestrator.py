@@ -170,6 +170,13 @@ async def _run_tests():
         config.GROUNDED_MODEL,
     ])
     check("agent: verify saw tool source", "Source One" in _calls["verify"][0][0])
+    # Untrusted-context hardening (borrowed from Odysseus): web/tool source text
+    # the model sees must be wrapped so embedded instructions are treated as data.
+    _tool_msgs = [
+        m for msgs in _calls["chat_messages"] for m in msgs if m.get("role") == "tool"
+    ]
+    check("security: tool output wrapped as untrusted",
+          any("UNTRUSTED SOURCE DATA" in (m.get("content") or "") for m in _tool_msgs))
 
     # Search summaries without URLs are useful hints but not citable evidence.
     _reset()

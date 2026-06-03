@@ -7,7 +7,7 @@ them, and final output is held until the grounding gate allows it.
 import json
 import re
 
-from . import config, fireworks, search, style, toolserver
+from . import config, fireworks, prompt_security, search, style, toolserver
 
 TOOL_SCHEMAS = [
     {
@@ -303,7 +303,7 @@ def _user_source(messages) -> str:
 
 
 def _initial_messages(messages, user_id: str):
-    system = SYSTEM_AGENT
+    system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY
     profile = style.get_style_profile(user_id)
     if profile:
         system += (
@@ -520,7 +520,7 @@ async def _refine_to_source(source: str, candidate: str, claims: str, *, session
             [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
             config.REFINE_MODEL,
             max_tokens=config.DRAFT_MAX_TOKENS,
-            temperature=config.TEMPERATURE,
+            temperature=config.WRITER_TEMPERATURE,
             session=session,
         )
     except Exception:
@@ -576,7 +576,7 @@ async def _refine_honesty(full_request: str, candidate: str, unsupported, *, ses
             [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
             config.REFINE_MODEL,
             max_tokens=config.DRAFT_MAX_TOKENS,
-            temperature=config.TEMPERATURE,
+            temperature=config.WRITER_TEMPERATURE,
             session=session,
         )
     except Exception:
@@ -693,11 +693,17 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                     ),
                 }
             )
+        # Split temperature by the turn's job: when tools are still on the table
+        # this is primarily a routing/decide turn (low temp = reliable tool choice
+        # + tight instruction-following); once the tool budget is exhausted the
+        # turn can only write the final artifact, so use the warmer writer temp
+        # for natural prose.
+        step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
         result = await fireworks.chat(
             scratch,
             model,
             max_tokens=config.AGENT_MAX_TOKENS,
-            temperature=config.TEMPERATURE,
+            temperature=step_temp,
             session=session,
             tools=tools,
             tool_choice="auto" if tools is not None else None,
@@ -740,13 +746,19 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 source_text = _source_from_tool(name, raw_result)
                 if source_text:
                     tool_sources.append(source_text)
-                visible = _visible_tool_result(name, raw_result)
+                visible = _compact_json(_visible_tool_result(name, raw_result))
+                # External/source-bearing tool output (web, fetched pages,
+                # citations) is untrusted: wrap it so embedded instructions are
+                # treated as data, not commands. Local tools (export/verify) are
+                # not externally sourced and pass through unwrapped.
+                if source_text:
+                    visible = prompt_security.wrap_untrusted(name, visible)
                 scratch.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id") or name,
                         "name": name,
-                        "content": _compact_json(visible),
+                        "content": visible,
                     }
                 )
             continue

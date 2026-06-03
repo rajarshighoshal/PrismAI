@@ -93,3 +93,14 @@ verification honesty. Override the Claude command with `CLAUDE_CMD` or
 Then in OWUI: **Admin -> Settings -> Connections -> add an OpenAI connection**
 with base URL `http://owui-orchestrator:8002/v1`. Prod deploy remains
 user-gated.
+
+## Borrowed ideas & attribution
+
+`prompt_security.py` (untrusted-context wrapper + prompt-injection policy) is
+adapted from the **Odysseus** project
+(https://github.com/pewdiepie-archdaemon/odysseus, MIT License, © 2025 Odysseus
+Contributors). All external/tool-gathered content is wrapped as untrusted data so
+the model treats it as reference material, never as instructions — which directly
+reinforces this service's anti-fabrication / verification goal. See the
+repo-root [`CREDITS.md`](../CREDITS.md) for full attribution and other ideas we
+studied from that project.
