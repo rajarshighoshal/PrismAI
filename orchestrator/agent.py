@@ -846,9 +846,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             )
             continue
 
+        print(f"[DEBUG] gemini.available()={gemini.available()}, use_gemini={use_gemini}")
         if gemini.available() and not use_gemini:
             if prose_tier_cached is None:
                 prose_tier_cached = await _classify_prose_tier(messages, session=session)
+            print(f"[DEBUG] prose_tier_cached={prose_tier_cached}, export_requested={export_requested}")
             if prose_tier_cached == "formal" or export_requested:
                 if config.SHOW_WORK:
                     yield ("reasoning", "✨ Polishing…\n")
