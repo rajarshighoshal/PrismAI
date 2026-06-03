@@ -852,6 +852,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 prose_tier_cached = await _classify_prose_tier(messages, session=session)
             print(f"[DEBUG] prose_tier_cached={prose_tier_cached}, export_requested={export_requested}")
             if prose_tier_cached == "formal" or export_requested:
+                print("[DEBUG] Entering Gemini polish block")
                 if config.SHOW_WORK:
                     yield ("reasoning", "✨ Polishing…\n")
                 gemini_messages = [
@@ -860,6 +861,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                     if m.get("role") in ("system", "user", "assistant")
                     and not m.get("tool_calls")
                 ]
+                print(f"[DEBUG] Calling Gemini with {len(gemini_messages)} messages")
                 try:
                     gemini_result = await gemini.chat(
                         gemini_messages,
@@ -868,12 +870,17 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                         temperature=config.WRITER_TEMPERATURE,
                         session=session,
                     )
+                    print(f"[DEBUG] Gemini returned: {str(gemini_result)[:200]}")
                     gemini_candidate = (gemini_result.get("message", {}).get("content") or "").strip()
                     if gemini_candidate:
                         candidate = gemini_candidate
+                        print("[DEBUG] Gemini candidate accepted")
                         if config.SHOW_WORK:
                             yield ("reasoning", "✅ Gemini polished\n")
+                    else:
+                        print("[DEBUG] Gemini returned empty candidate")
                 except Exception as e:
+                    print(f"[DEBUG] Gemini exception: {e}")
                     if config.SHOW_WORK:
                         yield ("reasoning", f"⚠️ Gemini failed: {e}\n")
 
