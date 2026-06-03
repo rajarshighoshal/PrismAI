@@ -21,7 +21,7 @@ FIREWORKS_BASE_URL = os.getenv(
 # for tasks classified as high-value, falling back to GLM-5.1 for standard tasks.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 ENABLE_GEMINI_PROSE = _flag("ENABLE_GEMINI_PROSE", "false")  # opt-in; set true + key to enable
-GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-3-pro")
+GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-2.5-pro")
 
 # tool-server (same docker network) — verification + export primitives.
 TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").rstrip("/")

@@ -22,11 +22,10 @@ def _require_aiohttp():
 
 
 def _headers() -> dict:
-    return {"Content-Type": "application/json"}
-
-
-def _url(path: str) -> str:
-    return f"{GEMINI_BASE_URL}{path}?key={config.GOOGLE_API_KEY}"
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.GOOGLE_API_KEY}",
+    }
 
 
 def available() -> bool:
@@ -70,7 +69,7 @@ async def chat(
             "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
         }
         async with session.post(
-            _url("/chat/completions"),
+            f"{GEMINI_BASE_URL}/chat/completions",
             headers=_headers(),
             json=payload,
             timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
@@ -103,7 +102,7 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
         }
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         async with session.post(
-            _url("/chat/completions"),
+            f"{GEMINI_BASE_URL}/chat/completions",
             headers=_headers(),
             json=payload,
             timeout=timeout,
