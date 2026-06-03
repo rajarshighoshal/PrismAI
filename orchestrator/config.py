@@ -38,6 +38,15 @@ ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "assistant-vision")
 # Generation knobs.
 CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))
 DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "8192"))
+# Split temperature by job instead of one compromise value:
+# - TOOL_TEMPERATURE: turns where the model decides/chains tools. Low = reliable
+#   tool selection and tight instruction-following (no "Here's a..." preamble).
+# - WRITER_TEMPERATURE: generating the final written artifact (and refine
+#   rewrites). Higher = natural, non-templated prose. The decision/gate calls
+#   stay hard 0.0 (classification, never creative).
+# TEMPERATURE kept as a back-compat default for any remaining shared call.
+TOOL_TEMPERATURE = float(os.getenv("TOOL_TEMPERATURE", "0.2"))
+WRITER_TEMPERATURE = float(os.getenv("WRITER_TEMPERATURE", "0.55"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))
 
 # Networking.
