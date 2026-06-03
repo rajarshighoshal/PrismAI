@@ -7,7 +7,7 @@ them, and final output is held until the grounding gate allows it.
 import json
 import re
 
-from . import config, fireworks, prompt_security, search, style, toolserver
+from . import config, fireworks, gemini, prompt_security, search, style, toolserver
 
 TOOL_SCHEMAS = [
     {
@@ -353,6 +353,49 @@ def _select_model(has_sources: bool) -> str:
     return config.GROUNDED_MODEL if has_sources else config.AGENT_MODEL
 
 
+SYSTEM_PROSE_CLASSIFIER = (
+    "Classify whether this user request is asking for FORMAL DELIVERABLE prose "
+    "(cover letter, resume, CV, research paper, thesis, formal letter, proposal, "
+    "report, personal statement, executive summary, manuscript, professional email "
+    "to external parties) vs CASUAL output (conversation, brainstorming, quick "
+    "answers, internal notes, code, debugging, explanations, informal chat).\n"
+    "Return JSON only: {\"tier\": \"formal\" | \"casual\", \"reason\": \"brief\"}."
+)
+
+
+async def _classify_prose_tier(messages, *, session=None) -> str:
+    """Classify if request is formal deliverable or casual. Returns 'formal' or 'casual'."""
+    user_text = _last_user_text(messages)
+    if not user_text:
+        return "casual"
+    try:
+        raw = await fireworks.complete(
+            [
+                {"role": "system", "content": SYSTEM_PROSE_CLASSIFIER},
+                {"role": "user", "content": user_text[:2000]},
+            ],
+            config.PROSE_CLASSIFIER_MODEL,
+            max_tokens=80,
+            temperature=0.0,
+            session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        return "formal" if data.get("tier") == "formal" else "casual"
+    except Exception:
+        return "casual"
+
+
+def _has_export_request(tool_calls) -> bool:
+    """Check if any tool call is an export (docx/pdf/markdown/csv)."""
+    for call in tool_calls or []:
+        fn = call.get("function") or {}
+        name = fn.get("name") or ""
+        if name in {"export_docx", "export_pdf", "export_markdown", "export_csv"}:
+            return True
+    return False
+
+
 def _tool_status(name: str, args: dict) -> str:
     """Human-readable 'show your work' line for a tool call, streamed to the UI
     as reasoning so the chat visibly narrates what the agent is doing."""
@@ -676,11 +719,15 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
     tool_call_count = 0
     web_search_count = 0
     budget_note_added = False
+    export_requested = False
+    prose_tier_cached = None
 
     for _ in range(config.AGENT_MAX_STEPS):
         source = _combined_source(user_source, tool_sources)
         model = _select_model(bool(source))
         tools = _budgeted_tools(tool_call_count, web_search_count)
+        use_gemini = False
+
         if tools is None and not budget_note_added:
             budget_note_added = True
             scratch.append(
@@ -693,26 +740,52 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                     ),
                 }
             )
+
+        # When generating final prose (tools exhausted), check if Gemini should be used.
+        # Export-triggered (zero cost) or LLM-classified (cheap gpt-oss call).
+        if tools is None and gemini.available():
+            if export_requested:
+                use_gemini = True
+            else:
+                if prose_tier_cached is None:
+                    prose_tier_cached = await _classify_prose_tier(messages, session=session)
+                if prose_tier_cached == "formal":
+                    use_gemini = True
+
         # Split temperature by the turn's job: when tools are still on the table
         # this is primarily a routing/decide turn (low temp = reliable tool choice
         # + tight instruction-following); once the tool budget is exhausted the
         # turn can only write the final artifact, so use the warmer writer temp
         # for natural prose.
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
-        result = await fireworks.chat(
-            scratch,
-            model,
-            max_tokens=config.AGENT_MAX_TOKENS,
-            temperature=step_temp,
-            session=session,
-            tools=tools,
-            tool_choice="auto" if tools is not None else None,
-        )
+
+        if use_gemini:
+            if config.SHOW_WORK:
+                yield ("reasoning", "✨ Using premium prose model…\n")
+            result = await gemini.chat(
+                scratch,
+                config.GEMINI_PROSE_MODEL,
+                max_tokens=config.AGENT_MAX_TOKENS,
+                temperature=step_temp,
+                session=session,
+            )
+        else:
+            result = await fireworks.chat(
+                scratch,
+                model,
+                max_tokens=config.AGENT_MAX_TOKENS,
+                temperature=step_temp,
+                session=session,
+                tools=tools,
+                tool_choice="auto" if tools is not None else None,
+            )
         message = result.get("message") or {}
         tool_calls = message.get("tool_calls") or []
 
         if tool_calls:
             scratch.append(_clean_assistant_tool_message(message))
+            if _has_export_request(tool_calls):
+                export_requested = True
             for call in tool_calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""

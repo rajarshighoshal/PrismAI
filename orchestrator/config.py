@@ -16,6 +16,13 @@ FIREWORKS_BASE_URL = os.getenv(
     "FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"
 ).rstrip("/")
 
+# Google Gemini API for high-value prose (cover letters, resumes, research papers).
+# When enabled, the orchestrator routes final prose output through Gemini 3 Pro
+# for tasks classified as high-value, falling back to GLM-5.1 for standard tasks.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+ENABLE_GEMINI_PROSE = _flag("ENABLE_GEMINI_PROSE", "false")  # opt-in; set true + key to enable
+GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-3-pro")
+
 # tool-server (same docker network) — verification + export primitives.
 TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").rstrip("/")
 
@@ -86,6 +93,10 @@ SHOW_WORK = _flag("SHOW_WORK", "true")
 
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
+
+# Prose tier classifier model — cheap, fast model to determine if a request is
+# high-value formal prose (→ Gemini) or casual conversation (→ GLM).
+PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/gpt-oss-120b")
 
 # On an ungrounded deliverable, run one refine pass that strips/fixes the
 # unsupported claims and append the corrected version. Off -> warn-only footer.
