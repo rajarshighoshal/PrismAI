@@ -852,23 +852,28 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             if prose_tier_cached == "formal" or export_requested:
                 if config.SHOW_WORK:
                     yield ("reasoning", "✨ Polishing…\n")
-                # Filter out tool messages - Gemini doesn't support them
                 gemini_messages = [
                     {"role": m["role"], "content": _text_of(m.get("content"))}
                     for m in scratch
                     if m.get("role") in ("system", "user", "assistant")
                     and not m.get("tool_calls")
                 ]
-                gemini_result = await gemini.chat(
-                    gemini_messages,
-                    config.GEMINI_PROSE_MODEL,
-                    max_tokens=config.AGENT_MAX_TOKENS,
-                    temperature=config.WRITER_TEMPERATURE,
-                    session=session,
-                )
-                gemini_candidate = (gemini_result.get("message", {}).get("content") or "").strip()
-                if gemini_candidate:
-                    candidate = gemini_candidate
+                try:
+                    gemini_result = await gemini.chat(
+                        gemini_messages,
+                        config.GEMINI_PROSE_MODEL,
+                        max_tokens=config.AGENT_MAX_TOKENS,
+                        temperature=config.WRITER_TEMPERATURE,
+                        session=session,
+                    )
+                    gemini_candidate = (gemini_result.get("message", {}).get("content") or "").strip()
+                    if gemini_candidate:
+                        candidate = gemini_candidate
+                        if config.SHOW_WORK:
+                            yield ("reasoning", "✅ Gemini polished\n")
+                except Exception as e:
+                    if config.SHOW_WORK:
+                        yield ("reasoning", f"⚠️ Gemini failed: {e}\n")
 
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Writing and verifying the answer…\n")
