@@ -611,23 +611,74 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
 
 
-async def _refine_to_source(source: str, candidate: str, claims: str, *, session=None) -> str:
+async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) -> str:
+    """Run a refine pass on the SAME prose model that wrote the draft when one was
+    used (so paid Opus/GPT prose isn't silently reverted to the open model on a
+    fix); otherwise use the default open REFINE_MODEL."""
+    msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": user}]
+    try:
+        if prose is not None:
+            client, model = prose
+            return await client.complete(
+                msgs, model, max_tokens=config.DRAFT_MAX_TOKENS,
+                temperature=config.WRITER_TEMPERATURE, session=session,
+            )
+        return await fireworks.complete(
+            msgs, config.REFINE_MODEL,
+            max_tokens=config.DRAFT_MAX_TOKENS,
+            temperature=config.WRITER_TEMPERATURE, session=session,
+        )
+    except Exception:
+        return ""
+
+
+async def _refine_to_source(source: str, candidate: str, claims: str, *, prose=None, session=None) -> str:
     prompt = (
         "Revise the draft so every factual claim is supported by SOURCE. Remove "
         "or qualify unsupported claims; preserve the user's requested format and "
         "keep the prose polished. Output only the revised final answer."
     )
     user = f"SOURCE:\n{source}\n\nUNSUPPORTED CLAIMS:\n{claims}\n\nDRAFT:\n{candidate}"
-    try:
-        return await fireworks.complete(
-            [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
-            config.REFINE_MODEL,
-            max_tokens=config.DRAFT_MAX_TOKENS,
-            temperature=config.WRITER_TEMPERATURE,
-            session=session,
+    return await _refine_complete(prompt, user, prose=prose, session=session)
+
+
+def _prose_provider(prose_quality):
+    """Map a quality tier to (client_module, model) honoring availability, with
+    graceful fallback. Returns None if no prose provider is usable (caller then
+    stays on the open-model path). Keeps generation AND refine on the SAME model
+    so paid prose quality isn't silently reverted to the open model on a refine.
+    """
+    if prose_quality == "premium" and openai_client.available():
+        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
+    if prose_quality == "quality" and anthropic_client.available():
+        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
+    if prose_quality == "standard" and openai_client.available():
+        return openai_client, config.OPENAI_PROSE_MODEL
+    if prose_quality and gemini.available():
+        return gemini, config.GEMINI_PROSE_MODEL
+    return None
+
+
+def _prose_context_messages(scratch, source):
+    """Build a clean message list for prose models: drop tool-role messages and
+    tool_calls (the OpenAI-compat endpoints — especially Gemini — choke on them),
+    but DO inject the gathered source so the prose model writes WITH the evidence,
+    not blind to it."""
+    msgs = [
+        {"role": m["role"], "content": _text_of(m.get("content"))}
+        for m in scratch
+        if m.get("role") in ("system", "user", "assistant") and not m.get("tool_calls")
+    ]
+    if source.strip():
+        # Insert the gathered source right after the system message so the prose
+        # model grounds on it. Wrapped as untrusted data (instructions inside are
+        # not commands) — same trust-boundary discipline as the tool path.
+        block = prompt_security.wrap_untrusted(
+            "gathered source material", source[:12000]
         )
-    except Exception:
-        return ""
+        insert_at = 1 if msgs and msgs[0]["role"] == "system" else 0
+        msgs.insert(insert_at, {"role": "user", "content": block})
+    return msgs
 
 
 def _all_user_text(messages) -> str:
@@ -663,7 +714,7 @@ async def _honesty_audit(full_request: str, candidate: str, *, session=None):
         return None
 
 
-async def _refine_honesty(full_request: str, candidate: str, unsupported, *, session=None) -> str:
+async def _refine_honesty(full_request: str, candidate: str, unsupported, *, prose=None, session=None) -> str:
     """Rewrite the draft to drop unsupported self-claims WITHOUT inventing replacements."""
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported self-claims)"
     prompt = (
@@ -674,16 +725,7 @@ async def _refine_honesty(full_request: str, candidate: str, unsupported, *, ses
         "— do not pad with invented detail. Output only the revised final answer."
     )
     user = f"USER REQUEST:\n{full_request}\n\nUNSUPPORTED CLAIMS TO REMOVE:\n{listed}\n\nDRAFT:\n{candidate}"
-    try:
-        return await fireworks.complete(
-            [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
-            config.REFINE_MODEL,
-            max_tokens=config.DRAFT_MAX_TOKENS,
-            temperature=config.WRITER_TEMPERATURE,
-            session=session,
-        )
-    except Exception:
-        return ""
+    return await _refine_complete(prompt, user, prose=prose, session=session)
 
 
 def _honesty_block_msg(unsupported) -> str:
@@ -696,7 +738,7 @@ def _honesty_block_msg(unsupported) -> str:
     )
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=None, session=None):
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
 
@@ -709,7 +751,7 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, session
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
-            refined = await _refine_honesty(full_request, candidate, unsupported, session=session)
+            refined = await _refine_honesty(full_request, candidate, unsupported, prose=prose, session=session)
             if refined:
                 recheck = await _honesty_audit(full_request, refined, session=session)
                 if not recheck or not str(recheck.get("verdict", "")).upper().startswith("FAB"):
@@ -744,7 +786,7 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, session
         return "ok", candidate
 
     claims = (audit.get("unsupported_claims") or "").strip() or "Unsupported claims were found."
-    refined = await _refine_to_source(source, candidate, claims, session=session)
+    refined = await _refine_to_source(source, candidate, claims, prose=prose, session=session)
     if refined:
         second = await toolserver.verify_grounding(source, refined, session=session)
         if second is not None and second.get("grounded"):
@@ -812,50 +854,25 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
 
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
 
-        prose_messages = None
-        if prose_quality:
-            prose_messages = [
-                {"role": m["role"], "content": _text_of(m.get("content"))}
-                for m in scratch
-                if m.get("role") in ("system", "user", "assistant") and not m.get("tool_calls")
-            ]
-
-        if prose_quality == "premium" and openai_client.available():
+        # Pick a prose provider for this final turn (None = stay on open models).
+        prose = _prose_provider(prose_quality) if prose_quality else None
+        if prose is not None:
+            prose_client, prose_model = prose
+            label = {
+                config.OPENAI_PROSE_MODEL_PREMIUM: "Premium polish (GPT-5.5 Pro)",
+                config.ANTHROPIC_PROSE_MODEL: "Quality polish (Opus)",
+                config.OPENAI_PROSE_MODEL: "Polishing (GPT-4o)",
+                config.GEMINI_PROSE_MODEL: "Polishing (Gemini)",
+            }.get(prose_model, "Polishing")
             if config.SHOW_WORK:
-                yield ("reasoning", "✨ Premium polish (GPT-5.5 Pro)…\n")
-            result = await openai_client.chat(
-                prose_messages,
-                config.OPENAI_PROSE_MODEL_PREMIUM,
-                max_tokens=config.AGENT_MAX_TOKENS,
-                temperature=step_temp,
-                session=session,
-            )
-        elif prose_quality == "quality" and anthropic_client.available():
-            if config.SHOW_WORK:
-                yield ("reasoning", "✨ Quality polish (Opus)…\n")
-            result = await anthropic_client.chat(
-                prose_messages,
-                config.ANTHROPIC_PROSE_MODEL,
-                max_tokens=config.AGENT_MAX_TOKENS,
-                temperature=step_temp,
-                session=session,
-            )
-        elif prose_quality == "standard" and openai_client.available():
-            if config.SHOW_WORK:
-                yield ("reasoning", "✨ Polishing (GPT-4o)…\n")
-            result = await openai_client.chat(
-                prose_messages,
-                config.OPENAI_PROSE_MODEL,
-                max_tokens=config.AGENT_MAX_TOKENS,
-                temperature=step_temp,
-                session=session,
-            )
-        elif prose_quality and gemini.available():
-            if config.SHOW_WORK:
-                yield ("reasoning", "✨ Polishing (Gemini fallback)…\n")
-            result = await gemini.chat(
-                scratch,
-                config.GEMINI_PROSE_MODEL,
+                yield ("reasoning", f"✨ {label}…\n")
+            # All prose providers get the SAME clean, source-aware context — no
+            # tool-role messages / tool_calls (the OpenAI-compat endpoints, esp.
+            # Gemini, choke on those), but WITH the gathered source so the prose
+            # model writes with the evidence rather than blind.
+            result = await prose_client.chat(
+                _prose_context_messages(scratch, source),
+                prose_model,
                 max_tokens=config.AGENT_MAX_TOKENS,
                 temperature=step_temp,
                 session=session,
@@ -943,6 +960,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             messages,
             candidate,
             source,
+            prose=prose,
             session=session,
         )
         if status == "ok":
