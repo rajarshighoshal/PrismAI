@@ -5,9 +5,12 @@ turn into prewritten task flows; the model chooses tools, the harness executes
 them, and final output is held until the grounding gate allows it.
 """
 import json
+import logging
 import re
 
-from . import config, fireworks, gemini, prompt_security, search, style, toolserver
+from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
+
+log = logging.getLogger(__name__)
 
 TOOL_SCHEMAS = [
     {
@@ -177,7 +180,17 @@ SYSTEM_AGENT = (
     "Return ONLY what the user asked for: no preamble (no 'Here's a...'), no "
     "sign-off commentary, no offers to tailor it further. Match the requested "
     "format and length exactly. Add nothing beyond the given or verified facts — "
-    "no invented flourish or padding."
+    "no invented flourish or padding.\n"
+    "CLARIFICATION QUESTIONS: When writing formal deliverables (cover letters, "
+    "resumes, proposals, applications), if key information is missing or you would "
+    "need to make assumptions, DO NOT write the deliverable with placeholders. "
+    "Instead, STOP and ask 2-4 brief clarifying questions AS YOUR ENTIRE RESPONSE. "
+    "For example: 'Before I write this cover letter, I need to know: 1) Why this "
+    "specific role/field? 2) Which of your experiences should I emphasize?' "
+    "WAIT for the user's answers. THEN write the complete deliverable with no "
+    "placeholders. Never put [NEEDS DETAIL] or similar markers in formal output. "
+    "Use the EXACT technical language from the user's provided materials — do not "
+    "invent connections, analogies, or claims not explicitly stated."
 )
 
 SYSTEM_VISION = (
@@ -354,12 +367,29 @@ def _select_model(has_sources: bool) -> str:
 
 
 SYSTEM_PROSE_CLASSIFIER = (
-    "Classify whether this user request is asking for FORMAL DELIVERABLE prose "
-    "(cover letter, resume, CV, research paper, thesis, formal letter, proposal, "
-    "report, personal statement, executive summary, manuscript, professional email "
-    "to external parties) vs CASUAL output (conversation, brainstorming, quick "
-    "answers, internal notes, code, debugging, explanations, informal chat).\n"
+    "Classify what TYPE OF OUTPUT the user is requesting — ignore how casually "
+    "they asked, focus on WHAT they want produced.\n"
+    "FORMAL: cover letter, resume, CV, application letter, research paper, thesis, "
+    "formal letter, proposal, report, personal statement, executive summary, "
+    "manuscript, professional email, grant application, PhD application.\n"
+    "CASUAL: conversation, brainstorming, quick answers, internal notes, code, "
+    "debugging, explanations, informal chat, questions, summaries for self.\n"
+    "If the user asks you to WRITE or DRAFT something that would be sent to "
+    "employers, universities, clients, or external parties → FORMAL.\n"
     "Return JSON only: {\"tier\": \"formal\" | \"casual\", \"reason\": \"brief\"}."
+)
+
+SYSTEM_QUALITY_CLASSIFIER = (
+    "Given a formal writing request, classify the QUALITY TIER needed:\n"
+    "- STANDARD: routine cover letters, simple proposals, internal reports, "
+    "standard professional emails. Good prose is enough.\n"
+    "- QUALITY: important cover letters for competitive roles, research paper "
+    "abstracts, grant proposals, client-facing reports. Needs polished prose.\n"
+    "- PREMIUM: executive briefs to C-suite, thesis/dissertation chapters, "
+    "high-stakes research papers, board presentations, anything where prose "
+    "quality is critical to outcome.\n"
+    "Return JSON only: {\"quality\": \"standard\" | \"quality\" | \"premium\", "
+    "\"reason\": \"brief\"}."
 )
 
 
@@ -381,9 +411,39 @@ async def _classify_prose_tier(messages, *, session=None) -> str:
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
-        return "formal" if data.get("tier") == "formal" else "casual"
-    except Exception:
+        tier = "formal" if data.get("tier") == "formal" else "casual"
+        log.info(f"[prose_tier] input='{user_text[:100]}...' result={tier} raw={data}")
+        return tier
+    except Exception as e:
+        log.warning(f"[prose_tier] error: {e}")
         return "casual"
+
+
+async def _classify_quality_tier(messages, *, session=None) -> str:
+    """Classify quality tier for formal prose. Returns 'standard', 'quality', or 'premium'."""
+    user_text = _last_user_text(messages)
+    if not user_text:
+        return "standard"
+    try:
+        raw = await fireworks.complete(
+            [
+                {"role": "system", "content": SYSTEM_QUALITY_CLASSIFIER},
+                {"role": "user", "content": user_text[:2000]},
+            ],
+            config.PROSE_CLASSIFIER_MODEL,
+            max_tokens=80,
+            temperature=0.0,
+            session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        tier = data.get("quality", "standard")
+        tier = tier if tier in ("standard", "quality", "premium") else "standard"
+        log.info(f"[quality_tier] result={tier} raw={data}")
+        return tier
+    except Exception as e:
+        log.warning(f"[quality_tier] error: {e}")
+        return "standard"
 
 
 def _has_export_request(tool_calls) -> bool:
@@ -726,7 +786,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
         source = _combined_source(user_source, tool_sources)
         model = _select_model(bool(source))
         tools = _budgeted_tools(tool_call_count, web_search_count)
-        use_gemini = False
 
         if tools is None and not budget_note_added:
             budget_note_added = True
@@ -741,27 +800,59 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 }
             )
 
-        # When generating final prose (tools exhausted), check if Gemini should be used.
-        # Export-triggered (zero cost) or LLM-classified (cheap gpt-oss call).
-        if tools is None and gemini.available():
-            if export_requested:
-                use_gemini = True
-            else:
-                if prose_tier_cached is None:
-                    prose_tier_cached = await _classify_prose_tier(messages, session=session)
-                if prose_tier_cached == "formal":
-                    use_gemini = True
+        # When generating final prose (tools exhausted), check if premium prose model should be used.
+        # 90% casual → stays on DeepSeek/GLM
+        # 10% formal → tiered: standard (GPT-4o), quality (Opus), premium (GPT-5.5 Pro)
+        prose_quality = None
+        if tools is None:
+            if prose_tier_cached is None:
+                prose_tier_cached = await _classify_prose_tier(messages, session=session)
+            if prose_tier_cached == "formal" or export_requested:
+                prose_quality = await _classify_quality_tier(messages, session=session)
 
-        # Split temperature by the turn's job: when tools are still on the table
-        # this is primarily a routing/decide turn (low temp = reliable tool choice
-        # + tight instruction-following); once the tool budget is exhausted the
-        # turn can only write the final artifact, so use the warmer writer temp
-        # for natural prose.
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
 
-        if use_gemini:
+        prose_messages = None
+        if prose_quality:
+            prose_messages = [
+                {"role": m["role"], "content": _text_of(m.get("content"))}
+                for m in scratch
+                if m.get("role") in ("system", "user", "assistant") and not m.get("tool_calls")
+            ]
+
+        if prose_quality == "premium" and openai_client.available():
             if config.SHOW_WORK:
-                yield ("reasoning", "✨ Polishing…\n")
+                yield ("reasoning", "✨ Premium polish (GPT-5.5 Pro)…\n")
+            result = await openai_client.chat(
+                prose_messages,
+                config.OPENAI_PROSE_MODEL_PREMIUM,
+                max_tokens=config.AGENT_MAX_TOKENS,
+                temperature=step_temp,
+                session=session,
+            )
+        elif prose_quality == "quality" and anthropic_client.available():
+            if config.SHOW_WORK:
+                yield ("reasoning", "✨ Quality polish (Opus)…\n")
+            result = await anthropic_client.chat(
+                prose_messages,
+                config.ANTHROPIC_PROSE_MODEL,
+                max_tokens=config.AGENT_MAX_TOKENS,
+                temperature=step_temp,
+                session=session,
+            )
+        elif prose_quality == "standard" and openai_client.available():
+            if config.SHOW_WORK:
+                yield ("reasoning", "✨ Polishing (GPT-4o)…\n")
+            result = await openai_client.chat(
+                prose_messages,
+                config.OPENAI_PROSE_MODEL,
+                max_tokens=config.AGENT_MAX_TOKENS,
+                temperature=step_temp,
+                session=session,
+            )
+        elif prose_quality and gemini.available():
+            if config.SHOW_WORK:
+                yield ("reasoning", "✨ Polishing (Gemini fallback)…\n")
             result = await gemini.chat(
                 scratch,
                 config.GEMINI_PROSE_MODEL,
@@ -845,44 +936,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 }
             )
             continue
-
-        print(f"[DEBUG] gemini.available()={gemini.available()}, use_gemini={use_gemini}")
-        if gemini.available() and not use_gemini:
-            if prose_tier_cached is None:
-                prose_tier_cached = await _classify_prose_tier(messages, session=session)
-            print(f"[DEBUG] prose_tier_cached={prose_tier_cached}, export_requested={export_requested}")
-            if prose_tier_cached == "formal" or export_requested:
-                print("[DEBUG] Entering Gemini polish block")
-                if config.SHOW_WORK:
-                    yield ("reasoning", "✨ Polishing…\n")
-                gemini_messages = [
-                    {"role": m["role"], "content": _text_of(m.get("content"))}
-                    for m in scratch
-                    if m.get("role") in ("system", "user", "assistant")
-                    and not m.get("tool_calls")
-                ]
-                print(f"[DEBUG] Calling Gemini with {len(gemini_messages)} messages")
-                try:
-                    gemini_result = await gemini.chat(
-                        gemini_messages,
-                        config.GEMINI_PROSE_MODEL,
-                        max_tokens=config.AGENT_MAX_TOKENS,
-                        temperature=config.WRITER_TEMPERATURE,
-                        session=session,
-                    )
-                    print(f"[DEBUG] Gemini returned: {str(gemini_result)[:200]}")
-                    gemini_candidate = (gemini_result.get("message", {}).get("content") or "").strip()
-                    if gemini_candidate:
-                        candidate = gemini_candidate
-                        print("[DEBUG] Gemini candidate accepted")
-                        if config.SHOW_WORK:
-                            yield ("reasoning", "✅ Gemini polished\n")
-                    else:
-                        print("[DEBUG] Gemini returned empty candidate")
-                except Exception as e:
-                    print(f"[DEBUG] Gemini exception: {e}")
-                    if config.SHOW_WORK:
-                        yield ("reasoning", f"⚠️ Gemini failed: {e}\n")
 
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Writing and verifying the answer…\n")

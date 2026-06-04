@@ -7,14 +7,36 @@ Two hard-won rules baked in:
   can render it as collapsible "thinking" — but accumulation for the verify
   loop only ever uses content.
 """
+import hashlib
 import json
+import logging
 
 try:
     import aiohttp
-except ImportError:  # lets offline tests run without installed service deps
+except ImportError:
     aiohttp = None
 
 from . import config
+
+log = logging.getLogger(__name__)
+
+
+def compute_session_id(messages, user_id: str = "") -> str:
+    """Compute stable session ID from message context for cache affinity."""
+    parts = [user_id]
+    for m in messages[:5]:
+        role = m.get("role", "")
+        content = m.get("content", "")
+        if isinstance(content, str):
+            parts.append(f"{role}:{content[:200]}")
+        elif isinstance(content, list):
+            text = " ".join(
+                p.get("text", "")[:100] for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+            parts.append(f"{role}:{text}")
+    combined = "|".join(parts)
+    return hashlib.sha256(combined.encode()).hexdigest()[:16]
 
 
 def _require_aiohttp():
@@ -29,7 +51,7 @@ def _headers() -> dict:
     return h
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None) -> str:
     """Non-streaming completion. Returns the final answer text (content only)."""
     result = await chat(
         messages,
@@ -37,6 +59,7 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
         max_tokens=max_tokens,
         temperature=temperature,
         session=session,
+        user_id=user_id,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -50,6 +73,7 @@ async def chat(
     session=None,
     tools=None,
     tool_choice=None,
+    user_id=None,
 ) -> dict:
     """Non-streaming chat completion.
 
@@ -61,19 +85,24 @@ async def chat(
         _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
+        session_id = compute_session_id(messages, user_id or "")
         payload = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": config.TEMPERATURE if temperature is None else temperature,
+            "user": session_id,
         }
         if tools is not None:
             payload["tools"] = tools
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
+        headers = _headers()
+        headers["x-session-affinity"] = session_id
+        log.info(f"[fireworks] model={model} session={session_id[:8]} tokens={max_tokens}")
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
-            headers=_headers(),
+            headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
         ) as resp:
@@ -89,7 +118,7 @@ async def chat(
             await session.close()
 
 
-async def stream(messages, model, *, max_tokens, temperature=None, session=None):
+async def stream(messages, model, *, max_tokens, temperature=None, session=None, user_id=None):
     """Streaming completion. Yields (kind, text) where kind is 'content' or
     'reasoning'. Caller forwards 'content' as delta.content and may forward
     'reasoning' as delta.reasoning_content for the thinking UI.
@@ -99,17 +128,22 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
         _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
+        session_id = compute_session_id(messages, user_id or "")
         payload = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": config.TEMPERATURE if temperature is None else temperature,
             "stream": True,
+            "user": session_id,
         }
+        headers = _headers()
+        headers["x-session-affinity"] = session_id
+        log.info(f"[fireworks] stream model={model} session={session_id[:8]}")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
-            headers=_headers(),
+            headers=headers,
             json=payload,
             timeout=timeout,
         ) as resp:

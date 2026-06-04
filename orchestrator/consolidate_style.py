@@ -24,7 +24,7 @@ import urllib.request
 DB_PATH = os.getenv("STYLE_DB_PATH", "/app/backend/data/webui.db")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
 # Instruction-tuned, no chain-of-thought leak (verified).
-CONSOLIDATION_MODEL = os.getenv("STYLE_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+CONSOLIDATION_MODEL = os.getenv("STYLE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 MIN_TURNS = int(os.getenv("STYLE_MIN_TURNS", "5"))      # need enough signal
 MAX_TURNS = int(os.getenv("STYLE_MAX_TURNS", "80"))     # cap per user
 MAX_CHARS = int(os.getenv("STYLE_MAX_CHARS", "12000"))  # cap prompt size

@@ -16,12 +16,21 @@ FIREWORKS_BASE_URL = os.getenv(
     "FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"
 ).rstrip("/")
 
-# Google Gemini API for high-value prose (cover letters, resumes, research papers).
-# When enabled, the orchestrator routes final prose output through Gemini 3 Pro
-# for tasks classified as high-value, falling back to GLM-5.1 for standard tasks.
+# Google Gemini API (legacy, kept for fallback).
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-ENABLE_GEMINI_PROSE = _flag("ENABLE_GEMINI_PROSE", "false")  # opt-in; set true + key to enable
+ENABLE_GEMINI_PROSE = _flag("ENABLE_GEMINI_PROSE", "false")
 GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-3.1-pro-preview")
+
+# OpenAI API for high-value prose (cover letters, resumes, research papers).
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+ENABLE_OPENAI_PROSE = _flag("ENABLE_OPENAI_PROSE", "true")
+OPENAI_PROSE_MODEL = os.getenv("OPENAI_PROSE_MODEL", "gpt-4o")
+OPENAI_PROSE_MODEL_PREMIUM = os.getenv("OPENAI_PROSE_MODEL_PREMIUM", "gpt-5.5-pro")
+
+# Anthropic API for quality-tier prose (research papers, executive briefs).
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ENABLE_ANTHROPIC_PROSE = _flag("ENABLE_ANTHROPIC_PROSE", "true")
+ANTHROPIC_PROSE_MODEL = os.getenv("ANTHROPIC_PROSE_MODEL", "claude-opus-4-8")
 
 # tool-server (same docker network) — verification + export primitives.
 TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").rstrip("/")
@@ -35,7 +44,7 @@ REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 # shifts to GLM after source-bearing tools because it measured stronger there.
 AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
 GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/glm-5p1")
-GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 # The auditor model lives in the tool-server (gpt-oss-120b); we just call it.
 
 # Advertised model ids — what OWUI shows in this connection's model list.
@@ -78,7 +87,7 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # gate (which wrongly waves through "creative writing" that inflates a resume).
 # Bake-off (2026-05-31) showed deepseek-v4-pro / glm-5p1 / gpt-oss-120b / gemini
 # all catch it; kimi leaks chain-of-thought. Default to the strong model; set
-# HONESTY_MODEL=accounts/fireworks/models/gpt-oss-120b for a cheaper auditor.
+# HONESTY_MODEL=accounts/fireworks/models/deepseek-v4-flash for a cheaper auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
 HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
@@ -96,7 +105,7 @@ MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
-PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 
 # On an ungrounded deliverable, run one refine pass that strips/fixes the
 # unsupported claims and append the corrected version. Off -> warn-only footer.
@@ -111,7 +120,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")        # hosted fallback
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "20"))
 # Cheap, no-CoT-leak model to compress the turn into a <=400-char search query.
-QUERY_MODEL = os.getenv("QUERY_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+QUERY_MODEL = os.getenv("QUERY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 QUERY_MAX_CHARS = int(os.getenv("QUERY_MAX_CHARS", "400"))
 # Also audit GROUNDED answers against retrieved snippets (extra call). Default off
 # to keep GROUNDED cheap; verification is reserved for deliverables.
