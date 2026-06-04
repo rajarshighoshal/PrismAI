@@ -6,6 +6,7 @@ plus /health. All real work lives in pipeline.run; this file just speaks the
 OpenAI wire format and forwards the logged-in user's id from OWUI's headers.
 """
 import json
+import logging
 import time
 import uuid
 
@@ -14,6 +15,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config, pipeline
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="OWUI Orchestrator", version="0.1.0")
 
@@ -80,6 +88,9 @@ async def chat_completions(request: Request):
     user_id = _user_id(request)
     request_headers = _request_headers(request)
     cid = "chatcmpl-" + uuid.uuid4().hex
+
+    owui_headers = {k: v for k, v in request_headers.items() if "openwebui" in k}
+    log.info(f"[request] user={user_id} model={model} messages={len(messages)} owui_headers={owui_headers}")
 
     if want_stream:
         async def event_stream():
