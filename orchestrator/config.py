@@ -31,6 +31,10 @@ OPENAI_PROSE_MODEL_PREMIUM = os.getenv("OPENAI_PROSE_MODEL_PREMIUM", "gpt-5.5-pr
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ENABLE_ANTHROPIC_PROSE = _flag("ENABLE_ANTHROPIC_PROSE", "true")
 ANTHROPIC_PROSE_MODEL = os.getenv("ANTHROPIC_PROSE_MODEL", "claude-opus-4-8")
+# Standard-tier prose: Sonnet. Benchmarks (EQ-Bench creative writing) rank Sonnet
+# above GPT-4o for prose, and it runs on the working Anthropic key, so the
+# standard tier is Sonnet by default; GPT-4o remains an OpenAI fallback only.
+ANTHROPIC_STANDARD_MODEL = os.getenv("ANTHROPIC_STANDARD_MODEL", "claude-sonnet-4-6")
 
 # tool-server (same docker network) — verification + export primitives.
 TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").rstrip("/")

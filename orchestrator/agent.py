@@ -437,13 +437,25 @@ async def _classify_quality_tier(messages, *, session=None) -> str:
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
-        tier = data.get("quality", "standard")
-        tier = tier if tier in ("standard", "quality", "premium") else "standard"
+        tier = data.get("quality", _default_quality_tier())
+        tier = tier if tier in ("standard", "quality", "premium") else _default_quality_tier()
         log.info(f"[quality_tier] result={tier} raw={data}")
         return tier
     except Exception as e:
-        log.warning(f"[quality_tier] error: {e}")
+        log.warning(f"[quality_tier] error: {e}; defaulting to {_default_quality_tier()}")
+        return _default_quality_tier()
+
+
+def _default_quality_tier() -> str:
+    """When the quality classifier is unsure/errors, prefer a tier whose provider
+    is actually available — so a formal deliverable still gets real prose instead
+    of falling to a 429'd provider. Opus (quality) is the strong default; fall to
+    standard, then premium, by availability."""
+    if anthropic_client.available():
+        return "quality"
+    if openai_client.available():
         return "standard"
+    return "premium"
 
 
 def _has_export_request(tool_calls) -> bool:
@@ -652,8 +664,13 @@ def _prose_provider(prose_quality):
         return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
     if prose_quality == "quality" and anthropic_client.available():
         return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if prose_quality == "standard" and openai_client.available():
-        return openai_client, config.OPENAI_PROSE_MODEL
+    if prose_quality == "standard":
+        # Standard tier = Sonnet (better prose than GPT-4o per benchmarks, and on
+        # the working Anthropic key); GPT-4o is only a fallback if Anthropic is down.
+        if anthropic_client.available():
+            return anthropic_client, config.ANTHROPIC_STANDARD_MODEL
+        if openai_client.available():
+            return openai_client, config.OPENAI_PROSE_MODEL
     if prose_quality and gemini.available():
         return gemini, config.GEMINI_PROSE_MODEL
     return None
@@ -958,6 +975,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             label = {
                 config.OPENAI_PROSE_MODEL_PREMIUM: "Premium polish (GPT-5.5 Pro)",
                 config.ANTHROPIC_PROSE_MODEL: "Quality polish (Opus)",
+                config.ANTHROPIC_STANDARD_MODEL: "Polishing (Sonnet)",
                 config.OPENAI_PROSE_MODEL: "Polishing (GPT-4o)",
                 config.GEMINI_PROSE_MODEL: "Polishing (Gemini)",
             }.get(prose_model, "Polishing")
