@@ -659,26 +659,41 @@ def _prose_provider(prose_quality):
     return None
 
 
-def _prose_context_messages(scratch, source):
-    """Build a clean message list for prose models: drop tool-role messages and
-    tool_calls (the OpenAI-compat endpoints — especially Gemini — choke on them),
-    but DO inject the gathered source so the prose model writes WITH the evidence,
-    not blind to it."""
-    msgs = [
-        {"role": m["role"], "content": _text_of(m.get("content"))}
-        for m in scratch
-        if m.get("role") in ("system", "user", "assistant") and not m.get("tool_calls")
-    ]
+_PROSE_POLISH_SYS = (
+    "You are a prose editor. Rewrite the DRAFT into clearer, more natural, more "
+    "engaging prose for the user's request. STRICT RULES: change only wording and "
+    "flow — do NOT add facts, claims, numbers, names, or experience not already in "
+    "the draft or the SOURCE; do not invent. Keep the requested format and length. "
+    "No preamble, no sign-off commentary — output ONLY the rewritten deliverable."
+)
+
+
+def _prose_polish_messages(messages, candidate, source):
+    """Build the polish request: the user's ask + (optional) source as untrusted
+    reference + the open model's draft to rewrite. No tool-role messages /
+    tool_calls (OpenAI-compat endpoints, esp. Gemini, choke on those)."""
+    user_req = _all_user_text(messages)
+    parts = [f"USER REQUEST:\n{user_req}"]
     if source.strip():
-        # Insert the gathered source right after the system message so the prose
-        # model grounds on it. Wrapped as untrusted data (instructions inside are
-        # not commands) — same trust-boundary discipline as the tool path.
-        block = prompt_security.wrap_untrusted(
-            "gathered source material", source[:12000]
-        )
-        insert_at = 1 if msgs and msgs[0]["role"] == "system" else 0
-        msgs.insert(insert_at, {"role": "user", "content": block})
-    return msgs
+        parts.append(prompt_security.wrap_untrusted("gathered source material", source[:12000]))
+    parts.append(f"DRAFT TO POLISH:\n{candidate}")
+    return [
+        {"role": "system", "content": _PROSE_POLISH_SYS},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def _is_clarification(text: str) -> bool:
+    """Detect a clarifying-question turn (the agent asked the user for info rather
+    than producing a deliverable) — these must NOT be prose-polished or treated as
+    a final deliverable."""
+    t = (text or "").strip().lower()
+    if "?" not in t:
+        return False
+    # Heuristic: short-ish, question-led, asks for info before writing.
+    cues = ("i need to know", "before i write", "could you clarify", "a few questions",
+            "to write this", "which of", "can you tell me", "what is the", "let me know")
+    return len(t) < 1200 and (t.count("?") >= 2 or any(c in t for c in cues))
 
 
 def _all_user_text(messages) -> str:
@@ -842,51 +857,20 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                 }
             )
 
-        # When generating final prose (tools exhausted), check if premium prose model should be used.
-        # 90% casual → stays on DeepSeek/GLM
-        # 10% formal → tiered: standard (GPT-4o), quality (Opus), premium (GPT-5.5 Pro)
-        prose_quality = None
-        if tools is None:
-            if prose_tier_cached is None:
-                prose_tier_cached = await _classify_prose_tier(messages, session=session)
-            if prose_tier_cached == "formal" or export_requested:
-                prose_quality = await _classify_quality_tier(messages, session=session)
-
+        # The open model always drives generation (it owns tool-calling + reasoning).
+        # Prose polish happens AFTER a final answer is produced (see below), so it
+        # applies whether or not tools were still on the table — pure writing tasks
+        # finish on turn 1 with tools still offered and must still get polished.
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
-
-        # Pick a prose provider for this final turn (None = stay on open models).
-        prose = _prose_provider(prose_quality) if prose_quality else None
-        if prose is not None:
-            prose_client, prose_model = prose
-            label = {
-                config.OPENAI_PROSE_MODEL_PREMIUM: "Premium polish (GPT-5.5 Pro)",
-                config.ANTHROPIC_PROSE_MODEL: "Quality polish (Opus)",
-                config.OPENAI_PROSE_MODEL: "Polishing (GPT-4o)",
-                config.GEMINI_PROSE_MODEL: "Polishing (Gemini)",
-            }.get(prose_model, "Polishing")
-            if config.SHOW_WORK:
-                yield ("reasoning", f"✨ {label}…\n")
-            # All prose providers get the SAME clean, source-aware context — no
-            # tool-role messages / tool_calls (the OpenAI-compat endpoints, esp.
-            # Gemini, choke on those), but WITH the gathered source so the prose
-            # model writes with the evidence rather than blind.
-            result = await prose_client.chat(
-                _prose_context_messages(scratch, source),
-                prose_model,
-                max_tokens=config.AGENT_MAX_TOKENS,
-                temperature=step_temp,
-                session=session,
-            )
-        else:
-            result = await fireworks.chat(
-                scratch,
-                model,
-                max_tokens=config.AGENT_MAX_TOKENS,
-                temperature=step_temp,
-                session=session,
-                tools=tools,
-                tool_choice="auto" if tools is not None else None,
-            )
+        result = await fireworks.chat(
+            scratch,
+            model,
+            max_tokens=config.AGENT_MAX_TOKENS,
+            temperature=step_temp,
+            session=session,
+            tools=tools,
+            tool_choice="auto" if tools is not None else None,
+        )
         message = result.get("message") or {}
         tool_calls = message.get("tool_calls") or []
 
@@ -954,8 +938,46 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             )
             continue
 
+        # PROSE POLISH — runs on the FINAL answer (no tool calls this turn),
+        # regardless of whether tools were still available. Formal deliverables
+        # (cover letters, statements, reports) get re-written by a stronger prose
+        # model; casual/chat stays on the open model. This is gated on the final
+        # answer (not "tools is None") so pure-writing turns that finish on turn 1
+        # still get polished. The polish is source-aware and the resulting `prose`
+        # provider is reused for any verification refine so paid prose isn't
+        # reverted to the open model.
+        prose = None
+        if not _is_clarification(candidate):
+            if prose_tier_cached is None:
+                prose_tier_cached = await _classify_prose_tier(messages, session=session)
+            if prose_tier_cached == "formal" or export_requested:
+                prose_quality = await _classify_quality_tier(messages, session=session)
+                prose = _prose_provider(prose_quality)
+        if prose is not None:
+            prose_client, prose_model = prose
+            label = {
+                config.OPENAI_PROSE_MODEL_PREMIUM: "Premium polish (GPT-5.5 Pro)",
+                config.ANTHROPIC_PROSE_MODEL: "Quality polish (Opus)",
+                config.OPENAI_PROSE_MODEL: "Polishing (GPT-4o)",
+                config.GEMINI_PROSE_MODEL: "Polishing (Gemini)",
+            }.get(prose_model, "Polishing")
+            if config.SHOW_WORK:
+                yield ("reasoning", f"✨ {label}…\n")
+            try:
+                polish = await prose_client.complete(
+                    _prose_polish_messages(messages, candidate, source),
+                    prose_model,
+                    max_tokens=config.AGENT_MAX_TOKENS,
+                    temperature=config.WRITER_TEMPERATURE,
+                    session=session,
+                )
+                if polish and polish.strip():
+                    candidate = polish.strip()
+            except Exception as e:
+                log.warning(f"[prose_polish] {prose_model} failed, keeping open-model draft: {e}")
+
         if config.SHOW_WORK:
-            yield ("reasoning", "✍️ Writing and verifying the answer…\n")
+            yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
             messages,
             candidate,
