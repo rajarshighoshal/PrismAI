@@ -70,7 +70,7 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
         if _honesty_queue:
             return json.dumps(_honesty_queue.pop(0))
         return json.dumps({"unsupported": [], "verdict": "CLEAN"})
-    if "calibrated application-writing claim auditor" in sys:
+    if "application/cover-letter draft" in sys:
         if _app_audit_queue:
             return json.dumps(_app_audit_queue.pop(0))
         return json.dumps({
