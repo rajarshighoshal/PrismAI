@@ -23,6 +23,7 @@ _chat_queue = []
 _gate_queue = []
 _tool_gate_queue = []
 _app_audit_queue = []
+_honesty_queue = []
 _verify_queue = []
 _post_queue = []
 
@@ -65,6 +66,10 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "Decide whether a proposed tool call is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
+    if "honesty auditor" in sys:
+        if _honesty_queue:
+            return json.dumps(_honesty_queue.pop(0))
+        return json.dumps({"unsupported": [], "verdict": "CLEAN"})
     if "calibrated application-writing claim auditor" in sys:
         if _app_audit_queue:
             return json.dumps(_app_audit_queue.pop(0))
@@ -125,6 +130,7 @@ def _reset():
     _gate_queue.clear()
     _tool_gate_queue.clear()
     _app_audit_queue.clear()
+    _honesty_queue.clear()
     _verify_queue.clear()
     _post_queue.clear()
 
@@ -219,6 +225,47 @@ async def _run_tests():
     check("search: uncited summary excluded from verification source", "uncited summary claim" not in _calls["verify"][0][0])
     check("search: URL-backed source remains visible", "real source claim" in last_context)
     search.search = _fake_search
+
+    # Honesty audit (the can't-lie layer): unsupported self-claims get refined out;
+    # if they persist the draft is BLOCKED, never shown. The founding guarantee —
+    # exercised explicitly here, not left to fail-soft.
+    _reset()
+    _chat_queue.append(_chat_content("I have 10 years of leadership and drove $5M in revenue."))
+    _honesty_queue.append({"unsupported": ["10 years of leadership", "$5M in revenue"], "verdict": "FABRICATION"})
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})  # recheck after refine
+    ev = await _collect([{"role": "user", "content": "Write a one-line professional bio emphasizing my leadership and revenue impact."}])
+    check("honesty: fabrication refined out (original claim not shown)",
+          "10 years" not in _content(ev) and _content(ev) == "Corrected final answer.")
+
+    _reset()
+    _saved_repair = config.GROUNDING_REPAIR_STEPS
+    config.GROUNDING_REPAIR_STEPS = 0  # surface the block now instead of re-prompting for a repair
+    _chat_queue.append(_chat_content("I led a 50-person team for 12 years."))
+    _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})
+    _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})  # persists
+    ev = await _collect([{"role": "user", "content": "Write a one-line bio about my management track record."}])
+    check("honesty: persistent fabrication is BLOCKED, not shown",
+          "can't present those claims" in _content(ev).lower())
+    config.GROUNDING_REPAIR_STEPS = _saved_repair
+
+    # Polish chain: when the agent calls the polish tool, the chosen paid writer
+    # actually runs on the final draft (and the result still passes verification).
+    _reset()
+    import orchestrator.openai_client as _oc
+    _oc_avail, _oc_complete = _oc.available, _oc.complete
+    _oc.available = lambda: True
+    async def _fake_prose(messages, model, *, max_tokens, temperature=None, session=None):
+        _calls.setdefault("prose", []).append(model)
+        return "POLISHED FINAL LETTER."
+    _oc.complete = _fake_prose
+    config.ENABLE_OPENAI_PROSE = True
+    _chat_queue.append(_chat_tools(_tool_call("polish", {"model": "gpt-5.5", "voice_pass": "none"})))
+    _chat_queue.append(_chat_content("Draft letter using only the user's facts."))
+    ev = await _collect([{"role": "user", "content": "Write a short cover letter. My facts: 2 years as a data analyst."}])
+    check("polish: paid writer ran on the final draft", "POLISHED FINAL LETTER." in _content(ev))
+    check("polish: routed to the chosen gpt-5.5 writer", _calls.get("prose") == [config.OPENAI_PROSE_MODEL_PREMIUM])
+    _oc.available, _oc.complete = _oc_avail, _oc_complete
+    config.ENABLE_OPENAI_PROSE = False
 
     # If a model tries factual output with no source, the gate pushes it back
     # into the tool loop instead of showing the unverified draft.
