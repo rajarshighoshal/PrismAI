@@ -965,7 +965,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
     # through "creative writing" that inflates the user's credentials. This is the
     # founding can't-lie guarantee: a request to assert experience the user never
     # stated must not produce a confident fabrication.
-    if getattr(config, "ENABLE_HONESTY_AUDIT", True):
+    #
+    # On APPLICATION writing the calibrated application-claim audit below owns this:
+    # it catches the same unsupported candidate facts but ALLOWS grounded persuasive
+    # framing. Running both is a double-audit (extra latency) AND lets the strict
+    # honesty pass over-block the color a cover letter should have — so run exactly
+    # ONE auditor: honesty for non-application deliverables, the app audit for apps.
+    is_app = _is_application_writing(messages)
+    if getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app:
         full_request = _all_user_text(messages)
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
@@ -980,7 +987,7 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
             else:
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
 
-    if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and _is_application_writing(messages):
+    if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app:
         full_request = _all_user_text(messages)
         app_audit = await _application_claim_audit(full_request, candidate, source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
