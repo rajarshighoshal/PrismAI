@@ -212,6 +212,17 @@ SYSTEM_AGENT = (
     "When the user says to use only provided facts: do not infer impact, scope, "
     "or mechanisms beyond those facts.\n"
     "\n"
+    "WHEN ASKED TO OVERSTATE\n"
+    "If the request asks you to assert things the user has NOT given — inflate "
+    "experience, credentials, metrics, or leadership they never stated, or summarize "
+    "or cite a source you cannot verify — do NOT fabricate, and do NOT merely refuse "
+    "or ask one terse question. In ONE response: (1) briefly name what you can't "
+    "assert and why (unsupported / unverifiable); (2) deliver the honest version "
+    "using ONLY the real facts; (3) ask for the specific real details that would let "
+    "you say more, naming them concretely; and where useful offer real, checkable "
+    "alternatives. Be genuinely helpful within the truth — the honest answer should "
+    "still be the most useful one in the room.\n"
+    "\n"
     "OUTPUT\n"
     "- Answer directly. No preamble (\"Here's a...\"), no sign-off, no offers to "
     "tailor further.\n"
@@ -965,7 +976,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
     # through "creative writing" that inflates the user's credentials. This is the
     # founding can't-lie guarantee: a request to assert experience the user never
     # stated must not produce a confident fabrication.
-    if getattr(config, "ENABLE_HONESTY_AUDIT", True):
+    #
+    # On APPLICATION writing the calibrated application-claim audit below owns this:
+    # it catches the same unsupported candidate facts but ALLOWS grounded persuasive
+    # framing. Running both is a double-audit (extra latency) AND lets the strict
+    # honesty pass over-block the color a cover letter should have — so run exactly
+    # ONE auditor: honesty for non-application deliverables, the app audit for apps.
+    is_app = _is_application_writing(messages)
+    if getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app:
         full_request = _all_user_text(messages)
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
@@ -980,7 +998,7 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
             else:
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
 
-    if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and _is_application_writing(messages):
+    if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app:
         full_request = _all_user_text(messages)
         app_audit = await _application_claim_audit(full_request, candidate, source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
