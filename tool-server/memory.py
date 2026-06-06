@@ -158,19 +158,26 @@ async def get_conn() -> Optional[sqlite3.Connection]:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts "
                 "USING fts5(content, content='chat_turns', content_rowid='id')"
             )
-            for trigger, timing, op in [
-                ("chat_turns_fts_ai", "AFTER INSERT", "new"),
-                ("chat_turns_fts_au", "AFTER UPDATE", "new"),
-                ("chat_turns_fts_ad", "AFTER DELETE", "old"),
+            # FTS5 external-content triggers — each op needs its OWN body. A shared
+            # 'delete'+'insert' body corrupts the index on INSERT: the 'delete'
+            # targets a rowid not yet in the FTS index → "database disk image is
+            # malformed" on the first write, which silently killed ALL memory.
+            for trigger, timing, body in [
+                ("chat_turns_fts_ai", "AFTER INSERT",
+                 "INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);"),
+                ("chat_turns_fts_ad", "AFTER DELETE",
+                 "INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) "
+                 "VALUES ('delete', old.id, old.content);"),
+                ("chat_turns_fts_au", "AFTER UPDATE",
+                 "INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) "
+                 "VALUES ('delete', old.id, old.content); "
+                 "INSERT INTO chat_turns_fts(rowid, content) VALUES (new.id, new.content);"),
             ]:
                 try:
+                    conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
                     conn.execute(
-                        f"CREATE TRIGGER IF NOT EXISTS {trigger} "
-                        f"{timing} ON chat_turns BEGIN "
-                        f"  INSERT INTO chat_turns_fts(chat_turns_fts, rowid, content) "
-                        f"  VALUES ('delete', {op}.id, {op}.content); "
-                        f"  INSERT INTO chat_turns_fts(rowid, content) VALUES ({op}.id, {op}.content); "
-                        f"END"
+                        f"CREATE TRIGGER {trigger} {timing} "
+                        f"ON chat_turns BEGIN {body} END"
                     )
                 except sqlite3.OperationalError:
                     pass
