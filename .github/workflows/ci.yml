@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: compile + contract tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r orchestrator/requirements.txt
+
+      - name: Syntax check (orchestrator + tool-server)
+        run: python -m py_compile orchestrator/*.py tool-server/*.py
+
+      - name: Orchestrator contract tests
+        # Exits non-zero on any failed assertion (test_orchestrator raises SystemExit(1)).
+        run: python -m orchestrator.test_orchestrator
