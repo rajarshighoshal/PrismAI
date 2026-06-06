@@ -4,6 +4,9 @@ The harness exposes tools and enforces verification. It does not classify the
 turn into prewritten task flows; the model chooses tools, the harness executes
 them, and final output is held until the grounding gate allows it.
 """
+
+import aiohttp
+import asyncio
 import json
 import logging
 import re
@@ -154,48 +157,80 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "polish",
+            "description": (
+                "Polish a final written deliverable when writing quality matters (not for "
+                "plain chat, quick answers, or code). Two stages, NEITHER may change or inflate facts.\n"
+                "'model' — writer for the substance rewrite; pick by what THIS piece must DO, "
+                "not by a static cost tier: "
+                "gpt-5.5 is the default for calibrated academic/formal substance (research prose, "
+                "PhD statements, academic cover letters, source-sensitive writing). Opus is the "
+                "default for corporate/job-market persuasion (resume/CV bullets, recruiter-facing "
+                "cover letters, pitches, bios) and when the user wants a bolder/high-visibility "
+                "style. Sonnet is best as a voice-only warmth pass. The reality audit still applies "
+                "after every polish.\n"
+                "'voice_pass' — optional final voice-only register pass: 'warm' (personal writing), "
+                "'formal' (academic/professional), or 'none'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "enum": ["gpt-5.5", "sonnet", "opus"]},
+                    "voice_pass": {"type": "string", "enum": ["none", "warm", "formal"]},
+                },
+                "required": ["model"],
+            },
+        },
+    },
 ]
 
 SYSTEM_AGENT = (
-    "You are the controller for one user-facing assistant. The user should never "
-    "see tool mechanics; they should just get the right result. Decide whether "
-    "to call tools, which tools to chain, and when enough evidence exists. Do "
-    "not call tools for ordinary conversation, stable conceptual explanations, "
-    "editing, brainstorming, or writing from provided material. Use web_search "
-    "only for current facts, source-grounded research, or external facts that "
-    "must be checked; do not search definitions of terms unless the user asks "
-    "for definitions. Use fetch_url for exact URLs, citation tools for DOI/"
-    "reference work, export tools only when the user asks for a file, and "
-    "verify_grounding before finalizing source-bound factual writing. For "
-    "research, gather a small amount of high-signal evidence, then synthesize; "
-    "do not keep searching once you have enough to answer. Cite current or "
-    "source-grounded claims only to actual retrieved URLs; do not cite search "
-    "summaries or invent a source list. "
-    "Do not invent facts, citations, dates, numbers, credentials, or sources. "
-    "When the user says to use only provided facts, do not infer impact, scope, "
-    "mechanism, metrics, or outcomes beyond those facts; keep every concrete "
-    "claim traceable to the supplied text. "
-    "If evidence is insufficient, say what cannot be verified. Final answers "
-    "should be polished, direct, and natural.\n"
-    "Return ONLY what the user asked for: no preamble (no 'Here's a...'), no "
-    "sign-off commentary, no offers to tailor it further. Match the requested "
-    "format and length exactly. Add nothing beyond the given or verified facts — "
-    "no invented flourish or padding.\n"
-    "CLARIFICATION QUESTIONS: When writing formal deliverables (cover letters, "
-    "resumes, proposals, applications), if key information is missing or you would "
-    "need to make assumptions, DO NOT write the deliverable with placeholders. "
-    "Instead, STOP and ask 2-4 brief clarifying questions AS YOUR ENTIRE RESPONSE. "
-    "For example: 'Before I write this cover letter, I need to know: 1) Why this "
-    "specific role/field? 2) Which of your experiences should I emphasize?' "
-    "WAIT for the user's answers. THEN write the complete deliverable with no "
-    "placeholders. Never put [NEEDS DETAIL] or similar markers in formal output. "
-    "Use the EXACT technical language from the user's provided materials — do not "
-    "invent connections, analogies, or claims not explicitly stated."
+    "You are the controller for one user-facing assistant. The user sees the "
+    "answer, never the tool mechanics. Decide which tools to call, how to chain "
+    "them, and when you have enough evidence to answer.\n"
+    "\n"
+    "TOOL USE\n"
+    "- web_search: for current facts, external verification, or source-grounded "
+    "research. Do not search definitions unless explicitly asked.\n"
+    "- verify_grounding: before finalizing any source-bound factual writing.\n"
+    "- polish: before writing a deliverable whose quality matters (cover letter, "
+    "statement, application/research prose, important email). Pick the writer model "
+    "by what this piece must do, using the model map in the tool description.\n"
+    "- export tools: only when the user asks for a file.\n"
+    "- Gather high-signal evidence, then synthesize. Do not over-search — stop "
+    "once you can answer.\n"
+    "\n"
+    "TRUTH\n"
+    "Every specific claim (number, date, credential, metric, scope, motivation, "
+    "lived experience) MUST be traceable to one of: user-provided material, "
+    "tool-retrieved sources, or genuine common knowledge. If a claim isn't "
+    "traceable: say it's uncertain — don't invent it.\n"
+    "Every citation [N] maps to a real retrieved URL. No invented sources.\n"
+    "When the user says to use only provided facts: do not infer impact, scope, "
+    "or mechanisms beyond those facts.\n"
+    "\n"
+    "OUTPUT\n"
+    "- Answer directly. No preamble (\"Here's a...\"), no sign-off, no offers to "
+    "tailor further.\n"
+    "- Match the requested format and length exactly.\n"
+    "- No visible placeholders like [NEEDS DETAIL] or [Company Name].\n"
+    "\n"
+    "CLARIFICATION\n"
+    "For formal deliverables: first decide if you can produce a credible, useful "
+    "result from what the user already gave. If yes — write it immediately, ask "
+    "nothing. Only ask when a single ESSENTIAL fact is missing without which the "
+    "deliverable cannot be credible. Then ask exactly one short question naming "
+    "only that fact, as your entire response. Never more than one question, never "
+    "ask for nice-to-haves, never web-search for the missing fact."
 )
 
 SYSTEM_VISION = (
-    "Answer directly and concretely. If an image is present, use it as visual "
-    "context. Do not invent details you cannot see."
+    "Transcribe and describe the image for a text-only agent. Quote all visible "
+    "text exactly when possible, then summarize layout, context, and likely user "
+    "intent. Do not answer the user's task; produce only faithful image context."
 )
 
 SYSTEM_GATE = (
@@ -222,6 +257,27 @@ SYSTEM_HONESTY = (
     "paraphrase of them.\n"
     "Output strict JSON only: {\"unsupported\": [\"exact phrase\", ...], \"verdict\": "
     "\"FABRICATION\" if any unsupported self-claims exist, else \"CLEAN\"}."
+)
+
+SYSTEM_APPLICATION_CLAIM_AUDIT = (
+    "You are a calibrated application-writing claim auditor. The goal is NOT sterile "
+    "writing: cover letters and applications should be humane, personal, persuasive, "
+    "and grounded in reality. Classify claims in the DRAFT against the USER REQUEST "
+    "and any SOURCE. Hard candidate claims must be explicitly supplied by the user "
+    "(achievements, metrics, years, credentials, revenue, leadership, employers, "
+    "projects, impact, daily routines, work settings, frequency, specific tool/product "
+    "history, or concrete scenes). Company/role framing may be persuasive if it is "
+    "generic or supported; specific company/product facts should be in the request/"
+    "source or kept generic. Motivation/fit language is allowed when light and "
+    "plausible, but it must not falsely attribute specific lived feelings, habits, "
+    "personal attachment, insider knowledge, or first-person product relationships "
+    "the user did not give. Flag over-personalized autobiographical texture, "
+    "unsupplied habitual-use claims, unsupplied emotional-history claims, and "
+    "specific company-culture/reputation claims unless supported by the request/"
+    "source. Output strict JSON only: "
+    "{\"unsupported_candidate_claims\":[],\"unsupported_company_claims\":[],"
+    "\"fake_motivation_or_fit\":[],\"acceptable_framing\":[],"
+    "\"verdict\":\"CLEAN\"|\"UNSUPPORTED\"}."
 )
 
 SYSTEM_TOOL_GUARD = (
@@ -265,6 +321,62 @@ def _has_images(messages) -> bool:
     return False
 
 
+def _split_content_parts(content):
+    if not isinstance(content, list):
+        return [], []
+    text_parts = [
+        p.get("text", "")
+        for p in content
+        if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+    ]
+    image_parts = [
+        p
+        for p in content
+        if isinstance(p, dict) and p.get("type") == "image_url"
+    ]
+    return text_parts, image_parts
+
+
+async def _describe_images_for_agent(messages, *, session=None):
+    out = []
+    for m in messages:
+        content = m.get("content")
+        text_parts, image_parts = _split_content_parts(content)
+        if not image_parts:
+            out.append(dict(m))
+            continue
+        user_text = "\n".join(t.strip() for t in text_parts if t.strip())
+        prompt = (
+            "The user attached image(s) to this message. Preserve the visual evidence "
+            "for a downstream text-only agent.\n\n"
+            f"USER TEXT:\n{user_text or '(none)'}\n\n"
+            "Return a faithful transcription/description. Quote visible text exactly. "
+            "Do not answer the user's task."
+        )
+        vision_content = [{"type": "text", "text": prompt}] + image_parts
+        try:
+            description = await fireworks.complete(
+                [{"role": "system", "content": SYSTEM_VISION},
+                 {"role": "user", "content": vision_content}],
+                config.VISION_MODEL,
+                max_tokens=config.CHAT_MAX_TOKENS,
+                temperature=0.0,
+                session=session,
+            )
+        except Exception as e:
+            log.warning(f"[vision] image description failed: {e}")
+            description = "Image was attached, but the vision transcription failed."
+        combined = user_text
+        if description.strip():
+            combined = (
+                (combined + "\n\n") if combined else ""
+            ) + "Image transcription/description:\n" + description.strip()
+        new_m = dict(m)
+        new_m["content"] = combined or "Image was attached, but no text was available."
+        out.append(new_m)
+    return out
+
+
 def _with_system(messages, system_text):
     out = [dict(m) for m in messages]
     for m in out:
@@ -302,6 +414,46 @@ def _same_message_source(text: str) -> str:
     return "\n\n".join(out).strip()
 
 
+async def _memory_recall(chat_id: str, query: str, session=None) -> list[tuple[str, str]]:
+    """Call tool-server memory recall. Uses its own session for independence."""
+    if not chat_id:
+        return []
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/memory/recall",
+                json={"chat_id": chat_id, "query": query, "top_k": 6},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [(t["role"], t["content"]) for t in data.get("turns", [])]
+    except Exception:
+        pass
+    return []
+
+
+async def _memory_store(chat_id: str, role: str, content: str, session=None) -> bool:
+    """Call tool-server memory store. Uses its own session to survive caller's session closure."""
+    if not chat_id:
+        return False
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/memory/store",
+                json={"chat_id": chat_id, "role": role, "content": content},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("stored", False)
+    except Exception:
+        pass
+    return False
+
+
 def _user_source(messages) -> str:
     user_texts = [
         _text_of(m.get("content")).strip()
@@ -313,6 +465,33 @@ def _user_source(messages) -> str:
     prior = "\n\n".join(t for t in user_texts[:-1] if t).strip()
     same = _same_message_source(user_texts[-1])
     return "\n\n".join(p for p in (prior, same) if p).strip()
+
+
+def _clip_memory_part(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...[truncated]"
+
+
+def _consolidated_user_memory(messages, user_source: str) -> str:
+    """Compact per-chat memory: current ask plus the context that informed it."""
+    user_texts = [
+        _text_of(m.get("content")).strip()
+        for m in messages
+        if m.get("role") == "user" and _text_of(m.get("content")).strip()
+    ]
+    if not user_texts and not user_source.strip():
+        return ""
+    last_user = user_texts[-1] if user_texts else ""
+    parts = []
+    if last_user:
+        parts.append("Current user request:\n" + _clip_memory_part(last_user, 3000))
+    if user_source.strip() and user_source.strip() != last_user.strip():
+        parts.append(
+            "Relevant provided/prior context:\n" + _clip_memory_part(user_source, 6000)
+        )
+    return "\n\n---\n\n".join(parts).strip()
 
 
 def _initial_messages(messages, user_id: str):
@@ -364,108 +543,6 @@ def _clean_assistant_tool_message(message: dict) -> dict:
 
 def _select_model(has_sources: bool) -> str:
     return config.GROUNDED_MODEL if has_sources else config.AGENT_MODEL
-
-
-SYSTEM_PROSE_CLASSIFIER = (
-    "Classify what TYPE OF OUTPUT the user is requesting — ignore how casually "
-    "they asked, focus on WHAT they want produced.\n"
-    "FORMAL: cover letter, resume, CV, application letter, research paper, thesis, "
-    "formal letter, proposal, report, personal statement, executive summary, "
-    "manuscript, professional email, grant application, PhD application.\n"
-    "CASUAL: conversation, brainstorming, quick answers, internal notes, code, "
-    "debugging, explanations, informal chat, questions, summaries for self.\n"
-    "If the user asks you to WRITE or DRAFT something that would be sent to "
-    "employers, universities, clients, or external parties → FORMAL.\n"
-    "Return JSON only: {\"tier\": \"formal\" | \"casual\", \"reason\": \"brief\"}."
-)
-
-SYSTEM_QUALITY_CLASSIFIER = (
-    "Given a formal writing request, classify the QUALITY TIER needed:\n"
-    "- STANDARD: routine cover letters, simple proposals, internal reports, "
-    "standard professional emails. Good prose is enough.\n"
-    "- QUALITY: important cover letters for competitive roles, research paper "
-    "abstracts, grant proposals, client-facing reports. Needs polished prose.\n"
-    "- PREMIUM: executive briefs to C-suite, thesis/dissertation chapters, "
-    "high-stakes research papers, board presentations, anything where prose "
-    "quality is critical to outcome.\n"
-    "Return JSON only: {\"quality\": \"standard\" | \"quality\" | \"premium\", "
-    "\"reason\": \"brief\"}."
-)
-
-
-async def _classify_prose_tier(messages, *, session=None) -> str:
-    """Classify if request is formal deliverable or casual. Returns 'formal' or 'casual'."""
-    user_text = _last_user_text(messages)
-    if not user_text:
-        return "casual"
-    try:
-        raw = await fireworks.complete(
-            [
-                {"role": "system", "content": SYSTEM_PROSE_CLASSIFIER},
-                {"role": "user", "content": user_text[:2000]},
-            ],
-            config.PROSE_CLASSIFIER_MODEL,
-            max_tokens=80,
-            temperature=0.0,
-            session=session,
-        )
-        match = re.search(r"\{.*\}", raw, flags=re.S)
-        data = json.loads(match.group(0) if match else raw)
-        tier = "formal" if data.get("tier") == "formal" else "casual"
-        log.info(f"[prose_tier] input='{user_text[:100]}...' result={tier} raw={data}")
-        return tier
-    except Exception as e:
-        log.warning(f"[prose_tier] error: {e}")
-        return "casual"
-
-
-async def _classify_quality_tier(messages, *, session=None) -> str:
-    """Classify quality tier for formal prose. Returns 'standard', 'quality', or 'premium'."""
-    user_text = _last_user_text(messages)
-    if not user_text:
-        return "standard"
-    try:
-        raw = await fireworks.complete(
-            [
-                {"role": "system", "content": SYSTEM_QUALITY_CLASSIFIER},
-                {"role": "user", "content": user_text[:2000]},
-            ],
-            config.PROSE_CLASSIFIER_MODEL,
-            max_tokens=80,
-            temperature=0.0,
-            session=session,
-        )
-        match = re.search(r"\{.*\}", raw, flags=re.S)
-        data = json.loads(match.group(0) if match else raw)
-        tier = data.get("quality", _default_quality_tier())
-        tier = tier if tier in ("standard", "quality", "premium") else _default_quality_tier()
-        log.info(f"[quality_tier] result={tier} raw={data}")
-        return tier
-    except Exception as e:
-        log.warning(f"[quality_tier] error: {e}; defaulting to {_default_quality_tier()}")
-        return _default_quality_tier()
-
-
-def _default_quality_tier() -> str:
-    """When the quality classifier is unsure/errors, prefer a tier whose provider
-    is actually available — so a formal deliverable still gets real prose instead
-    of falling to a 429'd provider. Opus (quality) is the strong default; fall to
-    standard, then premium, by availability."""
-    if anthropic_client.available():
-        return "quality"
-    if openai_client.available():
-        return "standard"
-    return "premium"
-
-
-def _has_export_request(tool_calls) -> bool:
-    """Check if any tool call is an export (docx/pdf/markdown/csv)."""
-    for call in tool_calls or []:
-        fn = call.get("function") or {}
-        name = fn.get("name") or ""
-        if name in {"export_docx", "export_pdf", "export_markdown", "export_csv"}:
-            return True
-    return False
 
 
 def _tool_status(name: str, args: dict) -> str:
@@ -654,24 +731,21 @@ async def _refine_to_source(source: str, candidate: str, claims: str, *, prose=N
     return await _refine_complete(prompt, user, prose=prose, session=session)
 
 
-def _prose_provider(prose_quality):
-    """Map a quality tier to (client_module, model) honoring availability, with
-    graceful fallback. Returns None if no prose provider is usable (caller then
-    stays on the open-model path). Keeps generation AND refine on the SAME model
-    so paid prose quality isn't silently reverted to the open model on a refine.
-    """
-    if prose_quality == "premium" and openai_client.available():
+def _prose_provider(voice):
+    """Map the agent-chosen polish voice to (client, model), honoring availability
+    with graceful fallback. None if no provider is usable (stay on the open draft)."""
+    if voice == "gpt-5.5" and openai_client.available():
         return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
-    if prose_quality == "quality" and anthropic_client.available():
+    if voice == "opus" and anthropic_client.available():
         return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if prose_quality == "standard":
-        # Standard tier = Sonnet (better prose than GPT-4o per benchmarks, and on
-        # the working Anthropic key); GPT-4o is only a fallback if Anthropic is down.
-        if anthropic_client.available():
-            return anthropic_client, config.ANTHROPIC_STANDARD_MODEL
-        if openai_client.available():
-            return openai_client, config.OPENAI_PROSE_MODEL
-    if prose_quality and gemini.available():
+    if voice == "sonnet" and anthropic_client.available():
+        return anthropic_client, config.ANTHROPIC_STANDARD_MODEL
+    # requested provider unavailable — fall back to any usable prose model
+    if anthropic_client.available():
+        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
+    if openai_client.available():
+        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
+    if gemini.available():
         return gemini, config.GEMINI_PROSE_MODEL
     return None
 
@@ -680,8 +754,11 @@ _PROSE_POLISH_SYS = (
     "You are a prose editor. Rewrite the DRAFT into clearer, more natural, more "
     "engaging prose for the user's request. STRICT RULES: change only wording and "
     "flow — do NOT add facts, claims, numbers, names, or experience not already in "
-    "the draft or the SOURCE; do not invent. Keep the requested format and length. "
-    "No preamble, no sign-off commentary — output ONLY the rewritten deliverable."
+    "the draft or the SOURCE; do not invent. Do NOT inflate, strengthen, or reframe "
+    "what the writer has done or claimed: keep the draft's level of confidence and "
+    "every hedge, and never imply more was accomplished or solved than the draft "
+    "states. Keep the requested format and length. No preamble, no sign-off "
+    "commentary — output ONLY the rewritten deliverable."
 )
 
 
@@ -698,6 +775,35 @@ def _prose_polish_messages(messages, candidate, source):
         {"role": "system", "content": _PROSE_POLISH_SYS},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
+
+
+_VOICE_REGISTER = {
+    "warm": "natural and lightly warm, with a little personality; contractions are fine",
+    "formal": "polished and formal, professional; no contractions",
+}
+_VOICE_PASS_SYS = (
+    "You are a VOICE editor, not a content editor. Improve ONLY the voice of the DRAFT — its "
+    "rhythm and naturalness, so it reads like a skilled human wrote it — at this register: "
+    "{register}. STRICT: do NOT add, remove, strengthen, soften, or simplify any claim, fact, "
+    "number, or hedge; do not add confidence or imply more was accomplished than stated; do not "
+    "change meaning or materially change length. Output ONLY the revised text, no preamble."
+)
+
+
+async def _voice_pass(candidate, register, *, session=None):
+    """Optional sonnet voice-only pass at a register (warm/formal). Never alters facts."""
+    if not anthropic_client.available():
+        return candidate
+    sys = _VOICE_PASS_SYS.replace("{register}", _VOICE_REGISTER.get(register, _VOICE_REGISTER["formal"]))
+    try:
+        out = await anthropic_client.complete(
+            [{"role": "system", "content": sys}, {"role": "user", "content": f"DRAFT:\n{candidate}"}],
+            config.ANTHROPIC_STANDARD_MODEL,
+            max_tokens=config.AGENT_MAX_TOKENS, temperature=config.WRITER_TEMPERATURE, session=session)
+        return out.strip() if (out and out.strip()) else candidate
+    except Exception as e:
+        log.warning(f"[voice_pass] {register} failed, keeping draft: {e}")
+        return candidate
 
 
 def _is_clarification(text: str) -> bool:
@@ -724,6 +830,24 @@ def _all_user_text(messages) -> str:
     )
 
 
+def _is_application_writing(messages) -> bool:
+    text = _all_user_text(messages).lower()
+    needles = (
+        "cover letter",
+        "application letter",
+        "letter of interest",
+        "statement of interest",
+        "personal statement",
+        "statement of purpose",
+        "phd application",
+        "job application",
+        "resume",
+        "résumé",
+        "cv",
+    )
+    return any(n in text for n in needles)
+
+
 async def _honesty_audit(full_request: str, candidate: str, *, session=None):
     """Flag claims about the USER the user never stated. Returns the auditor dict
     {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
@@ -746,6 +870,69 @@ async def _honesty_audit(full_request: str, candidate: str, *, session=None):
         return None
 
 
+async def _application_claim_audit(full_request: str, candidate: str, source: str, *, session=None):
+    if not candidate.strip():
+        return None
+    user = (
+        f"USER REQUEST:\n{full_request}\n\n"
+        f"SOURCE:\n{source[:6000] if source.strip() else '(none)'}\n\n"
+        f"DRAFT:\n{candidate[:6000]}"
+    )
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_APPLICATION_CLAIM_AUDIT},
+             {"role": "user", "content": user}],
+            config.HONESTY_MODEL,
+            max_tokens=900,
+            temperature=0.0,
+            session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _application_audit_issues(audit: dict) -> list[str]:
+    if not audit:
+        return []
+    fields = (
+        "unsupported_candidate_claims",
+        "unsupported_company_claims",
+        "fake_motivation_or_fit",
+    )
+    out = []
+    for field in fields:
+        for item in audit.get(field) or []:
+            if item:
+                out.append(str(item))
+    return out
+
+
+async def _refine_application_claims(full_request: str, candidate: str, source: str,
+                                     audit: dict, *, prose=None, session=None) -> str:
+    issues = "\n".join(f"- {i}" for i in _application_audit_issues(audit)) or "(unspecified)"
+    prompt = (
+        "Revise the application-writing draft so it is humane, personal, persuasive, "
+        "and grounded in reality. Remove or neutralize each unsupported issue. Do "
+        "NOT add new candidate achievements, credentials, metrics, years, revenue, "
+        "leadership, impact, employers, projects, daily routines, work settings, "
+        "specific scenes, emotional history, product-relationship claims, or company-culture "
+        "reputation claims. Keep role/company framing if "
+        "it is generic or supported; make unsupported company specifics generic. "
+        "Keep motivation/fit warm but do not fake personal history or strong feelings "
+        "the user did not provide. Output only the revised deliverable."
+    )
+    user = (
+        f"USER REQUEST:\n{full_request}\n\n"
+        f"SOURCE:\n{source if source.strip() else '(none)'}\n\n"
+        f"ISSUES TO FIX:\n{issues}\n\n"
+        f"DRAFT:\n{candidate}"
+    )
+    return await _refine_complete(prompt, user, prose=prose, session=session)
+
+
 async def _refine_honesty(full_request: str, candidate: str, unsupported, *, prose=None, session=None) -> str:
     """Rewrite the draft to drop unsupported self-claims WITHOUT inventing replacements."""
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported self-claims)"
@@ -763,10 +950,10 @@ async def _refine_honesty(full_request: str, candidate: str, unsupported, *, pro
 def _honesty_block_msg(unsupported) -> str:
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else ""
     return (
-        "I can't include claims about you that you haven't actually told me — that "
-        "would be fabrication, and avoiding exactly that is the point of this "
-        "assistant. These weren't supported by anything you stated:\n\n" + listed
-        + "\n\nGive me the real details (or confirm them) and I'll write it accurately."
+        "I can't present those claims as true from the facts you gave me. These "
+        "details are unsupported:\n\n" + listed
+        + "\n\nI can still write a truthful version using the facts you provided, "
+        "or you can give me the real details and I'll include them accurately."
     )
 
 
@@ -792,6 +979,32 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
                     return "unsupported_self_claims", _honesty_block_msg(unsupported)
             else:
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
+
+    if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and _is_application_writing(messages):
+        full_request = _all_user_text(messages)
+        app_audit = await _application_claim_audit(full_request, candidate, source, session=session)
+        if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
+            refined = await _refine_application_claims(
+                full_request, candidate, source, app_audit, prose=prose, session=session
+            )
+            if refined:
+                recheck = await _application_claim_audit(full_request, refined, source, session=session)
+                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED"):
+                    candidate = refined
+                else:
+                    issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
+                    return (
+                        "unsupported_application_claims",
+                        "I could not safely finalize this application draft without "
+                        "unsupported claims:\n\n" + issues,
+                    )
+            else:
+                issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
+                return (
+                    "unsupported_application_claims",
+                    "I could not safely finalize this application draft without "
+                    "unsupported claims:\n\n" + issues,
+                )
 
     if not source.strip() and _has_citation_markers(candidate):
         return (
@@ -830,35 +1043,52 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
     )
 
 
-async def run(messages, *, user_id="", session=None, request_headers=None):
+async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
     """Drive one chat turn. Async generator of (kind, text)."""
     if not messages:
         yield ("content", "")
         return
 
+    user_final_model = (user_model or "").strip()
+    is_user_model = bool(user_final_model)
+
     if _has_images(messages):
-        async for kind, text in fireworks.stream(
-            _with_system(messages, SYSTEM_VISION),
-            config.VISION_MODEL,
-            max_tokens=config.CHAT_MAX_TOKENS,
-            session=session,
-        ):
-            yield (kind, text)
-        return
+        if config.SHOW_WORK:
+            yield ("reasoning", "🖼️ Reading image context…\n")
+        messages = await _describe_images_for_agent(messages, session=session)
 
     scratch = _initial_messages(messages, user_id)
     user_source = _user_source(messages)
+
+    # Memory recall: inject relevant prior turns into system prompt context
+    req_headers = request_headers or {}
+    chat_id = req_headers.get("x-openwebui-chat-id", "")
+    if chat_id:
+        user_texts = [
+            _text_of(m.get("content")).strip()
+            for m in messages if m.get("role") == "user"
+        ]
+        recall_query = " ".join(user_texts)[:2000] or ""
+        recalled = await _memory_recall(chat_id, recall_query, session)
+        if recalled:
+            memory_block = (
+                "Prior context from this conversation (semantic recall):\n"
+            )
+            for role, content in recalled:
+                memory_block += f"[{role}] {content[:500]}\n\n"
+            scratch.append({"role": "system", "content": memory_block})
+
     tool_sources = []
     repair_steps = 0
     tool_call_count = 0
     web_search_count = 0
     budget_note_added = False
-    export_requested = False
-    prose_tier_cached = None
+    polish_voice = None
+    polish_voice_pass = None
 
     for _ in range(config.AGENT_MAX_STEPS):
         source = _combined_source(user_source, tool_sources)
-        model = _select_model(bool(source))
+        model = _select_model(bool(source)) if not is_user_model else config.AGENT_MODEL
         tools = _budgeted_tools(tool_call_count, web_search_count)
 
         if tools is None and not budget_note_added:
@@ -893,12 +1123,23 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
 
         if tool_calls:
             scratch.append(_clean_assistant_tool_message(message))
-            if _has_export_request(tool_calls):
-                export_requested = True
             for call in tool_calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 args = _json_args(fn.get("arguments") or "{}")
+                if name == "polish":
+                    polish_voice = args.get("model") or args.get("voice") or polish_voice
+                    polish_voice_pass = args.get("voice_pass") or polish_voice_pass
+                    note = f"Acknowledged: polish with {polish_voice}"
+                    note += (f" + {polish_voice_pass} voice pass." if polish_voice_pass
+                             and polish_voice_pass != "none" else ".")
+                    scratch.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or name,
+                        "name": name,
+                        "content": note,
+                    })
+                    continue
                 tool_call_count += 1
                 if name == "web_search":
                     web_search_count += 1
@@ -955,32 +1196,31 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             )
             continue
 
-        # PROSE POLISH — runs on the FINAL answer (no tool calls this turn),
-        # regardless of whether tools were still available. Formal deliverables
-        # (cover letters, statements, reports) get re-written by a stronger prose
-        # model; casual/chat stays on the open model. This is gated on the final
-        # answer (not "tools is None") so pure-writing turns that finish on turn 1
-        # still get polished. The polish is source-aware and the resulting `prose`
-        # provider is reused for any verification refine so paid prose isn't
-        # reverted to the open model.
+        is_clar = _is_clarification(candidate)
+
+        # User-chosen model: regenerate final answer with their model
+        # Runs regardless of tool use — the user picks the model, they get it.
+        if is_user_model and not is_clar:
+            if config.SHOW_WORK:
+                yield ("reasoning", f"✨ Writing with {user_final_model.split('/')[-1]}…\n")
+            regen = await _regenerate_with_user_model(
+                scratch, user_final_model, source, session
+            )
+            if regen:
+                candidate = regen
+            # if regen is empty (API failure or non-Fireworks model), keep agent draft
+        elif is_user_model and is_clar:
+            pass  # keep clarification as-is
+
+        # Polish the final answer only when the agent asked for it (polish tool)
+        # and it isn't a clarifying question. Skip polish for user-chosen models.
         prose = None
-        if not _is_clarification(candidate):
-            if prose_tier_cached is None:
-                prose_tier_cached = await _classify_prose_tier(messages, session=session)
-            if prose_tier_cached == "formal" or export_requested:
-                prose_quality = await _classify_quality_tier(messages, session=session)
-                prose = _prose_provider(prose_quality)
+        if polish_voice and not is_clar:
+            prose = _prose_provider(polish_voice)
         if prose is not None:
             prose_client, prose_model = prose
-            label = {
-                config.OPENAI_PROSE_MODEL_PREMIUM: "Premium polish (GPT-5.5 Pro)",
-                config.ANTHROPIC_PROSE_MODEL: "Quality polish (Opus)",
-                config.ANTHROPIC_STANDARD_MODEL: "Polishing (Sonnet)",
-                config.OPENAI_PROSE_MODEL: "Polishing (GPT-4o)",
-                config.GEMINI_PROSE_MODEL: "Polishing (Gemini)",
-            }.get(prose_model, "Polishing")
             if config.SHOW_WORK:
-                yield ("reasoning", f"✨ {label}…\n")
+                yield ("reasoning", "✨ Polishing…\n")
             try:
                 polish = await prose_client.complete(
                     _prose_polish_messages(messages, candidate, source),
@@ -993,6 +1233,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
                     candidate = polish.strip()
             except Exception as e:
                 log.warning(f"[prose_polish] {prose_model} failed, keeping open-model draft: {e}")
+        # Stage 2 — optional voice-only register pass (sonnet); facts untouched.
+        if polish_voice_pass and polish_voice_pass != "none" and not is_clar:
+            if config.SHOW_WORK:
+                yield ("reasoning", f"✨ Voice pass ({polish_voice_pass})…\n")
+            candidate = await _voice_pass(candidate, polish_voice_pass, session=session)
 
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Verifying the answer…\n")
@@ -1004,6 +1249,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
             session=session,
         )
         if status == "ok":
+            # Store in memory asynchronously (don't block the response)
+            if chat_id:
+                user_memory = _consolidated_user_memory(messages, user_source)
+                if user_memory:
+                    asyncio.create_task(_memory_store(chat_id, "user", user_memory, session))
+                asyncio.create_task(_memory_store(chat_id, "assistant", text, session))
             yield ("content", text)
             return
 
@@ -1032,3 +1283,54 @@ async def run(messages, *, user_id="", session=None, request_headers=None):
         "I could not complete a verified answer within the configured tool budget. "
         "I am not going to present an unverified factual answer as final.",
     )
+
+
+def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
+    tool_outputs = []
+    for m in scratch:
+        if m.get("role") == "tool":
+            name = m.get("name", "tool")
+            content = (m.get("content") or "")[:2000]
+            tool_outputs.append(f"[{name}]: {content}")
+    tool_text = "\n\n".join(tool_outputs) if tool_outputs else ""
+
+    if tool_text:
+        system_msg = (
+            "You have gathered information using tools. Answer the user's original "
+            "question using ONLY the evidence below. Cite source URLs where available. "
+            "If evidence is insufficient, say what cannot be verified. Be direct and "
+            "natural — no preamble, no sign-off."
+        )
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Tool results:\n\n{tool_text}\n\nOriginal question:\n{source[:4000]}"},
+        ]
+    else:
+        # No tools used — pass the original question directly
+        user_texts = []
+        for m in scratch:
+            if m.get("role") == "user":
+                user_texts.append(_text_of(m.get("content")))
+        last_user = user_texts[-1] if user_texts else source[:2000]
+        return [
+            {"role": "user", "content": last_user.strip()},
+        ]
+
+
+async def _regenerate_with_user_model(
+    scratch: list[dict], user_model: str, source: str, session
+) -> str:
+    if not user_model.startswith("accounts/fireworks/"):
+        log.warning(f"user_model={user_model} is not a Fireworks model — keeping agent draft")
+        return ""
+    messages = _build_regeneration_context(scratch, source)
+    result = await fireworks.chat(
+        messages,
+        user_model,
+        max_tokens=config.AGENT_MAX_TOKENS,
+        temperature=config.WRITER_TEMPERATURE,
+        session=session,
+        tools=None,
+        tool_choice=None,
+    )
+    return (result.get("message") or {}).get("content", "") or ""
