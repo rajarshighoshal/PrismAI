@@ -102,6 +102,7 @@ async def chat_completions(request: Request):
                     user_id=user_id,
                     session=session,
                     request_headers=request_headers,
+                    user_model=model,
                 ):
                     if kind == "content":
                         yield _chunk(cid, model, content=text)
@@ -127,6 +128,7 @@ async def chat_completions(request: Request):
             user_id=user_id,
             session=session,
             request_headers=request_headers,
+            user_model=model,
         ):
             if kind == "content":
                 parts.append(text)

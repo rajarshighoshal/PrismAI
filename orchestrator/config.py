@@ -24,8 +24,9 @@ GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-3.1-pro-preview")
 # OpenAI API for high-value prose (cover letters, resumes, research papers).
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ENABLE_OPENAI_PROSE = _flag("ENABLE_OPENAI_PROSE", "true")
-OPENAI_PROSE_MODEL = os.getenv("OPENAI_PROSE_MODEL", "gpt-4o")
-OPENAI_PROSE_MODEL_PREMIUM = os.getenv("OPENAI_PROSE_MODEL_PREMIUM", "gpt-5.5-pro")
+OPENAI_PROSE_MODEL = os.getenv("OPENAI_PROSE_MODEL", "gpt-5.5")
+# gpt-5.5, not -pro (-pro is Responses-API only, 404s on chat/completions)
+OPENAI_PROSE_MODEL_PREMIUM = os.getenv("OPENAI_PROSE_MODEL_PREMIUM", "gpt-5.5")
 
 # Anthropic API for quality-tier prose (research papers, executive briefs).
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -93,6 +94,7 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # all catch it; kimi leaks chain-of-thought. Default to the strong model; set
 # HONESTY_MODEL=accounts/fireworks/models/deepseek-v4-flash for a cheaper auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
+ENABLE_APPLICATION_CLAIM_AUDIT = _flag("ENABLE_APPLICATION_CLAIM_AUDIT", "true")
 HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))

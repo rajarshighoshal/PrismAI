@@ -1,8 +1,7 @@
-"""Tool server for OpenWebUI: file export + web fetch + citation lookup.
+"""Tool server for OpenWebUI: file export + web fetch + citation lookup + chat memory.
 
 OpenAPI-discoverable so OpenWebUI auto-registers each endpoint as a tool
-the model can invoke. Stateless: each request is self-contained. Listens
-on the internal docker network only — no auth.
+the model can invoke. Stateless except for the memory DB.
 """
 from __future__ import annotations
 
@@ -24,6 +23,8 @@ import pypandoc
 import trafilatura
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
+
+import memory  # same-directory module
 
 logger = logging.getLogger("tool-server")
 logging.basicConfig(level=logging.INFO)
@@ -777,3 +778,68 @@ def verify_grounding(req: VerifyGroundingRequest) -> dict:
             "citation rather than deleting the sentence."
         ),
     }
+
+
+# ── Chat memory endpoints ──────────────────────────────────────────────
+
+class MemoryStoreRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+    role: str = Field(..., description="user or assistant")
+    content: str = Field(..., description="Turn text content")
+
+
+class MemoryRecallRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+    query: str = Field(..., description="Recall query (typically the user's message)")
+    exclude_hashes: list[str] = Field(default=[], description="Content hashes to exclude")
+    top_k: int = Field(default=6, description="Max turns to return")
+
+
+class MemorySweepRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID to sweep")
+
+
+@app.on_event("startup")
+async def startup_init_memory():
+    """Pre-init the memory DB on startup so first request is fast."""
+    await memory.get_conn()
+
+
+@app.post(
+    "/memory/store",
+    summary="Store a chat turn in semantic memory",
+    operation_id="memory_store",
+)
+async def memory_store(req: MemoryStoreRequest) -> dict:
+    """Store a user or assistant turn for later semantic recall."""
+    ok = await memory.store(req.chat_id, req.role, req.content)
+    return {"stored": ok, "chat_id": req.chat_id}
+
+
+@app.post(
+    "/memory/recall",
+    summary="Recall relevant prior turns from chat memory",
+    operation_id="memory_recall",
+)
+async def memory_recall(req: MemoryRecallRequest) -> dict:
+    """Semantically search past turns in this chat and return the most relevant ones."""
+    turns = await memory.recall(
+        req.chat_id, req.query, req.exclude_hashes, req.top_k
+    )
+    return {
+        "chat_id": req.chat_id,
+        "count": len(turns),
+        "turns": [{"role": r, "content": c} for r, c in turns],
+    }
+
+
+@app.post(
+    "/memory/sweep",
+    summary="Run TTL and referential sweep on memory",
+    operation_id="memory_sweep",
+)
+async def memory_sweep(req: MemorySweepRequest) -> dict:
+    """Clean up old or orphaned memory rows for a chat."""
+    # Basic per-chat sweep: delete turns older than 90 days
+    removed = await memory.sweep_chat(req.chat_id)
+    return {"chat_id": req.chat_id, "removed_rows": removed}

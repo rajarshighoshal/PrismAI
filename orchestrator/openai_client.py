@@ -33,6 +33,21 @@ def available() -> bool:
     return bool(config.OPENAI_API_KEY) and config.ENABLE_OPENAI_PROSE
 
 
+def _is_reasoning_model(model: str) -> bool:
+    m = (model or "").lower()
+    return m.startswith("gpt-5") or m.startswith(("o1", "o3", "o4"))
+
+
+def _token_payload(model, max_tokens, temperature) -> dict:
+    # gpt-5.x/o-series: max_completion_tokens, no custom temperature
+    if _is_reasoning_model(model):
+        return {"max_completion_tokens": max_tokens}
+    return {
+        "max_tokens": max_tokens,
+        "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
+    }
+
+
 async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
     result = await chat(
         messages,
@@ -57,12 +72,8 @@ async def chat(
         _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
-        }
+        payload = {"model": model, "messages": messages,
+                   **_token_payload(model, max_tokens, temperature)}
         log.info(f"[openai] model={model} messages={len(messages)} tokens={max_tokens}")
         async with session.post(
             f"{OPENAI_BASE_URL}/chat/completions",
@@ -91,13 +102,8 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
         _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
-            "stream": True,
-        }
+        payload = {"model": model, "messages": messages, "stream": True,
+                   **_token_payload(model, max_tokens, temperature)}
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         async with session.post(
             f"{OPENAI_BASE_URL}/chat/completions",

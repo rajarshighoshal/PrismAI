@@ -137,6 +137,8 @@ VISION_CAPABLE_MODELS = frozenset(
     }
 )
 
+ORCHESTRATOR_MODEL_IDS = frozenset({"PrismAI"})
+
 # Fallback model chains — when the primary model is down (503, timeout),
 # try the next one in the chain. Entries were verified with Fireworks /models
 # endpoint checks plus live probes.
@@ -464,6 +466,62 @@ async def _check_response(resp: aiohttp.ClientResponse) -> None:
     if _is_retryable_status(resp.status):
         raise err
     raise _NonRetryableError(str(err)) from err
+
+
+# ── Tool-server memory bridges ──────────────────────────────────────────
+
+TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001")
+
+
+async def _memory_recall_remote(chat_id: str, query: str, exclude_hashes: list, top_k: int = 6) -> list[tuple[str, str]]:
+    """Call the tool-server's /memory/recall endpoint."""
+    try:
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"{TOOL_SERVER_URL}/memory/recall",
+                json={"chat_id": chat_id, "query": query, "exclude_hashes": exclude_hashes, "top_k": top_k},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [(t["role"], t["content"]) for t in data.get("turns", [])]
+    except Exception:
+        pass
+    return []
+
+
+async def _memory_store_remote(chat_id: str, role: str, content: str) -> bool:
+    """Call the tool-server's /memory/store endpoint."""
+    try:
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"{TOOL_SERVER_URL}/memory/store",
+                json={"chat_id": chat_id, "role": role, "content": content},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("stored", False)
+    except Exception:
+        pass
+    return False
+
+
+async def _memory_sweep_remote(chat_id: str) -> int:
+    """Call the tool-server's /memory/sweep endpoint."""
+    try:
+        async with aiohttp.ClientSession() as client:
+            async with client.post(
+                f"{TOOL_SERVER_URL}/memory/sweep",
+                json={"chat_id": chat_id},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("removed_rows", 0)
+    except Exception:
+        pass
+    return 0
 
 
 class Filter:
@@ -2545,209 +2603,30 @@ class Filter:
 
         messages = body["messages"]
         query_raw = _extract_text(messages[-1]["content"]).strip()
-        document_request = _is_document_request(query_raw)
-        document_output_request = _is_document_output_request(query_raw)
-        url_fetch_request = _is_url_fetch_request(query_raw)
 
-        # --- Image-based routing augmentation ---
-        # If the last user message contains images, generate a short caption
-        # and inject it into the routing query. The original message (with
-        # images) is NOT modified here — the vision proxy step later decides
-        # whether to replace images based on the selected model.
-        image_caption = ""
-        image_parts: list[dict] = []  # populated if images are present
-        last_content = messages[-1].get("content")
-        if self.valves.ENABLE_IMAGE_ROUTING and isinstance(last_content, list):
-            image_parts = _extract_images(last_content)
-            if image_parts:
-                await self._emit_status(
-                    __event_emitter__,
-                    f"🖼️ Router: captioning {len(image_parts)} image(s) for routing…",
-                    done=False,
-                )
-                caption = await self._caption_images(
-                    image_parts, user_text=query_raw, event_emitter=__event_emitter__
-                )
-                if caption:
-                    image_caption = caption
-                    await self._emit_status(
-                        __event_emitter__,
-                        "🖼️ Router: image captioned — routing enriched.",
-                    )
-                else:
-                    await self._emit_status(
-                        __event_emitter__,
-                        "⚠️ Router: image captioning failed — falling back to text-only routing.",
-                    )
-
-        # Build the augmented routing query: user text + image context
-        if image_caption:
-            routing_query = f"{query_raw} [Image context: {image_caption}]".strip()
-        else:
-            routing_query = query_raw
-        routing_query_lower = routing_query.lower()
-
-        force_search = any(p.search(routing_query_lower) for p in FORCE_SEARCH_PATTERNS)
-        chat_id = self._extract_chat_id(body)
-        is_followup = _is_followup_query(query_raw)
-
-        await self._ensure_anchor_embeddings()
-
-        query_vec = await self._get_embedding(routing_query[:500])
-        best_match = None
-        highest_score = -1.0
-
-        if query_vec:
-            for category, vec in self.anchor_embeddings.items():
-                score = _cosine_similarity(query_vec, vec)
-                if score > highest_score:
-                    highest_score, best_match = score, category
-
-        sticky_searched = False
-        if highest_score < self.valves.ROUTING_THRESHOLD:
-            sticky = self._get_sticky(chat_id) if is_followup else None
-            if sticky:
-                best_match = sticky["category"]
-                sticky_searched = bool(sticky.get("searched"))
-                await self._emit_status(
-                    __event_emitter__,
-                    f"🧲 Router: inherited route ({best_match}) from previous turn.",
-                )
-            else:
-                llm_response = await self._call_llm(
-                    self._build_classifier_prompt(messages, image_caption),
-                    self.valves.CLASSIFIER_MODEL,
-                    fallback_chain=CLASSIFIER_FALLBACK_CHAIN,
-                    log_role="classifier",
-                    log_chat_id=chat_id,
-                )
-                if llm_response is None:
-                    await self._emit_status(
-                        __event_emitter__,
-                        "⚠️ Router: classifier LLM unavailable — keeping embedding best-match.",
-                    )
-                llm_cat = self._parse_llm_category(llm_response)
-                if llm_cat:
-                    best_match = llm_cat
-
-        if not best_match:
-            await self._emit_status(
-                __event_emitter__,
-                "⚠️ Router: could not classify query — defaulting to CASUAL.",
-            )
-            best_match = "CASUAL"
-
-        search_category = best_match
-        if document_request and best_match in ["FACTUAL", "RESEARCH"]:
-            best_match = "CASUAL"
-        elif document_output_request and best_match == "CODING":
-            best_match = "CASUAL"
-        elif url_fetch_request and best_match in ["FACTUAL", "RESEARCH"]:
-            best_match = "CASUAL"
-
-        will_search = (
-            (
-                search_category in ["FACTUAL", "RESEARCH"]
-                and not document_request
-                and not url_fetch_request
-            )
-            or force_search
-            or (sticky_searched and not url_fetch_request)
-        )
-        search_flag = "_SEARCH" if will_search else ""
-        self._set_sticky(chat_id, best_match, will_search)
+        # --- All models now route through the PrismAI orchestrator harness ---
+        # The orchestrator provides tool calling (web_search, fetch_url, etc.),
+        # grounding verification, and multi-provider prose routing. The router
+        # only handles memory recall, vision proxy, and request forwarding.
+        model_id = body.get("model", "")
+        is_orch = model_id in ORCHESTRATOR_MODEL_IDS
 
         body.setdefault("metadata", {})
         body["metadata"]["_router_state"] = {
-            "category": best_match,
-            "searched": will_search,
-            "document_request": document_request,
-            "url_fetch_request": url_fetch_request,
+            "category": "ORCHESTRATOR",
+            "searched": False,
+            "orch_model": model_id,
         }
 
-        # Triple fallback for routing state: metadata (primary) → sticky_routes (2nd) → tag (3rd).
-        # Tag is the tertiary safety net — outlet may strip it from display if replace events work.
-        system_content = (
-            f"OUTPUT STRUCTURE:\n"
-            f"1. If you want to reason, put it inside <think>...</think> tags (hidden from the user).\n"
-            f"2. Then emit exactly this HTML comment on its own line: <!-- ROUTER_STATE: {best_match}{search_flag} -->\n"
-            f"3. Then write your answer for the user.\n"
-            f"Do NOT narrate your plan or restate the question in visible output outside of a "
-            f"<think>...</think> block.\n\n"
-        )
-
-        search_context = ""
-        if will_search:
-            depth = (
-                self.valves.SEARCH_RESULTS_RESEARCH
-                if search_category == "RESEARCH"
-                else self.valves.SEARCH_RESULTS_FACTUAL
-            )
-            if sticky_searched and is_followup:
-                prior_user_turns = [
-                    _extract_text(m["content"])
-                    for m in messages
-                    if m.get("role") == "user" and m.get("content")
-                ][-2:]
-                # _search_tavily LLM-compresses anything >400 chars, so we
-                # can pass more context here without risking the Tavily cap.
-                search_query = " ".join(prior_user_turns)[:2000] or routing_query
-            else:
-                search_query = routing_query
-            await self._emit_status(
-                __event_emitter__,
-                f"🌐 Searching the web ({best_match}, depth={depth})…",
-                done=False,
-            )
-            search_context = await self._search_tavily(search_query, max_results=depth)
-
-            search_ok = (
-                bool(search_context)
-                and "[Web Search Failed" not in search_context
-                and "[No Tavily API Key" not in search_context
-            )
-            if search_ok:
-                system_content += (
-                    f"=========================================\n"
-                    f"{SEARCH_MARKER} (USE THESE OR FAIL):\n"
-                    f"=========================================\n"
-                    f"{search_context}\n\n"
-                    f"=========================================\n\n"
-                )
-                body["metadata"]["_router_state"]["search_context"] = search_context
-                await self._emit_status(
-                    __event_emitter__,
-                    f"✅ Web search complete ({best_match}).",
-                )
-            else:
-                system_content += (
-                    f"=========================================\n"
-                    f"WEB SEARCH FAILED OR RETURNED NO DATA\n"
-                    f"=========================================\n\n"
-                )
-                reason = (
-                    "Tavily API key missing"
-                    if "[No Tavily API Key" in search_context
-                    else "upstream search failed"
-                )
-                await self._emit_status(
-                    __event_emitter__,
-                    f"⚠️ Web search unavailable ({reason}). Answering without live data.",
-                )
-
-        # --- Chat memory recall: inject relevant prior turns when the chat
-        # is long enough to have meaningfully aged out of OWUI's visible
-        # history. Strictly chat-scoped; skipped if no chat_id. ---
+        # Still run memory recall for all models
+        chat_id = self._extract_chat_id(body)
         if self.valves.ENABLE_CHAT_MEMORY and chat_id:
             exclude_hashes = set()
             for m in messages:
                 cleaned = _clean_for_memory(_extract_text(m.get("content", "")))
                 if cleaned:
                     exclude_hashes.add(_memory_content_hash(cleaned))
-            # Query rewriting for short / pronoun-y follow-ups — improves
-            # recall by resolving "it"/"that" against prior context before
-            # embedding. Falls back to routing_query on any failure.
-            recall_query = routing_query
+            recall_query = query_raw
             rewritten = await self._rewrite_followup_query(query_raw, messages)
             if rewritten:
                 recall_query = rewritten
@@ -2769,174 +2648,135 @@ class Filter:
                     snippet = content[:800].strip()
                     memory_block += f"[{role}] {snippet}\n\n"
                 memory_block += "=========================================\n\n"
-                system_content += memory_block
+                existing_system = next(
+                    (i for i, m in enumerate(body["messages"]) if m.get("role") == "system"),
+                    None,
+                )
+                if existing_system is not None:
+                    sys_content = _extract_text(body["messages"][existing_system]["content"])
+                    body["messages"][existing_system]["content"] = (
+                        sys_content + f"\n\n{memory_block}"
+                    )
+                else:
+                    body["messages"].insert(0, {"role": "system", "content": memory_block})
                 await self._emit_status(
                     __event_emitter__,
                     f"🧠 Recalled {len(recalled)} prior turn(s) from this chat.",
                 )
 
-        if self.valves.ADDRESS_USER_BY_NAME:
-            user_name = self._extract_user_name(__user__)
-            if user_name:
-                system_content += (
-                    f"USER IDENTITY: You are chatting with {user_name}. "
-                    f"In any reply or internal reasoning, refer to them as "
-                    f"{user_name}, not as 'the user'. Do not greet by name "
-                    f"every turn and never use their name more than once per "
-                    f"reply — natural mention only, no sycophancy.\n\n"
-                )
-
-        if self.valves.ENABLE_DOCUMENT_STYLE_GUIDANCE and _is_document_request(query_raw):
-            system_content += f"{DOCUMENT_STYLE_PROMPT}\n"
-            if self.valves.DOCUMENT_STYLE_GUIDE.strip():
-                system_content += (
-                    "USER WRITING PREFERENCES:\n"
-                    f"{self.valves.DOCUMENT_STYLE_GUIDE.strip()}\n\n"
-                )
-
-        if url_fetch_request:
-            system_content += f"{URL_FETCH_PROMPT}\n"
-
-        system_content += (
-            f"{self.prompts[best_match]}\n\n"
-            f"ANTI-REFUSAL: Do NOT say 'I do not have internet access'. If search results were provided above, use them. "
-            f"If search failed above, state that you cannot verify the live data."
-        )
-
-        existing_system = next(
-            (i for i, m in enumerate(messages) if m.get("role") == "system"),
-            None,
-        )
-        if existing_system is not None:
-            sys_content = _extract_text(body["messages"][existing_system]["content"])
-            body["messages"][existing_system]["content"] = (
-                sys_content + f"\n\n{system_content}"
-            )
-        else:
-            body["messages"].insert(0, {"role": "system", "content": system_content})
-
-        # --- Vision proxy: replace images with detailed captions for non-vision models ---
-        # If the selected model cannot natively process images, we replace each
-        # image_url content part with a rich text description. This must run on
-        # EVERY turn (not just when the current message has images) because
-        # conversation history from previous turns still contains image_url parts
-        # that the non-vision model will reject.
+        # Vision proxy: replace images with captions for non-vision models
         selected_model = body.get("model", "")
         is_vision_model = selected_model in VISION_CAPABLE_MODELS
-
         if self.valves.ENABLE_VISION_PROXY and not is_vision_model:
-            # Step 1: Scan ALL messages for image_url parts
-            all_image_parts: list[tuple[int, dict]] = []  # (message_index, image_part)
-            for i, m in enumerate(body["messages"]):
-                content = m.get("content")
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "image_url":
-                        all_image_parts.append((i, part))
-
-            if all_image_parts:
-                # Step 2: Resolve any internal URLs to base64 data URIs while
-                # keeping the original URL as the replacement key.
-                resolved_pairs: list[tuple[str, dict]] = []
-                for _, original_part in all_image_parts:
-                    original_url = (original_part.get("image_url") or {}).get(
-                        "url", ""
-                    )
-                    for resolved_part in await self._resolve_image_urls(
-                        [original_part],
-                        event_emitter=__event_emitter__,
-                    ):
-                        resolved_pairs.append((original_url, resolved_part))
-
-                # Step 3: Caption each unique image (with caching)
-                # Use a cache keyed by chat_id + image URL to avoid re-captioning
-                # the same image on follow-up turns.
-                chat_id_for_cache = chat_id or "unknown"
-                image_url_to_caption: dict[str, str] = {}
-
-                # Group by URL to avoid duplicate caption calls
-                unique_images: dict[str, dict] = {}
-                for original_url, resolved_part in resolved_pairs:
-                    if original_url and original_url not in unique_images:
-                        unique_images[original_url] = resolved_part
-
-                new_captions = 0
-                cached_captions = 0
-                for url, resolved_part in unique_images.items():
-                    # SHA-256 the URL so that huge data: URIs and long internal
-                    # paths can never collide via prefix match. Still chat-scoped.
-                    url_digest = hashlib.sha256(url.encode()).hexdigest()[:32]
-                    cache_key = f"{chat_id_for_cache}:{url_digest}"
-                    if cache_key in self.image_caption_cache:
-                        image_url_to_caption[url] = self.image_caption_cache[cache_key]
-                        cached_captions += 1
-                    else:
-                        # Generate a new detailed caption
-                        caption = await self._detailed_caption(
-                            [resolved_part],
-                            user_text=query_raw,
-                            event_emitter=__event_emitter__,
-                        )
-                        if caption:
-                            image_url_to_caption[url] = caption
-                            self.image_caption_cache[cache_key] = caption
-                            # Evict oldest entries if cache grows too large
-                            while len(self.image_caption_cache) > 200:
-                                self.image_caption_cache.popitem(last=False)
-                            new_captions += 1
-                        else:
-                            image_url_to_caption[url] = (
-                                "[Image description unavailable]"
-                            )
-
-                # Step 4: Replace image_url parts in ALL messages with captions
-                total_replaced = 0
-                for m in body["messages"]:
-                    content = m.get("content")
-                    if not isinstance(content, list):
-                        continue
-                    new_parts = []
-                    has_images = False
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "image_url":
-                            url = (part.get("image_url") or {}).get("url", "")
-                            caption_text = image_url_to_caption.get(
-                                url, "[Attached image]"
-                            )
-                            new_parts.append(
-                                {
-                                    "type": "text",
-                                    "text": f"\n[Attached image: {caption_text}]",
-                                }
-                            )
-                            has_images = True
-                            total_replaced += 1
-                        else:
-                            new_parts.append(part)
-                    if has_images:
-                        m["content"] = new_parts
-
-                if new_captions > 0:
-                    await self._emit_status(
-                        __event_emitter__,
-                        f"🖥️ Vision proxy: {selected_model.split('/')[-1]} doesn't support images — "
-                        f"captioned {new_captions} new image(s), reused {cached_captions} cached, "
-                        f"replaced {total_replaced} image part(s) in conversation.",
-                    )
-                elif cached_captions > 0:
-                    await self._emit_status(
-                        __event_emitter__,
-                        f"🖥️ Vision proxy: reused {cached_captions} cached caption(s) — "
-                        f"images replaced in conversation history.",
-                    )
-            elif image_parts:
-                # Current message has images but they were already in routing image_parts
-                # and none were found in body["messages"] as image_url parts
-                # (shouldn't happen, but handle gracefully)
-                pass
+            await self._run_vision_proxy(body, query_raw, chat_id, __user__, __event_emitter__)
 
         return body
+
+    async def _run_vision_proxy(self, body, query_raw, chat_id, __user__, __event_emitter__):
+        """Replace images with captions for non-vision models (extracted from old inlet)."""
+        selected_model = body.get("model", "")
+        is_vision_model = selected_model in VISION_CAPABLE_MODELS
+        if not self.valves.ENABLE_VISION_PROXY or is_vision_model:
+            return
+
+        all_image_parts = []
+        for i, m in enumerate(body["messages"]):
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    all_image_parts.append((i, part))
+
+        if not all_image_parts:
+            return
+
+        resolved_pairs = []
+        for _, original_part in all_image_parts:
+            original_url = (original_part.get("image_url") or {}).get("url", "")
+            for resolved_part in await self._resolve_image_urls(
+                [original_part], event_emitter=__event_emitter__
+            ):
+                resolved_pairs.append((original_url, resolved_part))
+
+        chat_cache_id = chat_id or "unknown"
+        image_url_to_caption = {}
+        unique_images = {}
+        for original_url, resolved_part in resolved_pairs:
+            if original_url and original_url not in unique_images:
+                unique_images[original_url] = resolved_part
+
+        new_captions = 0
+        cached_captions = 0
+        for url, resolved_part in unique_images.items():
+            url_digest = hashlib.sha256(url.encode()).hexdigest()[:32]
+            cache_key = f"{chat_cache_id}:{url_digest}"
+            if cache_key in self.image_caption_cache:
+                image_url_to_caption[url] = self.image_caption_cache[cache_key]
+                cached_captions += 1
+            else:
+                caption = await self._detailed_caption(
+                    [resolved_part], user_text=query_raw, event_emitter=__event_emitter__
+                )
+                if caption:
+                    image_url_to_caption[url] = caption
+                    self.image_caption_cache[cache_key] = caption
+                    while len(self.image_caption_cache) > 200:
+                        self.image_caption_cache.popitem(last=False)
+                    new_captions += 1
+                else:
+                    image_url_to_caption[url] = "[Image description unavailable]"
+
+        total_replaced = 0
+        for m in body["messages"]:
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            new_parts = []
+            has_images = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    caption_text = image_url_to_caption.get(url, "[Attached image]")
+                    new_parts.append({"type": "text", "text": f"\n[Attached image: {caption_text}]"})
+                    has_images = True
+                    total_replaced += 1
+                else:
+                    new_parts.append(part)
+            if has_images:
+                m["content"] = new_parts
+
+        if new_captions > 0:
+            await self._emit_status(
+                __event_emitter__,
+                f"🖥️ Vision proxy: captioned {new_captions} new image(s), reused {cached_captions} cached, "
+                f"replaced {total_replaced} image part(s) in conversation.",
+            )
+
+    async def _call_orchestrator(self, messages, user_model, request_headers):
+        """Forward the conversation to the PrismAI orchestrator harness."""
+        import aiohttp as _aiohttp
+        url = "http://owui-orchestrator:8002/v1/chat/completions"
+        payload = {"model": user_model, "messages": messages, "stream": False}
+        headers = {}
+        for k, v in (request_headers or {}).items():
+            low = k.lower()
+            if low.startswith("x-openwebui") or low.startswith("authorization"):
+                headers[k] = v
+
+        try:
+            async with _aiohttp.ClientSession() as client:
+                async with client.post(url, json=payload, headers=headers,
+                    timeout=_aiohttp.ClientTimeout(total=180)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        choices = data.get("choices") or []
+                        if choices:
+                            return choices[0].get("message", {}).get("content", "")
+                    return f"[Orchestrator unavailable (status {resp.status})]"
+        except Exception as e:
+            logger.warning(f"Orchestrator call failed: {e}")
+            return f"[Orchestrator unavailable: {type(e).__name__}]"
 
     async def outlet(
         self,
@@ -2946,291 +2786,33 @@ class Filter:
     ) -> dict:
         if not body.get("messages") or not self.valves.FIREWORKS_API_KEY:
             return body
-        response = _extract_text(body["messages"][-1].get("content", ""))
-        if not response:
-            return body
 
-        router_state = (body.get("metadata") or {}).get("_router_state") or {}
-        category = router_state.get("category")
-        search_results_injected = bool(router_state.get("searched"))
-        search_context_from_inlet = router_state.get("search_context", "")
-        document_request = bool(router_state.get("document_request"))
-        url_fetch_request = bool(router_state.get("url_fetch_request"))
-        if not document_request or not url_fetch_request:
-            user_msgs_for_mode = [
-                _extract_text(m.get("content", ""))
-                for m in body["messages"]
-                if m.get("role") == "user"
-            ]
-            last_user_for_mode = user_msgs_for_mode[-1] if user_msgs_for_mode else ""
-            if not document_request:
-                document_request = _is_document_request(last_user_for_mode)
-            if not url_fetch_request:
-                url_fetch_request = _is_url_fetch_request(last_user_for_mode)
+        messages = body["messages"]
+        model_id = body.get("model", "")
+        request_headers = {}
+        if __user__:
+            request_headers["x-openwebui-user-id"] = __user__.get("id", "")
+            request_headers["x-openwebui-user-email"] = __user__.get("email", "")
+        request_headers["x-openwebui-chat-id"] = self._extract_chat_id(body) or ""
 
-        # Fallback 1: Filter-instance sticky cache (survives even if OWUI strips body metadata).
-        if not category:
-            sticky_state = self._get_sticky(self._extract_chat_id(body))
-            if sticky_state:
-                category = sticky_state.get("category")
-                search_results_injected = bool(sticky_state.get("searched"))
-
-        # Fallback 2: parse the model's tag (only works if inlet still emits it).
-        parse_copy = _strip_thinking_blocks(response)
-        state_match = ROUTER_STATE_RE.search(parse_copy)
-        if not category and state_match:
-            category = (state_match.group(1) or state_match.group(3)).upper()
-            search_results_injected = bool(state_match.group(2) or state_match.group(4))
-
-        if not category:
-            category = "CASUAL"
-            await self._emit_status(
-                __event_emitter__,
-                "⚠️ Router: no state available (metadata missing, model skipped tag) — rendering as CASUAL.",
-            )
-
-        display_response = _strip_thinking_blocks(response)
-        tag_matches = list(ROUTER_STATE_STRIP_RE.finditer(display_response))
-        if tag_matches:
-            last = tag_matches[-1]
-            display_response = display_response[last.end() :].strip()
-        else:
-            display_response = display_response.strip()
-
-        override_label = None
-        override_emoji = None
-        if document_request:
-            override_label = "WRITING"
-            override_emoji = "✍️"
-        elif url_fetch_request:
-            override_label = "FETCH"
-            override_emoji = "🔗"
-
-        final_content = self._build_route_content(
-            category,
-            searched=search_results_injected,
-            body_text=display_response,
-            override_label=override_label,
-            override_emoji=override_emoji,
+        orch_response = await self._call_orchestrator(
+            messages, model_id, request_headers
         )
-        body["messages"][-1]["content"] = final_content
-        await self._emit_replace(__event_emitter__, final_content)
 
-        verifier_body = display_response
+        body["messages"][-1]["content"] = orch_response
+        await self._emit_replace(__event_emitter__, orch_response)
 
-        if (
-            self.valves.ENABLE_OUTLET_VERIFICATION
-            and category in ["FACTUAL", "RESEARCH"]
-            and len(verifier_body) >= 50
-            and search_results_injected
-        ):
-            try:
-                await asyncio.wait_for(
-                    self._verify_and_correct(
-                        body,
-                        verifier_body,
-                        category,
-                        search_context_from_inlet,
-                        __event_emitter__,
-                    ),
-                    timeout=self.valves.OUTLET_VERIFY_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Outlet verification exceeded %ds",
-                    self.valves.OUTLET_VERIFY_TIMEOUT,
-                )
-                await self._emit_status(
-                    __event_emitter__,
-                    f"⚠️ Verifier timed out after {self.valves.OUTLET_VERIFY_TIMEOUT}s — stopping retries.",
-                )
-
-        # --- Chat memory: persist the finalized user+assistant turns and
-        # run periodic GC. All operations are fail-open; a failure here
-        # never reaches the user. ---
-        if self.valves.ENABLE_CHAT_MEMORY:
-            chat_id_out = self._extract_chat_id(body)
-            if chat_id_out:
-                user_msgs = [
-                    m for m in body["messages"] if m.get("role") == "user"
-                ]
-                if user_msgs:
-                    last_user_text = _extract_text(user_msgs[-1].get("content", ""))
-                    await self._store_chat_turn(
-                        chat_id_out, "user", last_user_text
-                    )
-                # Assistant content after all outlet massaging
-                # (header wrap + optional verification trailer). The
-                # _store_chat_turn path strips mechanical artifacts before
-                # storing — the memory entry is just the actual answer.
-                asst_text = _extract_text(body["messages"][-1].get("content", ""))
-                await self._store_chat_turn(chat_id_out, "assistant", asst_text)
-                # Referential sweep every outlet — privacy-critical, cheap.
-                # Deleted chats must lose their memory rows promptly.
-                await self._referential_sweep()
-                # TTL sweep probabilistic — not privacy-critical.
-                await self._maybe_ttl_sweep()
-                # Compression runs as a background task — it calls the main
-                # model which can take several seconds. Firing-and-forgetting
-                # keeps the user's reply latency at zero cost from this path.
-                if self.valves.ENABLE_CHAT_MEMORY_COMPRESSION:
-                    asyncio.create_task(
-                        self._maybe_compress_old_turns(chat_id_out)
-                    )
+        chat_id = self._extract_chat_id(body)
+        if self.valves.ENABLE_CHAT_MEMORY and chat_id:
+            user_msgs = [m for m in messages if m.get("role") == "user"]
+            if user_msgs:
+                last_user_text = _extract_text(user_msgs[-1].get("content", ""))
+                await self._store_chat_turn(chat_id, "user", last_user_text)
+            asst_text = _extract_text(orch_response)
+            await self._store_chat_turn(chat_id, "assistant", asst_text)
+            await self._referential_sweep()
+            await self._maybe_ttl_sweep()
+            if self.valves.ENABLE_CHAT_MEMORY_COMPRESSION:
+                asyncio.create_task(self._maybe_compress_old_turns(chat_id))
 
         return body
-
-    async def _verify_and_correct(
-        self,
-        body: dict,
-        original_response: str,
-        category: str,
-        search_context: str,
-        event_emitter: EventEmitter,
-    ) -> None:
-        if not search_context:
-            search_context = next(
-                (
-                    _extract_text(m["content"])
-                    for m in body["messages"]
-                    if m.get("role") == "system"
-                    and SEARCH_MARKER in _extract_text(m["content"])
-                ),
-                "",
-            )
-
-        mode = (self.valves.VERIFIER_MODE or "hybrid").lower()
-        max_retries = max(0, self.valves.VERIFIER_MAX_RETRIES)
-
-        user_msgs = [
-            _extract_text(m["content"])
-            for m in body["messages"]
-            if m.get("role") == "user"
-        ]
-        user_query = user_msgs[-1] if user_msgs else "your previous prompt"
-        category_prompt = self.prompts.get(category, "")
-        safe_query = _sanitize_query(user_query)
-
-        current_response = original_response
-
-        for attempt in range(max_retries + 1):
-            await self._emit_status(
-                event_emitter,
-                f"🔍 Verifying citations (attempt {attempt + 1}/{max_retries + 1})…",
-                done=False,
-            )
-
-            passed = True
-            reason = ""
-            if mode in ("regex", "hybrid"):
-                has_claims = bool(CLAIM_PATTERNS.search(current_response))
-                has_citations = bool(CITATION_PATTERNS.search(current_response))
-                if has_claims and not has_citations:
-                    passed = False
-                    reason = "regex: factual claims without inline citations"
-
-            if passed and mode in ("llm", "hybrid"):
-                passed, llm_reason = await self._llm_verify_citations(
-                    current_response, search_context
-                )
-                reason = f"llm: {llm_reason}" if not passed else llm_reason
-
-            if passed:
-                if attempt == 0:
-                    await self._emit_status(
-                        event_emitter, f"✅ Verifier: {reason or 'citations verified.'}"
-                    )
-                else:
-                    corrected_content = self._build_route_content(
-                        category,
-                        searched=True,
-                        override_label=f"{category} → CITATION CORRECTED (attempt {attempt + 1})",
-                        override_emoji="🔄",
-                        body_text=current_response,
-                    )
-                    body["messages"][-1]["content"] = corrected_content
-                    await self._emit_replace(event_emitter, corrected_content)
-                    await self._emit_status(
-                        event_emitter,
-                        f"✅ Verifier: corrected on attempt {attempt + 1}.",
-                    )
-                return
-
-            logger.info("[Verifier] attempt %d FAIL — %s", attempt + 1, reason)
-
-            if attempt >= max_retries or not self.valves.VERIFIER_REGENERATE:
-                preserved_content = self._build_route_content(
-                    category,
-                    searched=True,
-                    body_text=original_response,
-                    trailer=(
-                        f"\n\n---\n"
-                        f"⚠️ **Verification note:** Auto-verification couldn't confirm all "
-                        f"citations after {attempt + 1} attempt(s). "
-                        f"Last reason: {reason}. "
-                        f"Double-check the linked sources before relying on the response above.\n"
-                    ),
-                )
-                body["messages"][-1]["content"] = preserved_content
-                await self._emit_replace(event_emitter, preserved_content)
-                await self._emit_status(
-                    event_emitter,
-                    f"⚠️ Verifier: {attempt + 1} attempt(s) failed — original kept with warning.",
-                )
-                return
-
-            await self._emit_status(
-                event_emitter,
-                f"🔄 Verifier FAIL ({reason}) — regenerating attempt {attempt + 2}…",
-                done=False,
-            )
-            regen_prompt = (
-                f"{category_prompt}\n\n"
-                f"A previous attempt FAILED citation verification because: {reason}\n"
-                f"Do better this time.\n\n"
-                f"Answer the question using ONLY verified facts from the SEARCH_RESULTS below. "
-                f"CITE SOURCES INLINE using numbered references [1], [2], etc. "
-                f"Every number, date, percentage, name, or location must carry a [N] citation "
-                f"whose URL appears verbatim in SEARCH_RESULTS. "
-                f"At the END, add a '---\\n**Sources:**' section mapping each number to its URL. "
-                f"Do NOT invent URLs.\n\n"
-                f"Question: '{safe_query}'\n\n"
-                f"SEARCH_RESULTS:\n{search_context[:6000]}"
-            )
-            new_response = await self._call_llm(
-                regen_prompt,
-                body.get("model") or self.valves.MAIN_MODEL,
-                max_tokens=self.valves.VERIFIER_MAX_TOKENS,
-                log_role="regen",
-                log_chat_id=self._extract_chat_id(body),
-            )
-            if not new_response:
-                await self._emit_status(
-                    event_emitter,
-                    "⚠️ Verifier: regeneration call failed — stopping retries.",
-                )
-                return
-
-            if (
-                "[DATA NOT FOUND]" in new_response
-                or len(new_response) < len(original_response) * 0.4
-            ):
-                await self._emit_status(
-                    event_emitter,
-                    "⚠️ Verifier: regeneration degraded — keeping original with warning.",
-                )
-                preserved_content = self._build_route_content(
-                    category,
-                    searched=True,
-                    body_text=original_response,
-                    trailer=(
-                        f"\n\n---\n"
-                        f"⚠️ **Verification note:** Auto-verification couldn't confirm all citations "
-                        f"({reason}). Double-check the linked sources before relying on the response above.\n"
-                    ),
-                )
-                body["messages"][-1]["content"] = preserved_content
-                await self._emit_replace(event_emitter, preserved_content)
-                return
-
-            current_response = new_response
