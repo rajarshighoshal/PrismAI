@@ -1070,12 +1070,29 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         ]
         recall_query = " ".join(user_texts)[:2000] or ""
         recalled = await _memory_recall(chat_id, recall_query, session)
-        if recalled:
+        # Inject ONLY recalled USER turns (facts the user actually stated). Never
+        # inject recalled ASSISTANT turns: a past "I don't have that" answer would
+        # be fed back as context that instructs the model to deny again — and that
+        # denial then gets stored, a self-poisoning loop. Strip the consolidated-
+        # memory labels and frame the rest as established facts.
+        facts, seen = [], set()
+        for role, content in recalled:
+            if role != "user":
+                continue
+            c = (content or "")
+            for label in ("Current user request:", "Relevant provided/prior context:"):
+                c = c.replace(label, " ")
+            c = " ".join(c.split())
+            if c and c not in seen:
+                seen.add(c)
+                facts.append(c[:500])
+        if facts:
             memory_block = (
-                "Prior context from this conversation (semantic recall):\n"
+                "Earlier in THIS conversation the user already told you the following. "
+                "Treat these as established facts the user has stated and use them to "
+                "answer the current message:\n\n"
+                + "\n".join(f"- {f}" for f in facts)
             )
-            for role, content in recalled:
-                memory_block += f"[{role}] {content[:500]}\n\n"
             scratch.append({"role": "system", "content": memory_block})
 
     tool_sources = []
