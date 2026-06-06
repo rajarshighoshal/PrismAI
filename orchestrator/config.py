@@ -53,8 +53,8 @@ GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/mod
 # The auditor model lives in the tool-server (gpt-oss-120b); we just call it.
 
 # Advertised model ids — what OWUI shows in this connection's model list.
-ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "assistant")
-ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "assistant-vision")
+ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
+ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 
 # Generation knobs.
 CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))

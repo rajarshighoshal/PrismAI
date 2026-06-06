@@ -1,5 +1,5 @@
 """
-title: Advanced Hybrid Router & Interceptor
+title: PrismAI
 description: Accuracy-first router. Semantic routing + sticky follow-up + contextual classifier + strict citation enforcement (inlet prompts + outlet regen) + WebUI status emission.
 author: open-webui-community
 version: 9.7
