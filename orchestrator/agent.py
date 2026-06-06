@@ -4,6 +4,8 @@ The harness exposes tools and enforces verification. It does not classify the
 turn into prewritten task flows; the model chooses tools, the harness executes
 them, and final output is held until the grounding gate allows it.
 """
+
+import asyncio
 import json
 import logging
 import re
@@ -420,7 +422,7 @@ async def _memory_recall(chat_id: str, query: str, session) -> list[tuple[str, s
             f"{config.TOOL_SERVER_URL}/memory/recall",
             json={"chat_id": chat_id, "query": query, "top_k": 6},
             headers={"Content-Type": "application/json"},
-            timeout=config.TOOL_TIMEOUT,
+            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -439,7 +441,7 @@ async def _memory_store(chat_id: str, role: str, content: str, session) -> bool:
             f"{config.TOOL_SERVER_URL}/memory/store",
             json={"chat_id": chat_id, "role": role, "content": content},
             headers={"Content-Type": "application/json"},
-            timeout=config.TOOL_TIMEOUT,
+            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -1258,19 +1260,29 @@ def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
             name = m.get("name", "tool")
             content = (m.get("content") or "")[:2000]
             tool_outputs.append(f"[{name}]: {content}")
-    tool_text = "\n\n".join(tool_outputs) or "(no tools used)"
+    tool_text = "\n\n".join(tool_outputs) if tool_outputs else ""
 
-    system_msg = (
-        "You have gathered information using tools. Answer the user's original "
-        "question using ONLY the evidence below. Cite source URLs where available. "
-        "If evidence is insufficient, say what cannot be verified. Be direct and "
-        "natural — no preamble, no sign-off."
-    )
-
-    return [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": f"Tool results:\n\n{tool_text}\n\nOriginal question context:\n{source[:4000]}"},
-    ]
+    if tool_text:
+        system_msg = (
+            "You have gathered information using tools. Answer the user's original "
+            "question using ONLY the evidence below. Cite source URLs where available. "
+            "If evidence is insufficient, say what cannot be verified. Be direct and "
+            "natural — no preamble, no sign-off."
+        )
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Tool results:\n\n{tool_text}\n\nOriginal question:\n{source[:4000]}"},
+        ]
+    else:
+        # No tools used — pass the original question directly
+        user_texts = []
+        for m in scratch:
+            if m.get("role") == "user":
+                user_texts.append(_text_of(m.get("content")))
+        last_user = user_texts[-1] if user_texts else source[:2000]
+        return [
+            {"role": "user", "content": last_user.strip()},
+        ]
 
 
 async def _regenerate_with_user_model(

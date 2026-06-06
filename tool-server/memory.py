@@ -25,12 +25,12 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.getenv("CHAT_MEMORY_DB_PATH", "/app/backend/data/router_mem.db")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "accounts/fireworks/models/nomic-embed-text-v1.5")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
 EMBEDDING_URL = "https://api.fireworks.ai/inference/v1/embeddings"
 
 MEMORY_TOP_K = int(os.getenv("CHAT_MEMORY_TOP_K", "6"))
-MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "8"))
+MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "3"))
 MEMORY_MAX_PER_CHAT = int(os.getenv("CHAT_MEMORY_MAX_TURNS_PER_CHAT", "100"))
 
 # ── Regex patterns ──────────────────────────────────────────────────────
@@ -115,6 +115,12 @@ async def get_conn() -> Optional[sqlite3.Connection]:
             conn = sqlite3.connect(DB_PATH)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
+
+            # Migration: add is_summary column if missing (older DBs)
+            try:
+                conn.execute("ALTER TABLE chat_turns ADD COLUMN is_summary INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS chat_turns (
