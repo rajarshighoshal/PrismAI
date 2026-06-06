@@ -25,8 +25,8 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.getenv("CHAT_MEMORY_DB_PATH", "/app/backend/data/router_mem.db")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "accounts/fireworks/models/qwen3-embedding-8b")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "4096"))
 EMBEDDING_URL = "https://api.fireworks.ai/inference/v1/embeddings"
 
 MEMORY_TOP_K = int(os.getenv("CHAT_MEMORY_TOP_K", "6"))
