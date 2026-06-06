@@ -5,6 +5,7 @@ turn into prewritten task flows; the model chooses tools, the harness executes
 them, and final output is held until the grounding gate allows it.
 """
 
+import aiohttp
 import asyncio
 import json
 import logging
@@ -413,39 +414,41 @@ def _same_message_source(text: str) -> str:
     return "\n\n".join(out).strip()
 
 
-async def _memory_recall(chat_id: str, query: str, session) -> list[tuple[str, str]]:
-    """Call tool-server memory recall."""
+async def _memory_recall(chat_id: str, query: str, session=None) -> list[tuple[str, str]]:
+    """Call tool-server memory recall. Uses its own session for independence."""
     if not chat_id:
         return []
     try:
-        async with session.post(
-            f"{config.TOOL_SERVER_URL}/memory/recall",
-            json={"chat_id": chat_id, "query": query, "top_k": 6},
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return [(t["role"], t["content"]) for t in data.get("turns", [])]
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/memory/recall",
+                json={"chat_id": chat_id, "query": query, "top_k": 6},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return [(t["role"], t["content"]) for t in data.get("turns", [])]
     except Exception:
         pass
     return []
 
 
-async def _memory_store(chat_id: str, role: str, content: str, session) -> bool:
-    """Call tool-server memory store."""
+async def _memory_store(chat_id: str, role: str, content: str, session=None) -> bool:
+    """Call tool-server memory store. Uses its own session to survive caller's session closure."""
     if not chat_id:
         return False
     try:
-        async with session.post(
-            f"{config.TOOL_SERVER_URL}/memory/store",
-            json={"chat_id": chat_id, "role": role, "content": content},
-            headers={"Content-Type": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("stored", False)
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/memory/store",
+                json={"chat_id": chat_id, "role": role, "content": content},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("stored", False)
     except Exception:
         pass
     return False
@@ -462,6 +465,33 @@ def _user_source(messages) -> str:
     prior = "\n\n".join(t for t in user_texts[:-1] if t).strip()
     same = _same_message_source(user_texts[-1])
     return "\n\n".join(p for p in (prior, same) if p).strip()
+
+
+def _clip_memory_part(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...[truncated]"
+
+
+def _consolidated_user_memory(messages, user_source: str) -> str:
+    """Compact per-chat memory: current ask plus the context that informed it."""
+    user_texts = [
+        _text_of(m.get("content")).strip()
+        for m in messages
+        if m.get("role") == "user" and _text_of(m.get("content")).strip()
+    ]
+    if not user_texts and not user_source.strip():
+        return ""
+    last_user = user_texts[-1] if user_texts else ""
+    parts = []
+    if last_user:
+        parts.append("Current user request:\n" + _clip_memory_part(last_user, 3000))
+    if user_source.strip() and user_source.strip() != last_user.strip():
+        parts.append(
+            "Relevant provided/prior context:\n" + _clip_memory_part(user_source, 6000)
+        )
+    return "\n\n---\n\n".join(parts).strip()
 
 
 def _initial_messages(messages, user_id: str):
@@ -1221,7 +1251,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if status == "ok":
             # Store in memory asynchronously (don't block the response)
             if chat_id:
-                asyncio.create_task(_memory_store(chat_id, "user", user_source, session))
+                user_memory = _consolidated_user_memory(messages, user_source)
+                if user_memory:
+                    asyncio.create_task(_memory_store(chat_id, "user", user_memory, session))
                 asyncio.create_task(_memory_store(chat_id, "assistant", text, session))
             yield ("content", text)
             return
