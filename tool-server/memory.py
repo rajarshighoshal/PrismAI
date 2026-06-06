@@ -32,6 +32,15 @@ EMBEDDING_URL = "https://api.fireworks.ai/inference/v1/embeddings"
 MEMORY_TOP_K = int(os.getenv("CHAT_MEMORY_TOP_K", "6"))
 MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "3"))
 MEMORY_MAX_PER_CHAT = int(os.getenv("CHAT_MEMORY_MAX_TURNS_PER_CHAT", "100"))
+ENABLE_CHAT_MEMORY_COMPRESSION = os.getenv(
+    "ENABLE_CHAT_MEMORY_COMPRESSION", "true"
+).lower() not in {"0", "false", "no"}
+MEMORY_COMPRESS_WHEN_OVER = int(os.getenv("CHAT_MEMORY_COMPRESS_WHEN_OVER", "60"))
+MEMORY_COMPRESS_CHUNK = int(os.getenv("CHAT_MEMORY_COMPRESS_CHUNK", "20"))
+COMPRESSION_MODEL = os.getenv(
+    "COMPRESSION_MODEL", "accounts/fireworks/models/deepseek-v4-flash"
+)
+CHAT_COMPLETIONS_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
 
 # ── Regex patterns ──────────────────────────────────────────────────────
 THINKING_RE = re.compile(r"<thinking[\s\S]*?<\s*/thinking>", re.IGNORECASE)
@@ -53,6 +62,7 @@ _memory_disabled = False
 _embedding_dim: Optional[int] = None
 _embedding_dim_warned = False
 _init_lock = asyncio.Lock()
+_compression_locks: dict[str, asyncio.Lock] = {}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -215,6 +225,45 @@ async def get_embedding(text: str) -> list[float]:
         return []
 
 
+async def summarize_turns(turns: list[tuple[str, str]]) -> str:
+    if not FIREWORKS_API_KEY or not turns:
+        return ""
+    block = "\n".join(f"[{role}]: {content[:700]}" for role, content in turns)
+    prompt = (
+        "Summarize these conversation turns into one concise, information-dense "
+        "memory note for later semantic recall. Preserve important facts, decisions, "
+        "user preferences, constraints, unresolved TODOs, code paths, commands, "
+        "URLs, paper titles, eval outcomes, and model/routing decisions. Omit "
+        "greetings, pleasantries, repeated phrasing, and transient details unless "
+        "they affect future work. Do not invent facts. Target 200-400 words in one "
+        "paragraph.\n\n"
+        f"CONVERSATION TURNS:\n{block}\n\n"
+        "MEMORY SUMMARY:"
+    )
+    payload = {
+        "model": COMPRESSION_MODEL,
+        "max_tokens": 500,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"].get("content") or ""
+            return THINKING_RE.sub("", text).strip()
+    except Exception as e:
+        logger.warning(f"Memory compression LLM failed: {e}")
+        return ""
+
+
 # ── Public API ───────────────────────────────────────────────────────────
 
 async def store(chat_id: str, role: str, content: str) -> bool:
@@ -256,7 +305,7 @@ async def store(chat_id: str, role: str, content: str) -> bool:
             (chat_id, role, cleaned, chash, blob, time.time()),
         )
 
-        # Enforce per-chat cap
+        # Enforce per-chat cap without deleting summary rows first.
         excess = conn.execute(
             "SELECT COUNT(*) - ? FROM chat_turns WHERE chat_id=?",
             (MEMORY_MAX_PER_CHAT, chat_id),
@@ -264,7 +313,8 @@ async def store(chat_id: str, role: str, content: str) -> bool:
         if excess > 0:
             conn.execute(
                 "DELETE FROM chat_turns WHERE id IN ("
-                "  SELECT id FROM chat_turns WHERE chat_id=? ORDER BY created_at ASC LIMIT ?"
+                "  SELECT id FROM chat_turns WHERE chat_id=? AND is_summary=0 "
+                "  ORDER BY created_at ASC LIMIT ?"
                 ")",
                 (chat_id, excess),
             )
@@ -274,6 +324,84 @@ async def store(chat_id: str, role: str, content: str) -> bool:
     except Exception as e:
         logger.warning(f"Memory store failed: {e}")
         return False
+
+
+def _compression_lock(chat_id: str) -> asyncio.Lock:
+    lock = _compression_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _compression_locks[chat_id] = lock
+    return lock
+
+
+async def maybe_compress_chat(chat_id: str) -> int:
+    """Summarize oldest raw rows into one durable summary row when a chat grows.
+
+    Returns the number of raw rows compacted. Fails soft and never deletes raw
+    rows unless a summary row has been inserted or already exists.
+    """
+    if not ENABLE_CHAT_MEMORY_COMPRESSION or not chat_id:
+        return 0
+    lock = _compression_lock(chat_id)
+    if lock.locked():
+        return 0
+    async with lock:
+        return await _compress_chat_unlocked(chat_id)
+
+
+async def _compress_chat_unlocked(chat_id: str) -> int:
+    conn = await get_conn()
+    if not conn:
+        return 0
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND is_summary=0",
+            (chat_id,),
+        ).fetchone()[0]
+        if total <= MEMORY_COMPRESS_WHEN_OVER:
+            return 0
+
+        rows = conn.execute(
+            "SELECT id, role, content FROM chat_turns "
+            "WHERE chat_id=? AND is_summary=0 "
+            "ORDER BY created_at ASC LIMIT ?",
+            (chat_id, MEMORY_COMPRESS_CHUNK),
+        ).fetchall()
+        if len(rows) < 5:
+            return 0
+
+        summary = await summarize_turns([(role, content) for _, role, content in rows])
+        if len(summary) < 50:
+            return 0
+
+        chash = _content_hash(summary)
+        existing = conn.execute(
+            "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=?",
+            (chat_id, chash),
+        ).fetchone()
+        vec = await get_embedding(summary[:2000])
+        blob = _f32_pack(vec) if vec else None
+        ids = [row_id for row_id, _, _ in rows]
+        qs = ",".join("?" * len(ids))
+
+        if not existing:
+            conn.execute(
+                "INSERT INTO chat_turns "
+                "(chat_id, role, content, content_hash, embedding, created_at, is_summary) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (chat_id, "summary", summary, chash, blob, time.time(), 1),
+            )
+        conn.execute(f"DELETE FROM chat_turns WHERE id IN ({qs})", tuple(ids))
+        conn.commit()
+        logger.info(
+            "Memory compression: chat=%s summarized %d raw rows",
+            str(chat_id)[:20],
+            len(ids),
+        )
+        return len(ids)
+    except Exception as e:
+        logger.warning(f"Memory compression failed: {e}")
+        return 0
 
 
 async def sweep_chat(chat_id: str, ttl_days: int = 90) -> int:

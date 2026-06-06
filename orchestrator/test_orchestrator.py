@@ -14,6 +14,7 @@ from orchestrator import agent, config, fireworks, pipeline, search, toolserver
 _calls = {
     "chat_models": [],
     "chat_messages": [],
+    "complete_models": [],
     "search": [],
     "post": [],
     "verify": [],
@@ -21,6 +22,7 @@ _calls = {
 _chat_queue = []
 _gate_queue = []
 _tool_gate_queue = []
+_app_audit_queue = []
 _verify_queue = []
 _post_queue = []
 
@@ -53,14 +55,27 @@ async def _fake_chat(messages, model, *, max_tokens, temperature=None, session=N
 
 
 async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None):
+    _calls["complete_models"].append(model)
     sys = messages[0]["content"] if messages else ""
+    if model == config.VISION_MODEL:
+        return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
     if "Decide if a draft needs grounding verification" in sys:
         value = _gate_queue.pop(0) if _gate_queue else False
         return json.dumps({"needs_verification": value, "reason": "test"})
     if "Decide whether a proposed tool call is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
-    if "Revise the draft" in sys:
+    if "calibrated application-writing claim auditor" in sys:
+        if _app_audit_queue:
+            return json.dumps(_app_audit_queue.pop(0))
+        return json.dumps({
+            "unsupported_candidate_claims": [],
+            "unsupported_company_claims": [],
+            "fake_motivation_or_fit": [],
+            "acceptable_framing": [],
+            "verdict": "CLEAN",
+        })
+    if "Revise the draft" in sys or "Revise the application-writing draft" in sys:
         return "Corrected final answer."
     return "completion"
 
@@ -109,6 +124,7 @@ def _reset():
     _chat_queue.clear()
     _gate_queue.clear()
     _tool_gate_queue.clear()
+    _app_audit_queue.clear()
     _verify_queue.clear()
     _post_queue.clear()
 
@@ -129,6 +145,9 @@ async def _run_tests():
     toolserver.verify_grounding = _fake_verify
     config.ENABLE_VERIFICATION = True
     config.ENABLE_GROUNDING_GATE = True
+    config.ENABLE_OPENAI_PROSE = False
+    config.ENABLE_ANTHROPIC_PROSE = False
+    config.ENABLE_GEMINI_PROSE = False
     config.AGENT_MAX_STEPS = 6
     config.GROUNDING_REPAIR_STEPS = 2
 
@@ -269,14 +288,49 @@ async def _run_tests():
     check("export: base64 not returned to model", "ZmFrZS1maWxl" not in tool_context)
     check("export: final text returned", _content(ev) == "Exported draft.md.")
 
-    # Vision remains a modality route, not a text-task tier.
+    # Vision is transcribed first, then the normal agent loop answers.
     _reset()
+    _chat_queue.append(_chat_content("The image says the PhD application is due Friday."))
+    _gate_queue.append(False)
     ev = await _collect([{"role": "user", "content": [
         {"type": "text", "text": "what is in this image?"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
     ]}])
-    check("vision: uses vision stream path", _content(ev) == "vision answer")
-    check("vision: used vision model", _calls["chat_models"] == [config.VISION_MODEL])
+    check("vision: transcribes then answers through agent", "PhD application is due Friday" in _content(ev))
+    check("vision: used vision model for transcription", _calls["complete_models"][0] == config.VISION_MODEL)
+    check("vision: used agent loop after transcription",
+          _calls["chat_models"] in ([config.AGENT_MODEL], [config.GROUNDED_MODEL]))
+    check("vision: injected image context into agent", "VISIBLE TEXT" in json.dumps(_calls["chat_messages"][0]))
+
+    # Application drafts may be persuasive, but fake candidate/motivation claims
+    # are refined out before display.
+    _reset()
+    _chat_queue.append(_chat_content(
+        "Dear Stripe Team,\n\nI am drawn to your mission because it deeply resonates with me. "
+        "I led analytics dashboards that transformed executive decision-making."
+    ))
+    _app_audit_queue.extend([
+        {
+            "unsupported_candidate_claims": ["led analytics dashboards that transformed executive decision-making"],
+            "unsupported_company_claims": [],
+            "fake_motivation_or_fit": ["deeply resonates with me"],
+            "acceptable_framing": ["Stripe Team"],
+            "verdict": "UNSUPPORTED",
+        },
+        {
+            "unsupported_candidate_claims": [],
+            "unsupported_company_claims": [],
+            "fake_motivation_or_fit": [],
+            "acceptable_framing": ["grounded role framing"],
+            "verdict": "CLEAN",
+        },
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": (
+        "Write a short cover letter for a data analyst role at Stripe. "
+        "Candidate facts: 3 years SQL, Tableau dashboards, A/B testing."
+    )}])
+    check("application audit: strips fake candidate/motivation claims", _content(ev) == "Corrected final answer.")
 
     print()
     if fails:

@@ -5,6 +5,7 @@ the model can invoke. Stateless except for the memory DB.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import ipaddress
@@ -813,6 +814,8 @@ async def startup_init_memory():
 async def memory_store(req: MemoryStoreRequest) -> dict:
     """Store a user or assistant turn for later semantic recall."""
     ok = await memory.store(req.chat_id, req.role, req.content)
+    if ok:
+        asyncio.create_task(memory.maybe_compress_chat(req.chat_id))
     return {"stored": ok, "chat_id": req.chat_id}
 
 
@@ -841,5 +844,6 @@ async def memory_recall(req: MemoryRecallRequest) -> dict:
 async def memory_sweep(req: MemorySweepRequest) -> dict:
     """Clean up old or orphaned memory rows for a chat."""
     # Basic per-chat sweep: delete turns older than 90 days
+    compacted = await memory.maybe_compress_chat(req.chat_id)
     removed = await memory.sweep_chat(req.chat_id)
-    return {"chat_id": req.chat_id, "removed_rows": removed}
+    return {"chat_id": req.chat_id, "removed_rows": removed, "compacted_rows": compacted}
