@@ -10,3 +10,9 @@ webui.db.backup-*
 orchestrator/orchestrator.env
 orchestrator/__pycache__/
 eval/
+
+# Public-repo safety: internal handoff, personal eval data, local DBs — never commit
+.claude/
+orchestrator/arena/
+orchestrator/ab_cases_*.json
+*.db
