@@ -1062,28 +1062,25 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         ]
         recall_query = " ".join(user_texts)[:2000] or ""
         recalled = await _memory_recall(chat_id, recall_query, session)
-        # Inject ONLY recalled USER turns (facts the user actually stated). Never
-        # inject recalled ASSISTANT turns: a past "I don't have that" answer would
-        # be fed back as context that instructs the model to deny again — and that
-        # denial then gets stored, a self-poisoning loop. Strip the consolidated-
-        # memory labels and frame the rest as established facts.
-        facts, seen = [], set()
+        # Inject recall as a faithful TRANSCRIPT (both roles), not as "facts": a
+        # recalled question then sits next to its answer (already resolved), so the
+        # model won't re-answer it, and a stale answer is just past context, not a
+        # standalone claim. The explicit guard keeps the model on the CURRENT turn.
+        lines, seen = [], set()
         for role, content in recalled:
-            if role != "user":
-                continue
             c = (content or "")
             for label in ("Current user request:", "Relevant provided/prior context:"):
                 c = c.replace(label, " ")
             c = " ".join(c.split())
-            if c and c not in seen:
-                seen.add(c)
-                facts.append(c[:500])
-        if facts:
+            key = (role, c)
+            if c and key not in seen:
+                seen.add(key)
+                lines.append(f"{role}: {c[:500]}")
+        if lines:
             memory_block = (
-                "Earlier in THIS conversation the user already told you the following. "
-                "Treat these as established facts the user has stated and use them to "
-                "answer the current message:\n\n"
-                + "\n".join(f"- {f}" for f in facts)
+                "Relevant earlier exchange from THIS conversation, for context only. "
+                "Use it to answer the user's CURRENT message; do NOT re-answer past "
+                "questions or repeat past answers:\n" + "\n".join(lines)
             )
             scratch.append({"role": "system", "content": memory_block})
 
