@@ -9,7 +9,7 @@ patched so these tests assert harness behavior rather than model quality.
 import asyncio
 import json
 
-from orchestrator import agent, config, fireworks, pipeline, search, toolserver
+from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver
 
 _calls = {
     "chat_models": [],
@@ -508,6 +508,47 @@ async def _run_tests():
 
     agent._honesty_audit, agent._memory_recall = _orig_honesty, _orig_recall
     agent._memory_store, toolserver.verify_grounding = _orig_store, _orig_verify
+
+    # ---- Request de-duplication (idempotency on retries) -----------------------
+    dedup._results.clear(); dedup._inflight.clear()
+    msgs = [{"role": "user", "content": "what is 2+2?"}]
+    key = dedup.make_key(msgs, "PrismAI", "user-1")
+    check("dedup: identical request -> same key",
+          key == dedup.make_key(list(msgs), "PrismAI", "user-1"))
+    check("dedup: different user -> different key",
+          key != dedup.make_key(msgs, "PrismAI", "user-2"))
+
+    # first request leads; an identical one arriving mid-flight follows the SAME future
+    mode, fut = dedup.begin(key)
+    check("dedup: first request is the lead", mode == "lead")
+    mode2, fut2 = dedup.begin(key)
+    check("dedup: concurrent identical request follows the lead", mode2 == "follow" and fut2 is fut)
+    dedup.resolve(key, fut, answer="4")
+    check("dedup: follower receives the lead's answer (no second run)", (await fut2) == "4")
+    mode3, payload3 = dedup.begin(key)
+    check("dedup: later identical request hits the completed cache", mode3 == "cached" and payload3 == "4")
+
+    # a failed request is NOT cached: the next identical one re-runs
+    dedup._results.clear(); dedup._inflight.clear()
+    kerr = dedup.make_key([{"role": "user", "content": "boom"}], "PrismAI", "user-1")
+    _, ferr = dedup.begin(kerr)
+    dedup.resolve(kerr, ferr, exc=RuntimeError("boom"))
+    try:
+        ferr.exception()  # retrieve so it isn't an unhandled-exception warning
+    except Exception:
+        pass
+    check("dedup: a failed request is not cached", dedup.get_cached(kerr) is None)
+    check("dedup: after a failure the next identical request re-runs (lead)",
+          dedup.begin(kerr)[0] == "lead")
+
+    # expired entries are not served
+    _saved_ttl = config.DEDUP_TTL_SECONDS
+    config.DEDUP_TTL_SECONDS = -1
+    ktl = dedup.make_key([{"role": "user", "content": "stale"}], "PrismAI", "user-1")
+    dedup.store(ktl, "old")
+    check("dedup: expired entry is not returned", dedup.get_cached(ktl) is None)
+    config.DEDUP_TTL_SECONDS = _saved_ttl
+    dedup._results.clear(); dedup._inflight.clear()
 
     print()
     if fails:
