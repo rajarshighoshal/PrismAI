@@ -1100,9 +1100,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     if chat_id and history_chars > config.MEMORY_CONTEXT_BUDGET_CHARS:
         recent, _older = _split_recent_history(messages, config.MEMORY_CONTEXT_BUDGET_CHARS)
         recent_norm = {_norm_turn(_text_of(m.get("content"))) for m in recent}
-        recall_query = " ".join(
-            _text_of(m.get("content")).strip()
-            for m in messages[-4:] if m.get("role") == "user"
+        # Query recall on the CURRENT question (last user turn). Joining several
+        # recent turns lets a big pasted message crowd out the actual intent once
+        # clipped, so recall would search on filler instead of what's being asked.
+        recall_query = next(
+            (_text_of(m.get("content")).strip() for m in reversed(messages) if m.get("role") == "user"),
+            "",
         )[:2000]
         recalled = await _memory_recall(chat_id, recall_query, session)
         lines, seen = [], set()

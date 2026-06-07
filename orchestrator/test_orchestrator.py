@@ -436,6 +436,11 @@ async def _run_tests():
     )
     out = _content(ev)
     check("memory/overflow: recall fires on a long chat", len(_recall_calls) == 1)
+    # Recall must query on the CURRENT question, not be drowned out by the big
+    # filler turn (the query is clipped to 2000 chars).
+    _q = _recall_calls[0][1] if _recall_calls else ""
+    check("memory/overflow: recall queries on the current question, not filler",
+          "codename" in _q and "Filler discussion" not in _q)
     check("memory/overflow: recalled fact survives verification", "Helios" in out and "March 3rd" in out)
 
     # B) Overflow is NOT a fabrication bypass: a fact absent from recall is still
