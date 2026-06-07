@@ -224,16 +224,13 @@ SYSTEM_VISION = (
 )
 
 SYSTEM_GATE = (
-    "Decide if a draft needs grounding verification before it is shown to the user. "
-    "Return ONLY a JSON object: {\"needs_verification\": boolean, \"reason\": string}. "
-    "Set true when the draft asserts things that would be a real problem if fabricated: "
-    "current or external facts (recent events, latest versions, prices, live statistics), "
-    "citations or named sources, claims about the USER's credentials/experience/history, "
-    "or specific factual figures/dates/metrics that must be exact. "
-    "Set false for greetings, small talk, opinion, creative writing, brainstorming, "
-    "simple code, basic arithmetic, and well-established common knowledge (capital "
-    "cities, dictionary definitions, widely-known facts). When genuinely unsure, true. "
-    "Respond with ONLY the JSON object on one line — no reasoning, explanation, or preamble."
+    "Decide if a draft needs grounding verification before it can be shown. "
+    "Return JSON only: {\"needs_verification\": boolean, \"reason\": string}. "
+    "needs_verification=true for source-bound writing, current/external factual "
+    "claims, citations, claims about user credentials/history, numbers, dates, "
+    "or anything that would be a problem if fabricated. false for greetings, "
+    "purely creative writing, opinion, harmless brainstorming, or simple code "
+    "with no external factual claims."
 )
 
 SYSTEM_HONESTY = (
@@ -680,24 +677,15 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
             ],
             config.GROUNDING_GATE_MODEL,
-            max_tokens=256,  # room for the JSON even if the model prepends reasoning
+            max_tokens=120,
             temperature=0.0,
             session=session,
         )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(match.group(0) if match else raw)
+        return bool(data.get("needs_verification"))
     except Exception:
-        return bool(source)  # service error: fall back to the source heuristic
-    # FAIL CLOSED: if the gate did not return a parseable verdict (it sometimes
-    # emits chain-of-thought that gets truncated before the JSON), assume the
-    # draft DOES need verification rather than silently skipping it. A flaky gate
-    # must never become a hole that ships an unverified factual/credential claim.
-    match = re.search(r"\{.*\}", raw, flags=re.S)
-    if not match:
-        return True
-    try:
-        data = json.loads(match.group(0))
-    except Exception:
-        return True
-    return bool(data.get("needs_verification"))
+        return bool(source)
 
 
 async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) -> str:
