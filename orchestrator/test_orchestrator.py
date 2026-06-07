@@ -379,6 +379,91 @@ async def _run_tests():
     )}])
     check("application audit: strips fake candidate/motivation claims", _content(ev) == "Corrected final answer.")
 
+    # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
+    # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
+    # text the auditor was handed is treated as a fabrication. This makes the
+    # tests real instead of rubber-stamps: if recall_context fails to reach the
+    # verifier, a correctly recalled fact looks invented and gets stripped, so the
+    # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
+    _SENTINELS = ["Helios", "March 3rd", "$5 million"]
+    _orig_honesty, _orig_recall = agent._honesty_audit, agent._memory_recall
+    _orig_store, _orig_verify = agent._memory_store, toolserver.verify_grounding
+
+    async def _realistic_honesty(full_request, candidate, *, session=None):
+        bad = [f for f in _SENTINELS if f in candidate and f not in full_request]
+        return {"unsupported": bad, "verdict": "FABRICATION" if bad else "CLEAN"}
+
+    async def _realistic_verify(source, draft, *, session=None):
+        _calls["verify"].append((source, draft))
+        bad = [f for f in _SENTINELS if f in draft and f not in source]
+        return {"grounded": not bad, "unsupported_claims": ", ".join(bad)}
+
+    _recall_calls, _recall_return = [], []
+
+    async def _fake_recall(chat_id, query, session=None):
+        _recall_calls.append((chat_id, query))
+        return list(_recall_return)
+
+    async def _noop_store(chat_id, role, content, session=None):
+        return True
+
+    agent._honesty_audit = _realistic_honesty
+    agent._memory_recall = _fake_recall
+    agent._memory_store = _noop_store
+    toolserver.verify_grounding = _realistic_verify
+
+    _BIG = "Filler discussion of unrelated topics. " * 700  # ~27k chars/block
+
+    def _overflow_history(final_q):
+        # Helios is stated FIRST, then enough filler to push it out of the kept
+        # tail, so only recall can carry it into the answer + verifier.
+        return [
+            {"role": "user", "content": "Earlier note: my project codename is Helios and we launch March 3rd."},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": _BIG},
+            {"role": "assistant", "content": _BIG},
+            {"role": "user", "content": final_q},
+        ]
+
+    # A) Overflow: a recalled fact survives verification (is NOT stripped).
+    _reset(); _recall_calls.clear()
+    _recall_return[:] = [("user", "my project codename is Helios and we launch March 3rd")]
+    _chat_queue.append(_chat_content("Your project codename is Helios and the launch date is March 3rd."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("What project codename and launch date did I mention earlier?"),
+        request_headers={"x-openwebui-chat-id": "long1"},
+    )
+    out = _content(ev)
+    check("memory/overflow: recall fires on a long chat", len(_recall_calls) == 1)
+    check("memory/overflow: recalled fact survives verification", "Helios" in out and "March 3rd" in out)
+
+    # B) Overflow is NOT a fabrication bypass: a fact absent from recall is still
+    #    stripped. This guards the dangerous failure mode of the fix.
+    _reset()
+    _recall_return[:] = [("user", "my project codename is Helios and we launch March 3rd")]
+    _chat_queue.append(_chat_content("Your codename is Helios and your budget is $5 million."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("Remind me of my codename and budget?"),
+        request_headers={"x-openwebui-chat-id": "long2"},
+    )
+    check("memory/overflow: recall is not a blanket fabrication bypass", "$5 million" not in _content(ev))
+
+    # C) Normal-length chat: recall does NOT fire — native history already covers
+    #    it, so custom recall would be pure redundancy.
+    _reset(); _recall_calls.clear()
+    _chat_queue.append(_chat_content("Hello there."))
+    _gate_queue.append(False)
+    await _collect(
+        [{"role": "user", "content": "hi, short chat"}],
+        request_headers={"x-openwebui-chat-id": "short1"},
+    )
+    check("memory/normal: no recall on a short chat (native history used)", _recall_calls == [])
+
+    agent._honesty_audit, agent._memory_recall = _orig_honesty, _orig_recall
+    agent._memory_store, toolserver.verify_grounding = _orig_store, _orig_verify
+
     print()
     if fails:
         print(f"{len(fails)} FAILED: {fails}")

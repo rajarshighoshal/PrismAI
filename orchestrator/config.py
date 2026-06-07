@@ -109,6 +109,14 @@ SHOW_WORK = _flag("SHOW_WORK", "true")
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 
+# Chat-memory recall is an OVERFLOW handler, not a per-turn feature. OWUI sends
+# the full native conversation history every request, so for normal-length chats
+# recall is pure redundancy — the model (and the verifier) already see everything.
+# Recall only kicks in when the native history exceeds this character budget: the
+# recent tail is kept verbatim and older relevant facts are recalled to stand in
+# for the truncated head. Set high so ordinary chats never trigger it.
+MEMORY_CONTEXT_BUDGET_CHARS = int(os.getenv("MEMORY_CONTEXT_BUDGET_CHARS", "40000"))
+
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
 PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")

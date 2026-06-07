@@ -942,9 +942,19 @@ def _honesty_block_msg(unsupported) -> str:
     )
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=None, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, session=None):
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
+
+    # Recalled facts are the user's OWN earlier statements, surfaced only when a
+    # long chat overflowed the context budget (see run()). They are established
+    # context, so every auditor must see them — otherwise the can't-lie layer
+    # flags a correctly-recalled fact as an unsupported fabrication and strips it
+    # (the memory-vs-verifier collision). For normal chats recall_context is "",
+    # so grounding_source/full_request are unchanged and this path is a no-op.
+    _rc = (recall_context or "").strip()
+    _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
+    grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
     # Honesty audit FIRST — independent of the grounding gate, which wrongly waves
     # through "creative writing" that inflates the user's credentials. This is the
@@ -958,7 +968,7 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
     # ONE auditor: honesty for non-application deliverables, the app audit for apps.
     is_app = _is_application_writing(messages)
     if getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app:
-        full_request = _all_user_text(messages)
+        full_request = _all_user_text(messages) + _recall_extra
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
@@ -973,14 +983,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
 
     if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app:
-        full_request = _all_user_text(messages)
-        app_audit = await _application_claim_audit(full_request, candidate, source, session=session)
+        full_request = _all_user_text(messages) + _recall_extra
+        app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
             refined = await _refine_application_claims(
-                full_request, candidate, source, app_audit, prose=prose, session=session
+                full_request, candidate, grounding_source, app_audit, prose=prose, session=session
             )
             if refined:
-                recheck = await _application_claim_audit(full_request, refined, source, session=session)
+                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session)
                 if not recheck or not str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED"):
                     candidate = refined
                 else:
@@ -998,22 +1008,22 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
                     "unsupported claims:\n\n" + issues,
                 )
 
-    if not source.strip() and _has_citation_markers(candidate):
+    if not grounding_source.strip() and _has_citation_markers(candidate):
         return (
             "citation_without_source",
             "The previous draft included citations or source labels, but no sources were actually supplied or retrieved.",
         )
 
-    needs = await _needs_verification(messages, candidate, source, session=session)
+    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
     if not needs:
         return "ok", candidate
-    if not source.strip():
+    if not grounding_source.strip():
         return (
             "needs_source",
             "The previous draft made factual claims without source material.",
         )
 
-    audit = await toolserver.verify_grounding(source, candidate, session=session)
+    audit = await toolserver.verify_grounding(grounding_source, candidate, session=session)
     if audit is None:
         return (
             "blocked",
@@ -1023,9 +1033,9 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
         return "ok", candidate
 
     claims = (audit.get("unsupported_claims") or "").strip() or "Unsupported claims were found."
-    refined = await _refine_to_source(source, candidate, claims, prose=prose, session=session)
+    refined = await _refine_to_source(grounding_source, candidate, claims, prose=prose, session=session)
     if refined:
-        second = await toolserver.verify_grounding(source, refined, session=session)
+        second = await toolserver.verify_grounding(grounding_source, refined, session=session)
         if second is not None and second.get("grounded"):
             return "ok", refined
     return (
@@ -1033,6 +1043,30 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
         "I could not safely finalize this without unsupported claims. The verification gate flagged:\n\n"
         + claims,
     )
+
+
+def _norm_turn(content) -> str:
+    """Strip the stored-memory wrapper labels and collapse whitespace, so recalled
+    turns can be deduped against the verbatim tail that's still in context."""
+    c = content or ""
+    for label in ("Current user request:", "Relevant provided/prior context:"):
+        c = c.replace(label, " ")
+    return " ".join(c.split())
+
+
+def _split_recent_history(messages, budget_chars: int):
+    """Split a long history into (recent_tail, older_head). The tail is the most
+    recent messages that fit in ~70% of the budget (leaving room for the recall
+    block + the answer); the head is everything older, to be represented by
+    recall. Always keeps at least the final message."""
+    keep = max(1, int(budget_chars * 0.7))
+    total, cut = 0, 0
+    for i in range(len(messages) - 1, -1, -1):
+        total += len(_text_of(messages[i].get("content")))
+        if total > keep and i < len(messages) - 1:
+            cut = i + 1
+            break
+    return messages[cut:], messages[:cut]
 
 
 async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
@@ -1049,40 +1083,56 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             yield ("reasoning", "🖼️ Reading image context…\n")
         messages = await _describe_images_for_agent(messages, session=session)
 
-    scratch = _initial_messages(messages, user_id)
-    user_source = _user_source(messages)
-
-    # Memory recall: inject relevant prior turns into system prompt context
     req_headers = request_headers or {}
     chat_id = req_headers.get("x-openwebui-chat-id", "")
-    if chat_id:
-        user_texts = [
+
+    # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
+    # conversation history every turn, so for normal-length chats the model (and
+    # the verifier) already have everything — running recall would just re-inject
+    # what is already present AND risk the can't-lie layer flagging a recalled
+    # fact it cannot see as a fabrication. Only when the history exceeds the
+    # context budget do we keep the recent tail verbatim and recall the relevant
+    # older facts to stand in for the trimmed head. recall_context is then handed
+    # to the verifier so those facts count as established (not fabricated).
+    recall_context = ""
+    messages_for_verify = messages
+    history_chars = sum(len(_text_of(m.get("content"))) for m in messages)
+    if chat_id and history_chars > config.MEMORY_CONTEXT_BUDGET_CHARS:
+        recent, _older = _split_recent_history(messages, config.MEMORY_CONTEXT_BUDGET_CHARS)
+        recent_norm = {_norm_turn(_text_of(m.get("content"))) for m in recent}
+        recall_query = " ".join(
             _text_of(m.get("content")).strip()
-            for m in messages if m.get("role") == "user"
-        ]
-        recall_query = " ".join(user_texts)[:2000] or ""
+            for m in messages[-4:] if m.get("role") == "user"
+        )[:2000]
         recalled = await _memory_recall(chat_id, recall_query, session)
-        # Inject recall as a faithful TRANSCRIPT (both roles), not as "facts": a
-        # recalled question then sits next to its answer (already resolved), so the
-        # model won't re-answer it, and a stale answer is just past context, not a
-        # standalone claim. The explicit guard keeps the model on the CURRENT turn.
         lines, seen = [], set()
         for role, content in recalled:
-            c = (content or "")
-            for label in ("Current user request:", "Relevant provided/prior context:"):
-                c = c.replace(label, " ")
-            c = " ".join(c.split())
-            key = (role, c)
-            if c and key not in seen:
-                seen.add(key)
-                lines.append(f"{role}: {c[:500]}")
+            c = _norm_turn(content)
+            if not c or c in recent_norm or c in seen:
+                continue  # already visible in the kept tail, or a duplicate
+            seen.add(c)
+            lines.append(f"{role}: {c[:500]}")
+        scratch = _initial_messages(recent, user_id)
+        messages_for_verify = recent
         if lines:
-            memory_block = (
-                "Relevant earlier exchange from THIS conversation, for context only. "
-                "Use it to answer the user's CURRENT message; do NOT re-answer past "
-                "questions or repeat past answers:\n" + "\n".join(lines)
-            )
-            scratch.append({"role": "system", "content": memory_block})
+            recall_context = "\n".join(lines)
+            scratch.append({
+                "role": "system",
+                "content": (
+                    "This is a long conversation and earlier turns were trimmed to "
+                    "fit. For continuity, here are the relevant earlier statements "
+                    "the user already made in THIS chat — treat them as established "
+                    "facts the user told you, not as new or unverified claims:\n"
+                    + recall_context
+                ),
+            })
+    else:
+        scratch = _initial_messages(messages, user_id)
+
+    # Verification source mirrors what the model was actually given: the kept tail
+    # (recent) in overflow, the full history otherwise. Older facts are supplied
+    # to the verifier separately via recall_context, so the source stays bounded.
+    user_source = _user_source(messages_for_verify)
 
     tool_sources = []
     repair_steps = 0
@@ -1248,9 +1298,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
-            messages,
+            messages_for_verify,
             candidate,
             source,
+            recall_context=recall_context,
             prose=prose,
             session=session,
         )
