@@ -443,16 +443,21 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
 
 
 def _user_source(messages) -> str:
-    user_texts = [
-        _text_of(m.get("content")).strip()
-        for m in messages
-        if m.get("role") == "user"
-    ]
-    if not user_texts:
-        return ""
-    prior = "\n\n".join(t for t in user_texts[:-1] if t).strip()
-    same = _same_message_source(user_texts[-1])
-    return "\n\n".join(p for p in (prior, same) if p).strip()
+    # Grounding "source" = explicitly source-like material the user supplied
+    # (pasted docs, quotes, code blocks, labeled sources/notes/resume/context)
+    # from ANY user turn — NOT ordinary conversational text. Treating every prior
+    # chat message as source forced the grounding+refine loop onto casual
+    # follow-ups ("what's my name?"): slow, and it leaked "the provided source"
+    # into the answer. The conversation itself is still available to the model and
+    # the auditors via `messages`; this is only what gets grounded against.
+    parts = []
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        src = _same_message_source(_text_of(m.get("content")))
+        if src:
+            parts.append(src)
+    return "\n\n".join(parts).strip()
 
 
 def _clip_memory_part(text: str, limit: int) -> str:
