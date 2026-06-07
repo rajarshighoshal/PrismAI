@@ -44,6 +44,7 @@ if ! docker run -d \
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
+        -v owui-tool-server-data:/app/backend/data \
         "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$IMAGE"; then
@@ -53,6 +54,7 @@ if ! docker run -d \
             --name "$CONTAINER" \
             --network "$NETWORK" \
             --restart unless-stopped \
+            -v owui-tool-server-data:/app/backend/data \
             "${ENV_ARGS[@]}" \
             -p "127.0.0.1:${HOST_PORT}:8001" \
             "$BACKUP_IMAGE" >/dev/null
@@ -82,6 +84,7 @@ if docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
+        -v owui-tool-server-data:/app/backend/data \
         "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$BACKUP_IMAGE" >/dev/null
