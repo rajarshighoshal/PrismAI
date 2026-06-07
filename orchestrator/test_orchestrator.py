@@ -412,7 +412,9 @@ async def _run_tests():
     agent._memory_store = _noop_store
     toolserver.verify_grounding = _realistic_verify
 
-    _BIG = "Filler discussion of unrelated topics. " * 700  # ~27k chars/block
+    # Size filler to the configured budget so the test triggers overflow no matter
+    # what the threshold is set to (~1.3x budget per block -> history >> budget).
+    _BIG = "Filler discussion of unrelated topics. " * (config.MEMORY_CONTEXT_BUDGET_CHARS // 30)
 
     def _overflow_history(final_q):
         # Helios is stated FIRST, then enough filler to push it out of the kept
