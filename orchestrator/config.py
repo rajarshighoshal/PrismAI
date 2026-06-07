@@ -91,11 +91,14 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # X is not evidence X is true. Runs on the final draft regardless of the grounding
 # gate (which wrongly waves through "creative writing" that inflates a resume).
 # Bake-off (2026-05-31) showed deepseek-v4-pro / glm-5p1 / gpt-oss-120b / gemini
-# all catch it; kimi leaks chain-of-thought. Default to the strong model; set
-# HONESTY_MODEL=accounts/fireworks/models/deepseek-v4-flash for a cheaper auditor.
+# all catch it; kimi leaks chain-of-thought. Default to flash: it runs on EVERY
+# turn (~2.2s on pro vs ~1s on flash), and an adversarial vet (2026-06-07) showed
+# flash flags the same fabrications — overt and subtle ("team of 50 engineers")
+# — and stays CLEAN on the user's real stated facts. Set HONESTY_MODEL=...-pro to
+# revert to the heavier auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
 ENABLE_APPLICATION_CLAIM_AUDIT = _flag("ENABLE_APPLICATION_CLAIM_AUDIT", "true")
-HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
+HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
