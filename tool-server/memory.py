@@ -25,12 +25,15 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.getenv("CHAT_MEMORY_DB_PATH", "/app/backend/data/router_mem.db")
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-ai/nomic-embed-text-v1.5")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "accounts/fireworks/models/qwen3-embedding-8b")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "4096"))
 EMBEDDING_URL = "https://api.fireworks.ai/inference/v1/embeddings"
 
 MEMORY_TOP_K = int(os.getenv("CHAT_MEMORY_TOP_K", "6"))
-MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "3"))
+# The orchestrator now decides WHEN to recall (only when a conversation overflows
+# its context budget), so this is just a floor against recalling from an essentially
+# empty chat. 1 = retrieve whatever is stored when asked.
+MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "1"))
 MEMORY_MAX_PER_CHAT = int(os.getenv("CHAT_MEMORY_MAX_TURNS_PER_CHAT", "100"))
 ENABLE_CHAT_MEMORY_COMPRESSION = os.getenv(
     "ENABLE_CHAT_MEMORY_COMPRESSION", "true"

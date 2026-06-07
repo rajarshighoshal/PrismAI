@@ -204,38 +204,17 @@ SYSTEM_AGENT = (
     "once you can answer.\n"
     "\n"
     "TRUTH\n"
-    "Every specific claim (number, date, credential, metric, scope, motivation, "
-    "lived experience) MUST be traceable to one of: user-provided material, "
-    "tool-retrieved sources, or genuine common knowledge. If a claim isn't "
-    "traceable: say it's uncertain — don't invent it.\n"
-    "Every citation [N] maps to a real retrieved URL. No invented sources.\n"
-    "When the user says to use only provided facts: do not infer impact, scope, "
-    "or mechanisms beyond those facts.\n"
-    "\n"
-    "WHEN ASKED TO OVERSTATE\n"
-    "If the request asks you to assert things the user has NOT given — inflate "
-    "experience, credentials, metrics, or leadership they never stated, or summarize "
-    "or cite a source you cannot verify — do NOT fabricate, and do NOT merely refuse "
-    "or ask one terse question. In ONE response: (1) briefly name what you can't "
-    "assert and why (unsupported / unverifiable); (2) deliver the honest version "
-    "using ONLY the real facts; (3) ask for the specific real details that would let "
-    "you say more, naming them concretely; and where useful offer real, checkable "
-    "alternatives. Be genuinely helpful within the truth — the honest answer should "
-    "still be the most useful one in the room.\n"
+    "Every specific claim must trace to what the user gave, a retrieved source, or "
+    "genuine common knowledge — never invent or pad beyond the given facts. Every "
+    "citation [N] is a real retrieved URL. If you genuinely need a fact you weren't "
+    "given, ask the user for it instead of inventing, guessing, or padding.\n"
     "\n"
     "OUTPUT\n"
-    "- Answer directly. No preamble (\"Here's a...\"), no sign-off, no offers to "
-    "tailor further.\n"
-    "- Match the requested format and length exactly.\n"
-    "- No visible placeholders like [NEEDS DETAIL] or [Company Name].\n"
-    "\n"
-    "CLARIFICATION\n"
-    "For formal deliverables: first decide if you can produce a credible, useful "
-    "result from what the user already gave. If yes — write it immediately, ask "
-    "nothing. Only ask when a single ESSENTIAL fact is missing without which the "
-    "deliverable cannot be credible. Then ask exactly one short question naming "
-    "only that fact, as your entire response. Never more than one question, never "
-    "ask for nice-to-haves, never web-search for the missing fact."
+    "Answer directly — no preamble (\"Here's a...\"), no sign-off, no offers to "
+    "tailor further. Match the requested format and length exactly. Never refer to "
+    "\"the source\", \"the provided context\", \"the material\", or tool/retrieval "
+    "mechanics in your answer — speak to the user naturally, as if you simply know "
+    "it. When the user asks about something they told you earlier, just state it."
 )
 
 SYSTEM_VISION = (
@@ -274,18 +253,16 @@ SYSTEM_APPLICATION_CLAIM_AUDIT = (
     "You are a calibrated application-writing claim auditor. The goal is NOT sterile "
     "writing: cover letters and applications should be humane, personal, persuasive, "
     "and grounded in reality. Classify claims in the DRAFT against the USER REQUEST "
-    "and any SOURCE. Hard candidate claims must be explicitly supplied by the user "
-    "(achievements, metrics, years, credentials, revenue, leadership, employers, "
-    "projects, impact, daily routines, work settings, frequency, specific tool/product "
-    "history, or concrete scenes). Company/role framing may be persuasive if it is "
-    "generic or supported; specific company/product facts should be in the request/"
-    "source or kept generic. Motivation/fit language is allowed when light and "
-    "plausible, but it must not falsely attribute specific lived feelings, habits, "
-    "personal attachment, insider knowledge, or first-person product relationships "
-    "the user did not give. Flag over-personalized autobiographical texture, "
-    "unsupplied habitual-use claims, unsupplied emotional-history claims, and "
-    "specific company-culture/reputation claims unless supported by the request/"
-    "source. Output strict JSON only: "
+    "and any SOURCE — facts the user DID give (and reasonable paraphrase of them) are "
+    "SUPPORTED, never flag them. Hard candidate claims must be explicitly supplied by "
+    "the user (achievements, metrics, years, credentials, revenue, leadership, "
+    "employers, projects, impact, specific tool/product history, or concrete scenes). "
+    "Company/role framing may be persuasive if it is generic or supported. "
+    "Motivation/fit language is allowed when light and plausible, but must not falsely "
+    "attribute specific lived feelings, habits, personal attachment, or first-person "
+    "product relationships the user did not give. Flag only unsupported claims — "
+    "over-personalized autobiographical texture and emotional-history not in the "
+    "request/source. Output strict JSON only: "
     "{\"unsupported_candidate_claims\":[],\"unsupported_company_claims\":[],"
     "\"fake_motivation_or_fit\":[],\"acceptable_framing\":[],"
     "\"verdict\":\"CLEAN\"|\"UNSUPPORTED\"}."
@@ -465,17 +442,34 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
     return False
 
 
+# Strong references to fire-and-forget background writes. asyncio keeps only a
+# WEAK reference to a running task, so a bare create_task() can be garbage
+# collected mid-flight once the request returns — silently dropping the write.
+_BG_TASKS: set = set()
+
+
+def _track_task(task):
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 def _user_source(messages) -> str:
-    user_texts = [
-        _text_of(m.get("content")).strip()
-        for m in messages
-        if m.get("role") == "user"
-    ]
-    if not user_texts:
-        return ""
-    prior = "\n\n".join(t for t in user_texts[:-1] if t).strip()
-    same = _same_message_source(user_texts[-1])
-    return "\n\n".join(p for p in (prior, same) if p).strip()
+    # Grounding "source" = explicitly source-like material the user supplied
+    # (pasted docs, quotes, code blocks, labeled sources/notes/resume/context)
+    # from ANY user turn — NOT ordinary conversational text. Treating every prior
+    # chat message as source forced the grounding+refine loop onto casual
+    # follow-ups ("what's my name?"): slow, and it leaked "the provided source"
+    # into the answer. The conversation itself is still available to the model and
+    # the auditors via `messages`; this is only what gets grounded against.
+    parts = []
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        src = _same_message_source(_text_of(m.get("content")))
+        if src:
+            parts.append(src)
+    return "\n\n".join(parts).strip()
 
 
 def _clip_memory_part(text: str, limit: int) -> str:
@@ -968,23 +962,30 @@ def _honesty_block_msg(unsupported) -> str:
     )
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=None, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", is_app=None, prose=None, session=None):
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
 
-    # Honesty audit FIRST — independent of the grounding gate, which wrongly waves
-    # through "creative writing" that inflates the user's credentials. This is the
-    # founding can't-lie guarantee: a request to assert experience the user never
-    # stated must not produce a confident fabrication.
-    #
-    # On APPLICATION writing the calibrated application-claim audit below owns this:
-    # it catches the same unsupported candidate facts but ALLOWS grounded persuasive
-    # framing. Running both is a double-audit (extra latency) AND lets the strict
-    # honesty pass over-block the color a cover letter should have — so run exactly
-    # ONE auditor: honesty for non-application deliverables, the app audit for apps.
-    is_app = _is_application_writing(messages)
+    # Recalled facts are the user's OWN earlier statements, surfaced only when a
+    # long chat overflowed the context budget (see run()). They are established
+    # context, so every auditor must see them — otherwise the can't-lie layer
+    # flags a correctly-recalled fact as an unsupported fabrication and strips it
+    # (the memory-vs-verifier collision). For normal chats recall_context is "",
+    # so grounding_source/full_request are unchanged and this path is a no-op.
+    _rc = (recall_context or "").strip()
+    _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
+    grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
+
+    # Honesty audit FIRST — the founding can't-lie guarantee: a request to assert
+    # experience the user never stated must not produce a confident fabrication.
+    # On APPLICATION writing the calibrated app-claim audit below owns this instead
+    # (it allows grounded persuasive framing) — run exactly one auditor. The caller
+    # passes is_app computed from the FULL conversation: in the overflow path
+    # `messages` is only the trimmed tail, so classifying here would mis-route a
+    # long cover-letter chat to the strict auditor and over-block its framing.
+    is_app = _is_application_writing(messages) if is_app is None else is_app
     if getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app:
-        full_request = _all_user_text(messages)
+        full_request = _all_user_text(messages) + _recall_extra
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
@@ -999,14 +1000,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
 
     if getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app:
-        full_request = _all_user_text(messages)
-        app_audit = await _application_claim_audit(full_request, candidate, source, session=session)
+        full_request = _all_user_text(messages) + _recall_extra
+        app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
             refined = await _refine_application_claims(
-                full_request, candidate, source, app_audit, prose=prose, session=session
+                full_request, candidate, grounding_source, app_audit, prose=prose, session=session
             )
             if refined:
-                recheck = await _application_claim_audit(full_request, refined, source, session=session)
+                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session)
                 if not recheck or not str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED"):
                     candidate = refined
                 else:
@@ -1024,22 +1025,22 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
                     "unsupported claims:\n\n" + issues,
                 )
 
-    if not source.strip() and _has_citation_markers(candidate):
+    if not grounding_source.strip() and _has_citation_markers(candidate):
         return (
             "citation_without_source",
             "The previous draft included citations or source labels, but no sources were actually supplied or retrieved.",
         )
 
-    needs = await _needs_verification(messages, candidate, source, session=session)
+    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
     if not needs:
         return "ok", candidate
-    if not source.strip():
+    if not grounding_source.strip():
         return (
             "needs_source",
             "The previous draft made factual claims without source material.",
         )
 
-    audit = await toolserver.verify_grounding(source, candidate, session=session)
+    audit = await toolserver.verify_grounding(grounding_source, candidate, session=session)
     if audit is None:
         return (
             "blocked",
@@ -1049,9 +1050,9 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
         return "ok", candidate
 
     claims = (audit.get("unsupported_claims") or "").strip() or "Unsupported claims were found."
-    refined = await _refine_to_source(source, candidate, claims, prose=prose, session=session)
+    refined = await _refine_to_source(grounding_source, candidate, claims, prose=prose, session=session)
     if refined:
-        second = await toolserver.verify_grounding(source, refined, session=session)
+        second = await toolserver.verify_grounding(grounding_source, refined, session=session)
         if second is not None and second.get("grounded"):
             return "ok", refined
     return (
@@ -1059,6 +1060,30 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, prose=N
         "I could not safely finalize this without unsupported claims. The verification gate flagged:\n\n"
         + claims,
     )
+
+
+def _norm_turn(content) -> str:
+    """Strip the stored-memory wrapper labels and collapse whitespace, so recalled
+    turns can be deduped against the verbatim tail that's still in context."""
+    c = content or ""
+    for label in ("Current user request:", "Relevant provided/prior context:"):
+        c = c.replace(label, " ")
+    return " ".join(c.split())
+
+
+def _split_recent_history(messages, budget_chars: int):
+    """Split a long history into (recent_tail, older_head). The tail is the most
+    recent messages that fit in ~70% of the budget (leaving room for the recall
+    block + the answer); the head is everything older, to be represented by
+    recall. Always keeps at least the final message."""
+    keep = max(1, int(budget_chars * 0.7))
+    total, cut = 0, 0
+    for i in range(len(messages) - 1, -1, -1):
+        total += len(_text_of(messages[i].get("content")))
+        if total > keep and i < len(messages) - 1:
+            cut = i + 1
+            break
+    return messages[cut:], messages[:cut]
 
 
 async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
@@ -1075,43 +1100,78 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             yield ("reasoning", "🖼️ Reading image context…\n")
         messages = await _describe_images_for_agent(messages, session=session)
 
-    scratch = _initial_messages(messages, user_id)
-    user_source = _user_source(messages)
-
-    # Memory recall: inject relevant prior turns into system prompt context
     req_headers = request_headers or {}
     chat_id = req_headers.get("x-openwebui-chat-id", "")
-    if chat_id:
-        user_texts = [
-            _text_of(m.get("content")).strip()
-            for m in messages if m.get("role") == "user"
-        ]
-        recall_query = " ".join(user_texts)[:2000] or ""
-        recalled = await _memory_recall(chat_id, recall_query, session)
-        # Inject ONLY recalled USER turns (facts the user actually stated). Never
-        # inject recalled ASSISTANT turns: a past "I don't have that" answer would
-        # be fed back as context that instructs the model to deny again — and that
-        # denial then gets stored, a self-poisoning loop. Strip the consolidated-
-        # memory labels and frame the rest as established facts.
-        facts, seen = [], set()
-        for role, content in recalled:
-            if role != "user":
-                continue
-            c = (content or "")
-            for label in ("Current user request:", "Relevant provided/prior context:"):
-                c = c.replace(label, " ")
-            c = " ".join(c.split())
-            if c and c not in seen:
+
+    # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
+    # conversation history every turn, so for normal-length chats the model (and
+    # the verifier) already have everything — running recall would just re-inject
+    # what is already present AND risk the can't-lie layer flagging a recalled
+    # fact it cannot see as a fabrication. Only when the history exceeds the
+    # context budget do we keep the recent tail verbatim and recall the relevant
+    # older facts to stand in for the trimmed head. recall_context is then handed
+    # to the verifier so those facts count as established (not fabricated).
+    recall_context = ""
+    messages_for_verify = messages
+    history_chars = sum(len(_text_of(m.get("content"))) for m in messages)
+    if chat_id and history_chars > config.MEMORY_CONTEXT_BUDGET_CHARS:
+        recent, _older = _split_recent_history(messages, config.MEMORY_CONTEXT_BUDGET_CHARS)
+        recent_norm = {_norm_turn(_text_of(m.get("content"))) for m in recent}
+        # Query recall on the CURRENT question (last user turn). Joining several
+        # recent turns lets a big pasted message crowd out the actual intent once
+        # clipped, so recall would search on filler instead of what's being asked.
+        recall_query = next(
+            (_text_of(m.get("content")).strip() for m in reversed(messages) if m.get("role") == "user"),
+            "",
+        )[:2000]
+        # Split recalled turns by ROLE. Only the user's OWN earlier statements may
+        # be treated as established/grounding context. Feeding the assistant's own
+        # prior answers back into the verifier as "source" would let the model
+        # ground a fresh claim on its own earlier (possibly unverified) output —
+        # the verifier rubber-stamping itself. Assistant turns are kept for
+        # continuity only, clearly labeled, and never grounded against.
+        user_lines, asst_lines, seen = [], [], set()
+        if recall_query.strip():  # no current question -> nothing meaningful to recall
+            for role, content in await _memory_recall(chat_id, recall_query, session):
+                c = _norm_turn(content)[:500]
+                if not c or c in recent_norm or c in seen:
+                    continue  # already visible in the kept tail, or a duplicate
                 seen.add(c)
-                facts.append(c[:500])
-        if facts:
-            memory_block = (
-                "Earlier in THIS conversation the user already told you the following. "
-                "Treat these as established facts the user has stated and use them to "
-                "answer the current message:\n\n"
-                + "\n".join(f"- {f}" for f in facts)
-            )
-            scratch.append({"role": "system", "content": memory_block})
+                (user_lines if role == "user" else asst_lines).append(c)
+        if user_lines or asst_lines:
+            scratch = _initial_messages(recent, user_id)
+            messages_for_verify = recent
+            recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
+            blocks = []
+            if user_lines:
+                blocks.append(
+                    "Earlier in THIS conversation the user stated (established facts "
+                    "they told you):\n" + recall_context
+                )
+            if asst_lines:
+                blocks.append(
+                    "Earlier assistant replies, for continuity only — NOT verified "
+                    "facts; do not rely on them as sources:\n" + "\n".join(asst_lines)
+                )
+            scratch.append({
+                "role": "system",
+                "content": "This is a long conversation; earlier turns were trimmed "
+                "to fit.\n\n" + "\n\n".join(blocks),
+            })
+        else:
+            # Recall produced nothing (cold chat, service down, transient embed
+            # failure). Don't trim blind: ~140k chars is still well within the
+            # model window, so keep the full conversation rather than silently
+            # dropping the older head with no replacement.
+            scratch = _initial_messages(messages, user_id)
+    else:
+        scratch = _initial_messages(messages, user_id)
+
+    # Grounding source = the user's pasted/quoted material across the WHOLE
+    # conversation. verify_grounding takes the source independently of the model's
+    # context budget, so a document pasted in a since-trimmed turn can still ground
+    # a faithful quote; recall_context separately carries older user-stated facts.
+    user_source = _user_source(messages)
 
     tool_sources = []
     repair_steps = 0
@@ -1247,10 +1307,13 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         elif is_user_model and is_clar:
             pass  # keep clarification as-is
 
-        # Polish the final answer only when the agent asked for it (polish tool)
-        # and it isn't a clarifying question. Skip polish for user-chosen models.
+        # Polish the final answer only when the agent asked for it (polish tool),
+        # it isn't a clarifying question, AND it is substantial prose. A short
+        # factual/numeric/conversational answer must not pay for a premium Opus
+        # rewrite. Skip polish for user-chosen models.
+        substantial = len(candidate) >= config.POLISH_MIN_CHARS
         prose = None
-        if polish_voice and not is_clar:
+        if polish_voice and not is_clar and substantial:
             prose = _prose_provider(polish_voice)
         if prose is not None:
             prose_client, prose_model = prose
@@ -1258,7 +1321,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 yield ("reasoning", "✨ Polishing…\n")
             try:
                 polish = await prose_client.complete(
-                    _prose_polish_messages(messages, candidate, source),
+                    # messages_for_verify (= the kept tail in overflow) keeps the
+                    # premium polish call bounded; the full older history would
+                    # otherwise be concatenated uncapped into the prompt.
+                    _prose_polish_messages(messages_for_verify, candidate, source),
                     prose_model,
                     max_tokens=config.AGENT_MAX_TOKENS,
                     temperature=config.WRITER_TEMPERATURE,
@@ -1269,7 +1335,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             except Exception as e:
                 log.warning(f"[prose_polish] {prose_model} failed, keeping open-model draft: {e}")
         # Stage 2 — optional voice-only register pass (sonnet); facts untouched.
-        if polish_voice_pass and polish_voice_pass != "none" and not is_clar:
+        # A SECOND premium call, so reserve it for genuinely long-form prose.
+        if (polish_voice_pass and polish_voice_pass != "none" and not is_clar
+                and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
             if config.SHOW_WORK:
                 yield ("reasoning", f"✨ Voice pass ({polish_voice_pass})…\n")
             candidate = await _voice_pass(candidate, polish_voice_pass, session=session)
@@ -1277,19 +1345,24 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if config.SHOW_WORK:
             yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
-            messages,
+            messages_for_verify,
             candidate,
             source,
+            recall_context=recall_context,
+            is_app=_is_application_writing(messages),
             prose=prose,
             session=session,
         )
         if status == "ok":
-            # Store in memory asynchronously (don't block the response)
+            # Store in memory asynchronously (don't block the response). Hold a
+            # strong reference (_track_task): the event loop keeps only a weak ref
+            # to a bare create_task, so an orphan store could be GC'd mid-flight
+            # after the request returns and the write silently lost.
             if chat_id:
                 user_memory = _consolidated_user_memory(messages, user_source)
                 if user_memory:
-                    asyncio.create_task(_memory_store(chat_id, "user", user_memory, session))
-                asyncio.create_task(_memory_store(chat_id, "assistant", text, session))
+                    _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+                _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
             yield ("content", text)
             return
 

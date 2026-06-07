@@ -260,7 +260,15 @@ async def _run_tests():
     _oc.complete = _fake_prose
     config.ENABLE_OPENAI_PROSE = True
     _chat_queue.append(_chat_tools(_tool_call("polish", {"model": "gpt-5.5", "voice_pass": "none"})))
-    _chat_queue.append(_chat_content("Draft letter using only the user's facts."))
+    # A real deliverable (>= POLISH_MIN_CHARS) — polish is gated to substantial
+    # prose now, so a one-liner would (correctly) skip the premium writer.
+    _chat_queue.append(_chat_content(
+        "Dear Hiring Team, I am writing to apply for the data analyst role. Over the "
+        "past two years I have worked as a data analyst, building dashboards and "
+        "running experiments to inform decisions. I would welcome the chance to bring "
+        "that experience to your team and contribute from day one. Thank you for your "
+        "consideration; I look forward to hearing from you."
+    ))
     ev = await _collect([{"role": "user", "content": "Write a short cover letter. My facts: 2 years as a data analyst."}])
     check("polish: paid writer ran on the final draft", "POLISHED FINAL LETTER." in _content(ev))
     check("polish: routed to the chosen gpt-5.5 writer", _calls.get("prose") == [config.OPENAI_PROSE_MODEL_PREMIUM])
@@ -378,6 +386,128 @@ async def _run_tests():
         "Candidate facts: 3 years SQL, Tableau dashboards, A/B testing."
     )}])
     check("application audit: strips fake candidate/motivation claims", _content(ev) == "Corrected final answer.")
+
+    # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
+    # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
+    # text the auditor was handed is treated as a fabrication. This makes the
+    # tests real instead of rubber-stamps: if recall_context fails to reach the
+    # verifier, a correctly recalled fact looks invented and gets stripped, so the
+    # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
+    _SENTINELS = ["Helios", "March 3rd", "$5 million", "$9,000"]
+    _orig_honesty, _orig_recall = agent._honesty_audit, agent._memory_recall
+    _orig_store, _orig_verify = agent._memory_store, toolserver.verify_grounding
+    _audit_inputs = []  # every full_request / source the auditors actually receive
+
+    async def _realistic_honesty(full_request, candidate, *, session=None):
+        _audit_inputs.append(full_request)
+        bad = [f for f in _SENTINELS if f in candidate and f not in full_request]
+        return {"unsupported": bad, "verdict": "FABRICATION" if bad else "CLEAN"}
+
+    async def _realistic_verify(source, draft, *, session=None):
+        _audit_inputs.append(source)
+        _calls["verify"].append((source, draft))
+        bad = [f for f in _SENTINELS if f in draft and f not in source]
+        return {"grounded": not bad, "unsupported_claims": ", ".join(bad)}
+
+    _recall_calls, _recall_return = [], []
+
+    async def _fake_recall(chat_id, query, session=None):
+        _recall_calls.append((chat_id, query))
+        return list(_recall_return)
+
+    async def _noop_store(chat_id, role, content, session=None):
+        return True
+
+    agent._honesty_audit = _realistic_honesty
+    agent._memory_recall = _fake_recall
+    agent._memory_store = _noop_store
+    toolserver.verify_grounding = _realistic_verify
+
+    # Size filler to the configured budget so the test triggers overflow no matter
+    # what the threshold is set to (~1.3x budget per block -> history >> budget).
+    _BIG = "Filler discussion of unrelated topics. " * (config.MEMORY_CONTEXT_BUDGET_CHARS // 30)
+
+    def _overflow_history(final_q):
+        # Helios is stated FIRST, then enough filler to push it out of the kept
+        # tail, so only recall can carry it into the answer + verifier.
+        return [
+            {"role": "user", "content": "Earlier note: my project codename is Helios and we launch March 3rd."},
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": _BIG},
+            {"role": "assistant", "content": _BIG},
+            {"role": "user", "content": final_q},
+        ]
+
+    # A) Overflow: a recalled fact survives verification (is NOT stripped).
+    _reset(); _recall_calls.clear()
+    _recall_return[:] = [("user", "my project codename is Helios and we launch March 3rd")]
+    _chat_queue.append(_chat_content("Your project codename is Helios and the launch date is March 3rd."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("What project codename and launch date did I mention earlier?"),
+        request_headers={"x-openwebui-chat-id": "long1"},
+    )
+    out = _content(ev)
+    check("memory/overflow: recall fires on a long chat", len(_recall_calls) == 1)
+    # Recall must query on the CURRENT question, not be drowned out by the big
+    # filler turn (the query is clipped to 2000 chars).
+    _q = _recall_calls[0][1] if _recall_calls else ""
+    check("memory/overflow: recall queries on the current question, not filler",
+          "codename" in _q and "Filler discussion" not in _q)
+    check("memory/overflow: recalled fact survives verification", "Helios" in out and "March 3rd" in out)
+
+    # B) Overflow is NOT a fabrication bypass. A fact absent from recall must (1)
+    #    never appear in the text handed to the auditors (proving recall_context
+    #    carries ONLY what recall returned, not the draft), and (2) be stripped
+    #    from the output. Asserting on the auditor INPUTS makes the recall plumbing
+    #    the load-bearing thing under test, not the two independent backstops.
+    _reset(); _audit_inputs.clear()
+    _recall_return[:] = [("user", "my project codename is Helios and we launch March 3rd")]
+    _chat_queue.append(_chat_content("Your codename is Helios and your budget is $5 million."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("Remind me of my codename and budget?"),
+        request_headers={"x-openwebui-chat-id": "long2"},
+    )
+    check("memory/overflow: un-recalled fact never reaches the auditors as source",
+          "$5 million" not in " ".join(_audit_inputs))
+    check("memory/overflow: recall is not a blanket fabrication bypass", "$5 million" not in _content(ev))
+
+    # D) Self-grounding guard (regresses the HIGH review finding): a recalled
+    #    ASSISTANT claim must NOT be laundered into grounding/established-fact
+    #    context — otherwise the verifier rubber-stamps the model's own earlier
+    #    output. Only USER turns become recall_context. Here recall returns an
+    #    assistant claim ($9,000) and a user fact (Helios); the assistant claim
+    #    must never reach the auditors and must be stripped from the answer.
+    _reset(); _audit_inputs.clear()
+    _recall_return[:] = [
+        ("assistant", "your account balance is $9,000"),
+        ("user", "my project codename is Helios and we launch March 3rd"),
+    ]
+    _chat_queue.append(_chat_content("Your account balance is $9,000 and your codename is Helios."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("remind me of my balance and codename"),
+        request_headers={"x-openwebui-chat-id": "long-d"},
+    )
+    check("memory/overflow: recalled ASSISTANT claim is not grounding context",
+          "$9,000" not in " ".join(_audit_inputs))
+    check("memory/overflow: un-grounded assistant claim is stripped, not laundered",
+          "$9,000" not in _content(ev))
+
+    # C) Normal-length chat: recall does NOT fire — native history already covers
+    #    it, so custom recall would be pure redundancy.
+    _reset(); _recall_calls.clear()
+    _chat_queue.append(_chat_content("Hello there."))
+    _gate_queue.append(False)
+    await _collect(
+        [{"role": "user", "content": "hi, short chat"}],
+        request_headers={"x-openwebui-chat-id": "short1"},
+    )
+    check("memory/normal: no recall on a short chat (native history used)", _recall_calls == [])
+
+    agent._honesty_audit, agent._memory_recall = _orig_honesty, _orig_recall
+    agent._memory_store, toolserver.verify_grounding = _orig_store, _orig_verify
 
     print()
     if fails:
