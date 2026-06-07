@@ -108,6 +108,10 @@ async def chat(
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
+        usage = data.get("usage") or {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        if cached:
+            log.info(f"[fireworks] cached_tokens={cached}/{usage.get('prompt_tokens', 0)} model={model}")
         choice = data["choices"][0]
         return {
             "message": choice.get("message") or {},

@@ -5,6 +5,7 @@ Exposes GET /v1/models and POST /v1/chat/completions (streaming + non-streaming)
 plus /health. All real work lives in pipeline.run; this file just speaks the
 OpenAI wire format and forwards the logged-in user's id from OWUI's headers.
 """
+import asyncio
 import json
 import logging
 import time
@@ -14,7 +15,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, pipeline
+from . import config, dedup, pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,11 +93,39 @@ async def chat_completions(request: Request):
     owui_headers = {k: v for k, v in request_headers.items() if "openwebui" in k}
     log.info(f"[request] user={user_id} model={model} messages={len(messages)} owui_headers={owui_headers}")
 
+    dkey = dedup.make_key(messages, model, user_id) if (dedup.enabled() and messages) else None
+
     if want_stream:
         async def event_stream():
+            yield _chunk(cid, model, role="assistant")
+
+            # De-dup: replay a just-computed answer, or attach to an identical
+            # request that is still in flight, before doing any real work.
+            lead_fut = None
+            if dkey is not None:
+                mode, payload = dedup.begin(dkey)
+                if mode == "cached":
+                    yield _chunk(cid, model, content=payload)
+                    yield _chunk(cid, model, finish="stop")
+                    yield "data: [DONE]\n\n"
+                    return
+                if mode == "follow":
+                    try:
+                        answer = await asyncio.wait_for(
+                            asyncio.shield(payload), timeout=config.HTTP_TIMEOUT
+                        )
+                        yield _chunk(cid, model, content=answer)
+                        yield _chunk(cid, model, finish="stop")
+                        yield "data: [DONE]\n\n"
+                        return
+                    except Exception:
+                        pass  # the twin failed/timed out -> run our own below
+                else:
+                    lead_fut = payload  # we are the original
+
             session = aiohttp.ClientSession()
+            parts, done_ok, err = [], False, None
             try:
-                yield _chunk(cid, model, role="assistant")
                 async for kind, text in pipeline.run(
                     messages,
                     user_id=user_id,
@@ -105,38 +134,55 @@ async def chat_completions(request: Request):
                     user_model=model,
                 ):
                     if kind == "content":
+                        parts.append(text)
                         yield _chunk(cid, model, content=text)
                     elif kind == "reasoning":
                         yield _chunk(cid, model, reasoning=text)
+                done_ok = True
                 yield _chunk(cid, model, finish="stop")
                 yield "data: [DONE]\n\n"
             except Exception as exc:  # surface, don't hang the client
+                err = exc
                 yield _chunk(cid, model, content=f"\n\n[orchestrator error: {exc}]")
                 yield _chunk(cid, model, finish="stop")
                 yield "data: [DONE]\n\n"
             finally:
+                answer = "".join(parts)
+                if lead_fut is not None:
+                    if done_ok and answer.strip():
+                        dedup.resolve(dkey, lead_fut, answer=answer)
+                    else:  # error / empty / client abort -> followers run their own
+                        dedup.resolve(dkey, lead_fut, exc=(err or RuntimeError("aborted")))
+                elif dkey is not None and done_ok and answer.strip():
+                    dedup.store(dkey, answer)  # follow-fallback still caches
                 await session.close()
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     # Non-streaming (OWUI uses this for title/tag generation): collect content.
-    session = aiohttp.ClientSession()
-    try:
-        parts = []
-        async for kind, text in pipeline.run(
-            messages,
-            user_id=user_id,
-            session=session,
-            request_headers=request_headers,
-            user_model=model,
-        ):
-            if kind == "content":
-                parts.append(text)
-        content = "".join(parts)
-    except Exception as exc:
-        content = f"[orchestrator error: {exc}]"
-    finally:
-        await session.close()
+    cached = dedup.get_cached(dkey) if dkey is not None else None
+    if cached is not None:
+        content = cached
+    else:
+        session = aiohttp.ClientSession()
+        try:
+            parts = []
+            async for kind, text in pipeline.run(
+                messages,
+                user_id=user_id,
+                session=session,
+                request_headers=request_headers,
+                user_model=model,
+            ):
+                if kind == "content":
+                    parts.append(text)
+            content = "".join(parts)
+            if dkey is not None and content.strip():
+                dedup.store(dkey, content)
+        except Exception as exc:
+            content = f"[orchestrator error: {exc}]"
+        finally:
+            await session.close()
 
     return JSONResponse(
         {

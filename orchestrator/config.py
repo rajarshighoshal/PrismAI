@@ -142,6 +142,14 @@ MEMORY_CONTEXT_BUDGET_CHARS = max(20000, int(
 POLISH_MIN_CHARS = int(os.getenv("POLISH_MIN_CHARS", "320"))
 POLISH_VOICE_MIN_CHARS = int(os.getenv("POLISH_VOICE_MIN_CHARS", "1200"))
 
+# Request de-duplication / idempotency. A byte-identical request (same messages +
+# model + user) that arrives again within the window must not re-run the whole
+# pipeline: it replays the first one's answer (completed cache) or attaches to it
+# while still in flight (single-flight). Window is short — a retry happens within
+# seconds; a genuinely new ask of the same question later re-runs for a fresh answer.
+ENABLE_DEDUP = _flag("ENABLE_DEDUP", "true")
+DEDUP_TTL_SECONDS = float(os.getenv("DEDUP_TTL_SECONDS", "120"))
+
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
 PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
