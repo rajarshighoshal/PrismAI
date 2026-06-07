@@ -260,7 +260,15 @@ async def _run_tests():
     _oc.complete = _fake_prose
     config.ENABLE_OPENAI_PROSE = True
     _chat_queue.append(_chat_tools(_tool_call("polish", {"model": "gpt-5.5", "voice_pass": "none"})))
-    _chat_queue.append(_chat_content("Draft letter using only the user's facts."))
+    # A real deliverable (>= POLISH_MIN_CHARS) — polish is gated to substantial
+    # prose now, so a one-liner would (correctly) skip the premium writer.
+    _chat_queue.append(_chat_content(
+        "Dear Hiring Team, I am writing to apply for the data analyst role. Over the "
+        "past two years I have worked as a data analyst, building dashboards and "
+        "running experiments to inform decisions. I would welcome the chance to bring "
+        "that experience to your team and contribute from day one. Thank you for your "
+        "consideration; I look forward to hearing from you."
+    ))
     ev = await _collect([{"role": "user", "content": "Write a short cover letter. My facts: 2 years as a data analyst."}])
     check("polish: paid writer ran on the final draft", "POLISHED FINAL LETTER." in _content(ev))
     check("polish: routed to the chosen gpt-5.5 writer", _calls.get("prose") == [config.OPENAI_PROSE_MODEL_PREMIUM])

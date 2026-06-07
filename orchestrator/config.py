@@ -127,6 +127,13 @@ MEMORY_CONTEXT_BUDGET_CHARS = int(
               str(int(MODEL_CONTEXT_TOKENS * MEMORY_COMPACT_FRACTION * 3.5)))  # ~140,000 chars
 )
 
+# Prose polish (premium Opus/Sonnet) is slow + costly. Only spend it on substantial
+# prose: a short factual / numeric / conversational answer must NOT trigger an Opus
+# rewrite (that was burning ~6-10s on one-line answers). The second "voice pass" is
+# a SECOND premium call, reserved for genuinely long-form prose.
+POLISH_MIN_CHARS = int(os.getenv("POLISH_MIN_CHARS", "320"))
+POLISH_VOICE_MIN_CHARS = int(os.getenv("POLISH_VOICE_MIN_CHARS", "1200"))
+
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
 PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
