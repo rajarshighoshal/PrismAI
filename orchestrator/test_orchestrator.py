@@ -393,15 +393,18 @@ async def _run_tests():
     # tests real instead of rubber-stamps: if recall_context fails to reach the
     # verifier, a correctly recalled fact looks invented and gets stripped, so the
     # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
-    _SENTINELS = ["Helios", "March 3rd", "$5 million"]
+    _SENTINELS = ["Helios", "March 3rd", "$5 million", "$9,000"]
     _orig_honesty, _orig_recall = agent._honesty_audit, agent._memory_recall
     _orig_store, _orig_verify = agent._memory_store, toolserver.verify_grounding
+    _audit_inputs = []  # every full_request / source the auditors actually receive
 
     async def _realistic_honesty(full_request, candidate, *, session=None):
+        _audit_inputs.append(full_request)
         bad = [f for f in _SENTINELS if f in candidate and f not in full_request]
         return {"unsupported": bad, "verdict": "FABRICATION" if bad else "CLEAN"}
 
     async def _realistic_verify(source, draft, *, session=None):
+        _audit_inputs.append(source)
         _calls["verify"].append((source, draft))
         bad = [f for f in _SENTINELS if f in draft and f not in source]
         return {"grounded": not bad, "unsupported_claims": ", ".join(bad)}
@@ -453,9 +456,12 @@ async def _run_tests():
           "codename" in _q and "Filler discussion" not in _q)
     check("memory/overflow: recalled fact survives verification", "Helios" in out and "March 3rd" in out)
 
-    # B) Overflow is NOT a fabrication bypass: a fact absent from recall is still
-    #    stripped. This guards the dangerous failure mode of the fix.
-    _reset()
+    # B) Overflow is NOT a fabrication bypass. A fact absent from recall must (1)
+    #    never appear in the text handed to the auditors (proving recall_context
+    #    carries ONLY what recall returned, not the draft), and (2) be stripped
+    #    from the output. Asserting on the auditor INPUTS makes the recall plumbing
+    #    the load-bearing thing under test, not the two independent backstops.
+    _reset(); _audit_inputs.clear()
     _recall_return[:] = [("user", "my project codename is Helios and we launch March 3rd")]
     _chat_queue.append(_chat_content("Your codename is Helios and your budget is $5 million."))
     _gate_queue.append(True)
@@ -463,7 +469,31 @@ async def _run_tests():
         _overflow_history("Remind me of my codename and budget?"),
         request_headers={"x-openwebui-chat-id": "long2"},
     )
+    check("memory/overflow: un-recalled fact never reaches the auditors as source",
+          "$5 million" not in " ".join(_audit_inputs))
     check("memory/overflow: recall is not a blanket fabrication bypass", "$5 million" not in _content(ev))
+
+    # D) Self-grounding guard (regresses the HIGH review finding): a recalled
+    #    ASSISTANT claim must NOT be laundered into grounding/established-fact
+    #    context — otherwise the verifier rubber-stamps the model's own earlier
+    #    output. Only USER turns become recall_context. Here recall returns an
+    #    assistant claim ($9,000) and a user fact (Helios); the assistant claim
+    #    must never reach the auditors and must be stripped from the answer.
+    _reset(); _audit_inputs.clear()
+    _recall_return[:] = [
+        ("assistant", "your account balance is $9,000"),
+        ("user", "my project codename is Helios and we launch March 3rd"),
+    ]
+    _chat_queue.append(_chat_content("Your account balance is $9,000 and your codename is Helios."))
+    _gate_queue.append(True)
+    ev = await _collect(
+        _overflow_history("remind me of my balance and codename"),
+        request_headers={"x-openwebui-chat-id": "long-d"},
+    )
+    check("memory/overflow: recalled ASSISTANT claim is not grounding context",
+          "$9,000" not in " ".join(_audit_inputs))
+    check("memory/overflow: un-grounded assistant claim is stripped, not laundered",
+          "$9,000" not in _content(ev))
 
     # C) Normal-length chat: recall does NOT fire — native history already covers
     #    it, so custom recall would be pure redundancy.

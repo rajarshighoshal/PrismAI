@@ -442,6 +442,18 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
     return False
 
 
+# Strong references to fire-and-forget background writes. asyncio keeps only a
+# WEAK reference to a running task, so a bare create_task() can be garbage
+# collected mid-flight once the request returns — silently dropping the write.
+_BG_TASKS: set = set()
+
+
+def _track_task(task):
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 def _user_source(messages) -> str:
     # Grounding "source" = explicitly source-like material the user supplied
     # (pasted docs, quotes, code blocks, labeled sources/notes/resume/context)
@@ -950,7 +962,7 @@ def _honesty_block_msg(unsupported) -> str:
     )
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", is_app=None, prose=None, session=None):
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
 
@@ -967,8 +979,11 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     # Honesty audit FIRST — the founding can't-lie guarantee: a request to assert
     # experience the user never stated must not produce a confident fabrication.
     # On APPLICATION writing the calibrated app-claim audit below owns this instead
-    # (it allows grounded persuasive framing) — run exactly one auditor.
-    is_app = _is_application_writing(messages)
+    # (it allows grounded persuasive framing) — run exactly one auditor. The caller
+    # passes is_app computed from the FULL conversation: in the overflow path
+    # `messages` is only the trimmed tail, so classifying here would mis-route a
+    # long cover-letter chat to the strict auditor and over-block its framing.
+    is_app = _is_application_writing(messages) if is_app is None else is_app
     if getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app:
         full_request = _all_user_text(messages) + _recall_extra
         honesty = await _honesty_audit(full_request, candidate, session=session)
@@ -1109,35 +1124,54 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             (_text_of(m.get("content")).strip() for m in reversed(messages) if m.get("role") == "user"),
             "",
         )[:2000]
-        recalled = await _memory_recall(chat_id, recall_query, session)
-        lines, seen = [], set()
-        for role, content in recalled:
-            c = _norm_turn(content)
-            if not c or c in recent_norm or c in seen:
-                continue  # already visible in the kept tail, or a duplicate
-            seen.add(c)
-            lines.append(f"{role}: {c[:500]}")
-        scratch = _initial_messages(recent, user_id)
-        messages_for_verify = recent
-        if lines:
-            recall_context = "\n".join(lines)
+        # Split recalled turns by ROLE. Only the user's OWN earlier statements may
+        # be treated as established/grounding context. Feeding the assistant's own
+        # prior answers back into the verifier as "source" would let the model
+        # ground a fresh claim on its own earlier (possibly unverified) output —
+        # the verifier rubber-stamping itself. Assistant turns are kept for
+        # continuity only, clearly labeled, and never grounded against.
+        user_lines, asst_lines, seen = [], [], set()
+        if recall_query.strip():  # no current question -> nothing meaningful to recall
+            for role, content in await _memory_recall(chat_id, recall_query, session):
+                c = _norm_turn(content)[:500]
+                if not c or c in recent_norm or c in seen:
+                    continue  # already visible in the kept tail, or a duplicate
+                seen.add(c)
+                (user_lines if role == "user" else asst_lines).append(c)
+        if user_lines or asst_lines:
+            scratch = _initial_messages(recent, user_id)
+            messages_for_verify = recent
+            recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
+            blocks = []
+            if user_lines:
+                blocks.append(
+                    "Earlier in THIS conversation the user stated (established facts "
+                    "they told you):\n" + recall_context
+                )
+            if asst_lines:
+                blocks.append(
+                    "Earlier assistant replies, for continuity only — NOT verified "
+                    "facts; do not rely on them as sources:\n" + "\n".join(asst_lines)
+                )
             scratch.append({
                 "role": "system",
-                "content": (
-                    "This is a long conversation and earlier turns were trimmed to "
-                    "fit. For continuity, here are the relevant earlier statements "
-                    "the user already made in THIS chat — treat them as established "
-                    "facts the user told you, not as new or unverified claims:\n"
-                    + recall_context
-                ),
+                "content": "This is a long conversation; earlier turns were trimmed "
+                "to fit.\n\n" + "\n\n".join(blocks),
             })
+        else:
+            # Recall produced nothing (cold chat, service down, transient embed
+            # failure). Don't trim blind: ~140k chars is still well within the
+            # model window, so keep the full conversation rather than silently
+            # dropping the older head with no replacement.
+            scratch = _initial_messages(messages, user_id)
     else:
         scratch = _initial_messages(messages, user_id)
 
-    # Verification source mirrors what the model was actually given: the kept tail
-    # (recent) in overflow, the full history otherwise. Older facts are supplied
-    # to the verifier separately via recall_context, so the source stays bounded.
-    user_source = _user_source(messages_for_verify)
+    # Grounding source = the user's pasted/quoted material across the WHOLE
+    # conversation. verify_grounding takes the source independently of the model's
+    # context budget, so a document pasted in a since-trimmed turn can still ground
+    # a faithful quote; recall_context separately carries older user-stated facts.
+    user_source = _user_source(messages)
 
     tool_sources = []
     repair_steps = 0
@@ -1287,7 +1321,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 yield ("reasoning", "✨ Polishing…\n")
             try:
                 polish = await prose_client.complete(
-                    _prose_polish_messages(messages, candidate, source),
+                    # messages_for_verify (= the kept tail in overflow) keeps the
+                    # premium polish call bounded; the full older history would
+                    # otherwise be concatenated uncapped into the prompt.
+                    _prose_polish_messages(messages_for_verify, candidate, source),
                     prose_model,
                     max_tokens=config.AGENT_MAX_TOKENS,
                     temperature=config.WRITER_TEMPERATURE,
@@ -1312,16 +1349,20 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             candidate,
             source,
             recall_context=recall_context,
+            is_app=_is_application_writing(messages),
             prose=prose,
             session=session,
         )
         if status == "ok":
-            # Store in memory asynchronously (don't block the response)
+            # Store in memory asynchronously (don't block the response). Hold a
+            # strong reference (_track_task): the event loop keeps only a weak ref
+            # to a bare create_task, so an orphan store could be GC'd mid-flight
+            # after the request returns and the write silently lost.
             if chat_id:
                 user_memory = _consolidated_user_memory(messages, user_source)
                 if user_memory:
-                    asyncio.create_task(_memory_store(chat_id, "user", user_memory, session))
-                asyncio.create_task(_memory_store(chat_id, "assistant", text, session))
+                    _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+                _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
             yield ("content", text)
             return
 

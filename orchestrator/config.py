@@ -122,10 +122,15 @@ MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 # and the answer. ~3.5 chars/token for prose.
 MODEL_CONTEXT_TOKENS = int(os.getenv("MODEL_CONTEXT_TOKENS", "200000"))      # glm-5p1 floor
 MEMORY_COMPACT_FRACTION = float(os.getenv("MEMORY_COMPACT_FRACTION", "0.20"))
-MEMORY_CONTEXT_BUDGET_CHARS = int(
+# ~3.5 chars/token is Latin-prose-tuned; dense scripts (e.g. CJK) run ~1-2
+# chars/token, so this under-counts tokens there — tolerable because the budget
+# sits far under the model window. Clamp to a floor so a stray MEMORY_COMPACT_
+# FRACTION=0 / MODEL_CONTEXT_TOKENS=0 can't collapse it to 0 and overflow every
+# chat on turn 1.
+MEMORY_CONTEXT_BUDGET_CHARS = max(20000, int(
     os.getenv("MEMORY_CONTEXT_BUDGET_CHARS",
               str(int(MODEL_CONTEXT_TOKENS * MEMORY_COMPACT_FRACTION * 3.5)))  # ~140,000 chars
-)
+))
 
 # Prose polish (premium Opus/Sonnet) is slow + costly. Only spend it on substantial
 # prose: a short factual / numeric / conversational answer must NOT trigger an Opus
