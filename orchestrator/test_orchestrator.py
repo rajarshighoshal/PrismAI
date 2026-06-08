@@ -231,6 +231,7 @@ async def _run_tests():
     # exercised explicitly here, not left to fail-soft.
     _reset()
     _chat_queue.append(_chat_content("I have 10 years of leadership and drove $5M in revenue."))
+    _gate_queue.append(True)  # gate flags claims about the user -> audit runs
     _honesty_queue.append({"unsupported": ["10 years of leadership", "$5M in revenue"], "verdict": "FABRICATION"})
     _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})  # recheck after refine
     ev = await _collect([{"role": "user", "content": "Write a one-line professional bio emphasizing my leadership and revenue impact."}])
@@ -241,6 +242,7 @@ async def _run_tests():
     _saved_repair = config.GROUNDING_REPAIR_STEPS
     config.GROUNDING_REPAIR_STEPS = 0  # surface the block now instead of re-prompting for a repair
     _chat_queue.append(_chat_content("I led a 50-person team for 12 years."))
+    _gate_queue.append(True)  # gate flags claims about the user -> audit runs
     _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})
     _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})  # persists
     ev = await _collect([{"role": "user", "content": "Write a one-line bio about my management track record."}])
