@@ -17,18 +17,24 @@ def _require_aiohttp():
 
 
 def _forward_headers(headers=None) -> dict:
-    """Forward only headers the tool-server can safely use for file attach."""
+    """Forward the headers the tool-server needs to attach exported files.
+
+    OWUI forwards X-OpenWebUI-Chat-Id / -Message-Id (no hyphen in 'openwebui');
+    the tool-server reads the hyphenated x-open-webui-* spelling — so translate.
+    """
     if not headers:
         return {}
     lower = {str(k).lower(): str(v) for k, v in dict(headers).items() if v is not None}
     out = {}
-    for name in (
-        "authorization",
-        "x-open-webui-chat-id",
-        "x-open-webui-message-id",
+    if lower.get("authorization"):
+        out["authorization"] = lower["authorization"]
+    for owui_name, ts_name in (
+        ("x-openwebui-chat-id", "x-open-webui-chat-id"),
+        ("x-openwebui-message-id", "x-open-webui-message-id"),
     ):
-        if lower.get(name):
-            out[name] = lower[name]
+        value = lower.get(owui_name) or lower.get(ts_name)
+        if value:
+            out[ts_name] = value
     return out
 
 
