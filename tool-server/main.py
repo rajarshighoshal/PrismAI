@@ -148,6 +148,9 @@ class CitationSearchRequest(BaseModel):
 
 def _safe_filename(name: Optional[str], default: str) -> str:
     raw = (name or default).strip() or default
+    # Drop a trailing extension the model tacked on (e.g. "...Letterdocx" or
+    # "report.docx") so the export doesn't double it up ("...Letterdocx.docx").
+    raw = re.sub(r"\.?(docx|pdf|md|markdown|csv)$", "", raw, flags=re.IGNORECASE)
     safe = re.sub(r"[^A-Za-z0-9_\- ]", "", raw).strip().replace(" ", "_")
     return safe or default
 
@@ -202,13 +205,19 @@ def _strip_reasoning_leak(markdown: str) -> str:
 
 def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
     markdown = _strip_reasoning_leak(markdown)
+    # Strip [1]-style grounding/traceability markers — they belong in the chat
+    # view, not the final document.
+    markdown = re.sub(r"[ \t]*\[\d+\]", "", markdown)
     with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
         pypandoc.convert_text(
             markdown,
             to=fmt,
-            format="markdown",
+            # hard_line_breaks: a single newline becomes a line break (not joined),
+            # so address blocks and signatures keep their layout instead of
+            # collapsing onto one line.
+            format="markdown+hard_line_breaks",
             outputfile=str(out_path),
             extra_args=extra_args,
         )
