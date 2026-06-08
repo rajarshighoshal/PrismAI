@@ -26,6 +26,8 @@ _app_audit_queue = []
 _honesty_queue = []
 _verify_queue = []
 _post_queue = []
+_request_work_queue = []
+_stream_out = []
 
 
 def _tool_call(name, args, call_id="call_1"):
@@ -63,6 +65,9 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "Decide if a draft needs grounding verification" in sys:
         value = _gate_queue.pop(0) if _gate_queue else False
         return json.dumps({"needs_verification": value, "reason": "test"})
+    if "needs tools, external" in sys:
+        value = _request_work_queue.pop(0) if _request_work_queue else True
+        return json.dumps({"needs_work": value})
     if "Decide whether a proposed tool call is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
@@ -87,7 +92,8 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
 
 async def _fake_stream(messages, model, *, max_tokens, temperature=None, session=None):
     _calls["chat_models"].append(model)
-    yield ("content", "vision answer")
+    for chunk in (_stream_out or ["streamed answer"]):
+        yield ("content", chunk)
 
 
 async def _fake_search(query, *, max_results=None, session=None):
@@ -133,6 +139,8 @@ def _reset():
     _honesty_queue.clear()
     _verify_queue.clear()
     _post_queue.clear()
+    _request_work_queue.clear()
+    _stream_out.clear()
 
 
 async def _run_tests():
@@ -156,6 +164,7 @@ async def _run_tests():
     config.ENABLE_GEMINI_PROSE = False
     config.AGENT_MAX_STEPS = 6
     config.GROUNDING_REPAIR_STEPS = 2
+    config.STREAM_SIMPLE_CHAT = False  # buffered loop for the existing suite; streaming has its own test
 
     tool_names = {t["function"]["name"] for t in agent.TOOL_SCHEMAS}
     check("tools: all required tools exposed", {
@@ -177,6 +186,18 @@ async def _run_tests():
     ev = await _collect([{"role": "user", "content": "hey"}])
     check("chat: returns direct answer", _content(ev) == "Plain answer.")
     check("chat: used agent model", _calls["chat_models"] == [config.AGENT_MODEL])
+
+    # Plain-chat live streaming: request gate says no work -> answer streams live,
+    # in chunks, with no buffered loop and no verifier.
+    _reset()
+    config.STREAM_SIMPLE_CHAT = True
+    _request_work_queue.append(False)
+    _stream_out[:] = ["Hi ", "there!"]
+    ev = await _collect([{"role": "user", "content": "hey"}])
+    check("stream: plain chat streams the answer live", _content(ev) == "Hi there!")
+    check("stream: arrived as multiple content chunks", sum(1 for k, _ in ev if k == "content") >= 2)
+    check("stream: no verifier ran on plain chat", _calls["verify"] == [])
+    config.STREAM_SIMPLE_CHAT = False
 
     # Model-driven web search: tool call first, then grounded final is verified.
     _reset()

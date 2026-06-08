@@ -233,6 +233,16 @@ SYSTEM_GATE = (
     "with no external factual claims."
 )
 
+SYSTEM_REQUEST_GATE = (
+    "Decide if answering this user message needs tools, external/current facts, "
+    "sources, file export, or writing about the user that must be verified — versus "
+    "plain conversation answerable directly from general knowledge. Return JSON only: "
+    "{\"needs_work\": boolean}. true for current events, web lookups, specific external "
+    "facts, documents/sources, citations, exports, or a resume/cover-letter/bio about "
+    "the user. false for greetings, opinions, explanations of stable concepts, "
+    "brainstorming, code, and general knowledge."
+)
+
 SYSTEM_HONESTY = (
     "You are an honesty auditor for an assistant's draft written for a user. You are "
     "given the full USER REQUEST (which mixes facts the user states about themselves "
@@ -698,6 +708,24 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
 
 
+async def _request_needs_work(messages, *, session=None) -> bool:
+    """Plain-chat gate: does this turn need the agentic loop (tools/source/verify)?
+    Uncertain -> True (use the safe buffered loop, never stream a risky turn)."""
+    q = _last_user_text(messages).strip()[:2000]
+    if not q:
+        return True
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_REQUEST_GATE},
+             {"role": "user", "content": q}],
+            config.GROUNDING_GATE_MODEL, max_tokens=60, temperature=0.0, session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        return bool(json.loads(match.group(0) if match else raw).get("needs_work", True))
+    except Exception:
+        return True
+
+
 async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) -> str:
     """Run a refine pass on the SAME prose model that wrote the draft when one was
     used (so paid Opus/GPT prose isn't silently reverted to the open model on a
@@ -1072,7 +1100,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     user_final_model = (user_model or "").strip()
     is_user_model = bool(user_final_model)
 
-    if _has_images(messages):
+    had_images = _has_images(messages)
+    if had_images:
         if config.SHOW_WORK:
             yield ("reasoning", "🖼️ Reading image context…\n")
         messages = await _describe_images_for_agent(messages, session=session)
@@ -1149,6 +1178,29 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # context budget, so a document pasted in a since-trimmed turn can still ground
     # a faithful quote; recall_context separately carries older user-stated facts.
     user_source = _user_source(messages)
+
+    # Plain-chat fast path: stream the answer live when the turn needs no tools,
+    # source, or verification. No verifier runs — there is nothing to ground or
+    # audit. Anything uncertain falls through to the buffered loop below.
+    if (config.STREAM_SIMPLE_CHAT and not is_user_model and not had_images
+            and not user_source and not _is_application_writing(messages)
+            and not await _request_needs_work(messages, session=session)):
+        streamed = []
+        async for kind, tok in fireworks.stream(
+            scratch, config.AGENT_MODEL,
+            max_tokens=config.AGENT_MAX_TOKENS,
+            temperature=config.WRITER_TEMPERATURE, session=session,
+        ):
+            if kind == "content":
+                streamed.append(tok)
+            yield (kind, tok)
+        answer = "".join(streamed).strip()
+        if answer and chat_id:
+            user_memory = _consolidated_user_memory(messages)
+            if user_memory:
+                _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+            _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
+        return
 
     tool_sources = []
     repair_steps = 0
