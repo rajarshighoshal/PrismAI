@@ -57,6 +57,18 @@ async def _fake_chat(messages, model, *, max_tokens, temperature=None, session=N
     return _chat_queue.pop(0)
 
 
+async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, session=None, tools=None, tool_choice=None):
+    _calls["chat_models"].append(model)
+    _calls["chat_messages"].append(messages)
+    item = _chat_queue.pop(0) if _chat_queue else _chat_content("")
+    msg = item.get("message", {})
+    content = msg.get("content") or ""
+    if content:
+        yield ("content", content)
+    yield ("final", {"content": content, "tool_calls": msg.get("tool_calls") or [],
+                     "finish_reason": item.get("finish_reason")})
+
+
 async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None):
     _calls["complete_models"].append(model)
     sys = messages[0]["content"] if messages else ""
@@ -152,6 +164,7 @@ async def _run_tests():
             fails.append(name)
 
     fireworks.chat = _fake_chat
+    fireworks.stream_chat = _fake_stream_chat
     fireworks.complete = _fake_complete
     fireworks.stream = _fake_stream
     search.search = _fake_search
@@ -166,6 +179,7 @@ async def _run_tests():
     config.GROUNDING_REPAIR_STEPS = 2
     config.STREAM_SIMPLE_CHAT = False  # buffered loop for the existing suite; streaming has its own test
     config.STREAM_PREAMBLE = False     # off for the existing suite; preamble has its own test
+    config.STREAM_ANSWER = False        # buffered/verify-before-show for the existing suite; optimistic has its own test
 
     tool_names = {t["function"]["name"] for t in agent.TOOL_SCHEMAS}
     check("tools: all required tools exposed", {
@@ -212,6 +226,24 @@ async def _run_tests():
     check("preamble: streamed as reasoning before the answer", "Let me draft that." in reasoning)
     check("preamble: answer still produced", _content(ev) == "Plain answer.")
     config.STREAM_PREAMBLE = False
+
+    # Optimistic streaming: the open-model answer streams live; a clean turn shows
+    # it as-is, a flagged turn shows it then openly self-corrects.
+    _reset()
+    config.STREAM_ANSWER = True
+    _chat_queue.append(_chat_content("This is the streamed answer."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "tell me something"}])
+    check("optimistic: answer streamed live (no buffering)", _content(ev) == "This is the streamed answer.")
+
+    _reset()
+    _chat_queue.append(_chat_content("Bitcoin is exactly $1 today."))
+    _gate_queue.append(True)  # needs verification; no source -> blocked
+    ev = await _collect([{"role": "user", "content": "what is bitcoin worth?"}])
+    body = _content(ev)
+    check("optimistic: streamed draft is shown", "exactly $1" in body)
+    check("optimistic: then openly self-corrects", "⚠️" in body)
+    config.STREAM_ANSWER = False
 
     # Model-driven web search: tool call first, then grounded final is verified.
     _reset()

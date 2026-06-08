@@ -182,3 +182,87 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
     finally:
         if own:
             await session.close()
+
+
+async def stream_chat(messages, model, *, max_tokens, temperature=None, session=None,
+                      tools=None, tool_choice=None, user_id=None):
+    """Streaming chat that ALSO surfaces tool calls. Yields ('reasoning', text) and
+    ('content', text) as they arrive, then a final ('final', {content, tool_calls,
+    finish_reason}) once the stream completes — so the agent loop can stream the
+    model's answer live while still acting on any tool calls it made.
+    """
+    own = session is None
+    if own:
+        _require_aiohttp()
+        session = aiohttp.ClientSession()
+    try:
+        session_id = compute_session_id(messages, user_id or "")
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": config.TEMPERATURE if temperature is None else temperature,
+            "stream": True,
+            "user": session_id,
+        }
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        if "deepseek-v4-flash" in model:
+            payload.setdefault("reasoning_effort", "none")
+        headers = _headers()
+        headers["x-session-affinity"] = session_id
+        log.info(f"[fireworks] stream_chat model={model} session={session_id[:8]} tokens={max_tokens}")
+        timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
+        content_parts, calls, finish = [], {}, None
+        async with session.post(
+            f"{config.FIREWORKS_BASE_URL}/chat/completions",
+            headers=headers, json=payload, timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+            async for raw in resp.content:
+                line = raw.decode("utf-8", "ignore").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+                delta = choice.get("delta") or {}
+                rc = delta.get("reasoning_content")
+                if rc:
+                    yield ("reasoning", rc)
+                c = delta.get("content")
+                if c:
+                    content_parts.append(c)
+                    yield ("content", c)
+                for tc in (delta.get("tool_calls") or []):
+                    slot = calls.setdefault(
+                        tc.get("index", 0),
+                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+        yield ("final", {
+            "content": "".join(content_parts),
+            "tool_calls": [calls[i] for i in sorted(calls)],
+            "finish_reason": finish,
+        })
+    finally:
+        if own:
+            await session.close()
