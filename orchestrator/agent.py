@@ -1342,7 +1342,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         # rewrite. Skip polish for user-chosen models.
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
         prose = None
-        if polish_voice and not is_clar and substantial:
+        if polish_voice and not is_clar and substantial and not is_user_model:
             prose = _prose_provider(polish_voice)
         if prose is not None:
             prose_client, prose_model = prose
