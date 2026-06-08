@@ -479,24 +479,17 @@ def _clip_memory_part(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "\n...[truncated]"
 
 
-def _consolidated_user_memory(messages, user_source: str) -> str:
-    """Compact per-chat memory: current ask plus the context that informed it."""
-    user_texts = [
-        _text_of(m.get("content")).strip()
-        for m in messages
-        if m.get("role") == "user" and _text_of(m.get("content")).strip()
-    ]
-    if not user_texts and not user_source.strip():
-        return ""
-    last_user = user_texts[-1] if user_texts else ""
-    parts = []
-    if last_user:
-        parts.append("Current user request:\n" + _clip_memory_part(last_user, 3000))
-    if user_source.strip() and user_source.strip() != last_user.strip():
-        parts.append(
-            "Relevant provided/prior context:\n" + _clip_memory_part(user_source, 6000)
-        )
-    return "\n\n---\n\n".join(parts).strip()
+def _consolidated_user_memory(messages) -> str:
+    """The text stored as this turn's user memory for later overflow recall: the
+    raw last user message (clipped), verbatim — no labels or wrapper. Storing it
+    raw means the embedding reflects what the user actually said (better recall),
+    and a recalled turn matches the same turn still verbatim in the kept tail."""
+    last_user = next(
+        (_text_of(m.get("content")).strip() for m in reversed(messages)
+         if m.get("role") == "user" and _text_of(m.get("content")).strip()),
+        "",
+    )
+    return _clip_memory_part(last_user, 3000)
 
 
 def _initial_messages(messages, user_id: str):
@@ -1074,12 +1067,9 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
 
 
 def _norm_turn(content) -> str:
-    """Strip the stored-memory wrapper labels and collapse whitespace, so recalled
-    turns can be deduped against the verbatim tail that's still in context."""
-    c = content or ""
-    for label in ("Current user request:", "Relevant provided/prior context:"):
-        c = c.replace(label, " ")
-    return " ".join(c.split())
+    """Collapse whitespace so a recalled turn (now stored verbatim) can be deduped
+    against the same turn still verbatim in the kept tail."""
+    return " ".join((content or "").split())
 
 
 def _split_recent_history(messages, budget_chars: int):
@@ -1370,7 +1360,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # to a bare create_task, so an orphan store could be GC'd mid-flight
             # after the request returns and the write silently lost.
             if chat_id:
-                user_memory = _consolidated_user_memory(messages, user_source)
+                user_memory = _consolidated_user_memory(messages)
                 if user_memory:
                     _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
                 _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
