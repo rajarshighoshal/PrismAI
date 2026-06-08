@@ -145,6 +145,8 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
             "stream": True,
             "user": session_id,
         }
+        if "deepseek-v4-flash" in model:
+            payload.setdefault("reasoning_effort", "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
         log.info(f"[fireworks] stream model={model} session={session_id[:8]}")
