@@ -969,57 +969,35 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
     grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
-    # Run the auditor CONCURRENTLY with the grounding gate. The auditor (honesty
-    # for normal deliverables; the calibrated app-claim audit for applications —
-    # exactly one) and the gate are independent unless the auditor refines the
-    # draft (the rare FABRICATION path), so overlapping them takes the ~1.5s gate
-    # off the critical path on the common clean turn. If an auditor refines, we
-    # re-gate the cleaned draft below so `needs` never reflects a stale draft.
-    # is_app is passed from the FULL conversation by the caller: in the overflow
-    # path `messages` is only the trimmed tail, so classifying here would mis-route
-    # a long cover-letter chat to the strict auditor and over-block its framing.
+    # One cheap classifier gates the whole chain. SYSTEM_GATE flags both external
+    # facts and claims about the user, so a casual turn — never an application —
+    # that needs neither skips straight through instead of paying for the audits.
     is_app = _is_application_writing(messages) if is_app is None else is_app
-    full_request = _all_user_text(messages) + _recall_extra
-    honesty_on = getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app
-    app_on = getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app
-    gate_coro = _needs_verification(messages, candidate, grounding_source, session=session)
+    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
+    if not needs and not is_app:
+        return "ok", candidate
 
-    if honesty_on:
-        honesty, needs = await asyncio.gather(
-            _honesty_audit(full_request, candidate, session=session), gate_coro
-        )
+    full_request = _all_user_text(messages) + _recall_extra
+
+    if config.ENABLE_HONESTY_AUDIT and not is_app:
+        honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
             refined = await _refine_honesty(full_request, candidate, unsupported, prose=prose, session=session)
-            if refined:
-                recheck = await _honesty_audit(full_request, refined, session=session)
-                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("FAB"):
-                    candidate = refined  # cleaned draft -> re-gate it
-                    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-                else:
-                    return "unsupported_self_claims", _honesty_block_msg(unsupported)
+            recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
+            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("FAB")):
+                candidate = refined
+                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
-    elif app_on:
-        app_audit, needs = await asyncio.gather(
-            _application_claim_audit(full_request, candidate, grounding_source, session=session), gate_coro
-        )
+    elif config.ENABLE_APPLICATION_CLAIM_AUDIT and is_app:
+        app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
-            refined = await _refine_application_claims(
-                full_request, candidate, grounding_source, app_audit, prose=prose, session=session
-            )
-            if refined:
-                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session)
-                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED"):
-                    candidate = refined
-                    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-                else:
-                    issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
-                    return (
-                        "unsupported_application_claims",
-                        "I could not safely finalize this application draft without "
-                        "unsupported claims:\n\n" + issues,
-                    )
+            refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, prose=prose, session=session)
+            recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
+            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED")):
+                candidate = refined
+                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
                 issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
                 return (
@@ -1027,8 +1005,6 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
                     "I could not safely finalize this application draft without "
                     "unsupported claims:\n\n" + issues,
                 )
-    else:
-        needs = await gate_coro
 
     if not grounding_source.strip() and _has_citation_markers(candidate):
         return (
