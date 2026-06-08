@@ -977,17 +977,27 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         # applies whether or not tools were still on the table — pure writing tasks
         # finish on turn 1 with tools still offered and must still get polished.
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
-        result = await fireworks.chat(
-            scratch,
-            model,
-            max_tokens=config.AGENT_MAX_TOKENS,
-            temperature=step_temp,
-            session=session,
-            tools=tools,
-            tool_choice="auto" if tools is not None else None,
-        )
-        message = result.get("message") or {}
-        tool_calls = message.get("tool_calls") or []
+        # Stream the open model's output live when this generation will BE the final
+        # answer — not a draft about to be polished, and not a user-model regen
+        # (those produce their own final text below). Streamed optimistically; a tool
+        # step carries little prose and the loop just continues.
+        stream_live = config.STREAM_ANSWER and not polish_voice and not is_user_model
+        parts, message, tool_calls = [], {}, []
+        async for kind, data in fireworks.stream_chat(
+            scratch, model, max_tokens=config.AGENT_MAX_TOKENS, temperature=step_temp,
+            session=session, tools=tools, tool_choice="auto" if tools is not None else None,
+        ):
+            if kind == "reasoning":
+                if config.SHOW_WORK:
+                    yield ("reasoning", data)
+            elif kind == "content":
+                parts.append(data)
+                if stream_live:
+                    yield ("content", data)
+            elif kind == "final":
+                message = {"role": "assistant", "content": data["content"],
+                           "tool_calls": data["tool_calls"]}
+                tool_calls = data["tool_calls"]
 
         if tool_calls:
             scratch.append(_clean_assistant_tool_message(message))
@@ -1067,6 +1077,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             )
             continue
 
+        streamed_live = stream_live  # this candidate's tokens were shown live
         is_clar = _is_clarification(candidate)
 
         # User-chosen model: regenerate final answer with their model
@@ -1095,25 +1106,36 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             prose_client, prose_model = prose
             if config.SHOW_WORK:
                 yield ("reasoning", "✨ Polishing…\n")
+            # messages_for_verify (= the kept tail in overflow) bounds the premium
+            # polish prompt. Stream the polished deliverable live when optimistic
+            # streaming is on — this is the final text the user sees.
+            pmsgs = _prose_polish_messages(messages_for_verify, candidate, source)
             try:
-                polish = await prose_client.complete(
-                    # messages_for_verify (= the kept tail in overflow) keeps the
-                    # premium polish call bounded; the full older history would
-                    # otherwise be concatenated uncapped into the prompt.
-                    _prose_polish_messages(messages_for_verify, candidate, source),
-                    prose_model,
-                    max_tokens=config.AGENT_MAX_TOKENS,
-                    temperature=config.WRITER_TEMPERATURE,
-                    session=session,
-                )
-                if polish and polish.strip():
-                    candidate = polish.strip()
+                if config.STREAM_ANSWER:
+                    pparts = []
+                    async for k, t in prose_client.stream(
+                        pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
+                        temperature=config.WRITER_TEMPERATURE, session=session,
+                    ):
+                        if k == "content":
+                            pparts.append(t)
+                            yield ("content", t)
+                    if "".join(pparts).strip():
+                        candidate = "".join(pparts).strip()
+                        streamed_live = True
+                else:
+                    polish = await prose_client.complete(
+                        pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
+                        temperature=config.WRITER_TEMPERATURE, session=session,
+                    )
+                    if polish and polish.strip():
+                        candidate = polish.strip()
             except Exception as e:
                 log.warning(f"[prose_polish] {prose_model} failed, keeping open-model draft: {e}")
         # Stage 2 — optional voice-only register pass (sonnet); facts untouched.
         # A SECOND premium call, so reserve it for genuinely long-form prose.
-        if (polish_voice_pass and polish_voice_pass != "none" and not is_clar
-                and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
+        if (not streamed_live and polish_voice_pass and polish_voice_pass != "none"
+                and not is_clar and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
             if config.SHOW_WORK:
                 yield ("reasoning", f"✨ Voice pass ({polish_voice_pass})…\n")
             candidate = await _voice_pass(candidate, polish_voice_pass, session=session)
@@ -1129,19 +1151,36 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             prose=prose,
             session=session,
         )
+        links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
+
         if status == "ok":
-            if export_links:
-                text += "\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)
+            if streamed_live:
+                # Already shown live. Emit only what's new: an open correction if the
+                # verifier changed the text, plus any download links.
+                if text.strip() != candidate.strip():
+                    final_text = text + links
+                    yield ("content", "\n\n---\n\n*On review I corrected unsupported claims — verified version:*\n\n" + final_text)
+                else:
+                    final_text = candidate + links
+                    if links:
+                        yield ("content", links)
+            else:
+                final_text = text + links
+                yield ("content", final_text)
             # Store in memory asynchronously (don't block the response). Hold a
             # strong reference (_track_task): the event loop keeps only a weak ref
-            # to a bare create_task, so an orphan store could be GC'd mid-flight
-            # after the request returns and the write silently lost.
+            # to a bare create_task, so an orphan store could be GC'd mid-flight.
             if chat_id:
                 user_memory = _consolidated_user_memory(messages)
                 if user_memory:
                     _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
-                _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
-            yield ("content", text)
+                _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", final_text, session)))
+            return
+
+        # Blocked. If we already streamed the answer, admit it openly and correct;
+        # otherwise repair (re-generate) before showing anything.
+        if streamed_live:
+            yield ("content", "\n\n---\n\n⚠️ " + text)
             return
 
         if repair_steps < config.GROUNDING_REPAIR_STEPS:
