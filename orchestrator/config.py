@@ -59,6 +59,8 @@ ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 # Generation knobs.
 CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))
 DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "8192"))
+# Image transcription is short by nature — no need for the full chat budget.
+VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "1024"))
 # Split temperature by job instead of one compromise value:
 # - TOOL_TEMPERATURE: turns where the model decides/chains tools. Low = reliable
 #   tool selection and tight instruction-following (no "Here's a..." preamble).

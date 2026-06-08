@@ -89,7 +89,7 @@ async def _describe_images_for_agent(messages, *, session=None):
                 [{"role": "system", "content": SYSTEM_VISION},
                  {"role": "user", "content": vision_content}],
                 config.VISION_MODEL,
-                max_tokens=config.CHAT_MAX_TOKENS,
+                max_tokens=config.VISION_MAX_TOKENS,
                 temperature=0.0,
                 session=session,
             )
