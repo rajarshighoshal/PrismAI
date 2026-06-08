@@ -146,7 +146,11 @@ async def chat_completions(request: Request):
                 yield "data: [DONE]\n\n"
             except Exception as exc:  # surface, don't hang the client
                 err = exc
-                yield _chunk(cid, model, content=f"\n\n[orchestrator error: {exc}]")
+                # Log the full error, but show the user a clean message — never the
+                # raw exception (it embeds a URL the next turn's agent would try to
+                # fetch, poisoning the chat).
+                log.warning(f"[pipeline] failed: {type(exc).__name__}: {exc}")
+                yield _chunk(cid, model, content="\n\n⚠️ Something went wrong completing this turn. Please try again.")
                 yield _chunk(cid, model, finish="stop")
                 yield "data: [DONE]\n\n"
             finally:
@@ -183,7 +187,8 @@ async def chat_completions(request: Request):
             if dkey is not None and content.strip():
                 dedup.store(dkey, content)
         except Exception as exc:
-            content = f"[orchestrator error: {exc}]"
+            log.warning(f"[pipeline] failed: {type(exc).__name__}: {exc}")
+            content = "Something went wrong completing this turn. Please try again."
         finally:
             await session.close()
 

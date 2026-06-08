@@ -39,15 +39,24 @@ def _forward_headers(headers=None) -> dict:
 
 
 def summarize_result(name: str, result):
-    """Keep model-visible tool output compact and avoid base64 context bloat."""
+    """Keep model-visible tool output compact and avoid base64 context bloat.
+
+    For exports, the model only needs to know it succeeded — the file delivery
+    (upload + download link) is the harness's job. We deliberately do NOT surface
+    upload errors to the model, or it tries to "fix" them by re-exporting other
+    formats in a loop.
+    """
     if name.startswith("export_") and isinstance(result, list):
         meta = {}
         for item in result:
             if isinstance(item, dict):
                 meta.update(item)
-        if meta:
-            return meta
-        return {"status": "success", "note": "export completed"}
+        fmt = name.replace("export_", "")
+        return {
+            "status": "success",
+            "filename": meta.get("filename"),
+            "note": f"The {fmt} file was generated and delivered to the user. Do not export again.",
+        }
     return result
 
 
