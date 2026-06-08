@@ -50,7 +50,7 @@ REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
 GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/glm-5p1")
 GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
-# The auditor model lives in the tool-server (gpt-oss-120b); we just call it.
+# The auditor model lives in the tool-server (deepseek-v4-flash, thinking off).
 
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
@@ -59,6 +59,8 @@ ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 # Generation knobs.
 CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))
 DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "8192"))
+# Image transcription is short by nature — no need for the full chat budget.
+VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "1024"))
 # Split temperature by job instead of one compromise value:
 # - TOOL_TEMPERATURE: turns where the model decides/chains tools. Low = reliable
 #   tool selection and tight instruction-following (no "Here's a..." preamble).
@@ -70,9 +72,23 @@ TOOL_TEMPERATURE = float(os.getenv("TOOL_TEMPERATURE", "0.2"))
 WRITER_TEMPERATURE = float(os.getenv("WRITER_TEMPERATURE", "0.55"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))
 
-# Networking.
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "180"))
+# Networking. Per-purpose timeouts (seconds). The old single 180s blanket let one
+# stalled upstream hang a whole turn for 3 minutes with no user feedback; each
+# call now carries a budget matched to what it actually does. All env-overridable.
+# HTTP_TIMEOUT stays as a back-compat catch-all default for any caller without a
+# more specific budget.
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "90"))
 STREAM_IDLE_TIMEOUT = float(os.getenv("STREAM_IDLE_TIMEOUT", "90"))
+# Fireworks non-streaming completion: agent steps, gates, query compression.
+GEN_TIMEOUT = float(os.getenv("GEN_TIMEOUT", "90"))
+# tool-server calls: verify_grounding (LLM auditor), web_search, fetch_url, export.
+TOOL_SERVER_TIMEOUT = float(os.getenv("TOOL_SERVER_TIMEOUT", "60"))
+# Per-chat memory recall/store — must be quick. If the memory service is slow,
+# degrade (skip recall / drop the async store) rather than hang the turn.
+MEMORY_TIMEOUT = float(os.getenv("MEMORY_TIMEOUT", "15"))
+# Premium prose polish (Opus/Sonnet/GPT-5.5/Gemini). Long-form generation is
+# legitimately slow, so this stays generous — but still bounded, not 3 minutes.
+PROSE_TIMEOUT = float(os.getenv("PROSE_TIMEOUT", "120"))
 
 # Optional bearer token OWUI must present (the connection's API key).
 # Empty = accept any (service is localhost-bound on a private docker net).
@@ -108,6 +124,12 @@ MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 # Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
 SHOW_WORK = _flag("SHOW_WORK", "true")
+
+# Plain-chat live streaming: when a cheap classifier says the turn needs no tools,
+# sources, or verification, stream the answer token-by-token instead of running the
+# buffered agentic loop. Critical turns (facts/source/application writing) still go
+# through the verify-first loop.
+STREAM_SIMPLE_CHAT = _flag("STREAM_SIMPLE_CHAT", "true")
 
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
@@ -152,6 +174,11 @@ POLISH_VOICE_MIN_CHARS = int(os.getenv("POLISH_VOICE_MIN_CHARS", "1200"))
 # seconds; a genuinely new ask of the same question later re-runs for a fresh answer.
 ENABLE_DEDUP = _flag("ENABLE_DEDUP", "true")
 DEDUP_TTL_SECONDS = float(os.getenv("DEDUP_TTL_SECONDS", "120"))
+# A follower attached to an in-flight identical request waits at most this long
+# for the lead's answer before falling back to running its own — and the fallback
+# is LOGGED, not silently swallowed. Keep < DEDUP_TTL so a slow lead still
+# populates the cache the follower can use on its own re-run.
+DEDUP_WAIT_TIMEOUT = float(os.getenv("DEDUP_WAIT_TIMEOUT", "90"))
 
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).

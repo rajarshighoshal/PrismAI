@@ -112,14 +112,17 @@ async def chat_completions(request: Request):
                 if mode == "follow":
                     try:
                         answer = await asyncio.wait_for(
-                            asyncio.shield(payload), timeout=config.HTTP_TIMEOUT
+                            asyncio.shield(payload), timeout=config.DEDUP_WAIT_TIMEOUT
                         )
                         yield _chunk(cid, model, content=answer)
                         yield _chunk(cid, model, finish="stop")
                         yield "data: [DONE]\n\n"
                         return
-                    except Exception:
-                        pass  # the twin failed/timed out -> run our own below
+                    except Exception as exc:
+                        # the twin failed/timed out -> run our own below. Log it:
+                        # a silent swallow here hid dedup-wait timeouts that then
+                        # silently re-ran the whole pipeline.
+                        log.info(f"[dedup] follower fell back to its own run: {type(exc).__name__}: {exc}")
                 else:
                     lead_fut = payload  # we are the original
 

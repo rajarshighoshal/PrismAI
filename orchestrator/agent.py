@@ -12,272 +12,14 @@ import logging
 import re
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
+from .prompts import (
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE,
+    SYSTEM_HONESTY, SYSTEM_APPLICATION_CLAIM_AUDIT, SYSTEM_TOOL_GUARD,
+    _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
+)
 
 log = logging.getLogger(__name__)
 
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the web for current or external facts. Returns numbered results with snippets.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Concise search query, <= 400 characters."},
-                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": "Fetch a specific public URL and extract readable text. Use for exact URLs.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string"},
-                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 50000},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_doi_citation",
-            "description": "Look up a DOI in CrossRef and return APA citation metadata, with optional title verification.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "doi": {"type": "string"},
-                    "expected_title": {"type": "string"},
-                },
-                "required": ["doi"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_citation",
-            "description": "Search CrossRef by title/author/year when the DOI is unknown. Use instead of guessing DOIs.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "rows": {"type": "integer", "minimum": 1, "maximum": 10},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "verify_grounding",
-            "description": "Audit a draft against provided source text and return unsupported claims. Use before finalizing source-bound factual writing.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string"},
-                    "draft": {"type": "string"},
-                },
-                "required": ["source", "draft"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "export_docx",
-            "description": "Export complete final markdown as a Word .docx file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "markdown": {"type": "string"},
-                    "filename": {"type": "string"},
-                    "title": {"type": "string"},
-                },
-                "required": ["markdown"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "export_pdf",
-            "description": "Export complete final markdown as a PDF file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "markdown": {"type": "string"},
-                    "filename": {"type": "string"},
-                    "title": {"type": "string"},
-                },
-                "required": ["markdown"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "export_markdown",
-            "description": "Export complete final markdown as a downloadable .md file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "markdown": {"type": "string"},
-                    "filename": {"type": "string"},
-                    "title": {"type": "string"},
-                },
-                "required": ["markdown"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "export_csv",
-            "description": "Export tabular rows as a CSV file.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "rows": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                    },
-                    "filename": {"type": "string"},
-                },
-                "required": ["rows"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "polish",
-            "description": (
-                "Polish a final written deliverable when writing quality matters (not for "
-                "plain chat, quick answers, or code). Two stages, NEITHER may change or inflate facts.\n"
-                "'model' — writer for the substance rewrite; pick by what THIS piece must DO, "
-                "not by a static cost tier: "
-                "gpt-5.5 is the default for calibrated academic/formal substance (research prose, "
-                "PhD statements, academic cover letters, source-sensitive writing). Opus is the "
-                "default for corporate/job-market persuasion (resume/CV bullets, recruiter-facing "
-                "cover letters, pitches, bios) and when the user wants a bolder/high-visibility "
-                "style. Sonnet is best as a voice-only warmth pass. The reality audit still applies "
-                "after every polish.\n"
-                "'voice_pass' — optional final voice-only register pass: 'warm' (personal writing), "
-                "'formal' (academic/professional), or 'none'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "enum": ["gpt-5.5", "sonnet", "opus"]},
-                    "voice_pass": {"type": "string", "enum": ["none", "warm", "formal"]},
-                },
-                "required": ["model"],
-            },
-        },
-    },
-]
-
-SYSTEM_AGENT = (
-    "You are the controller for one user-facing assistant. The user sees the "
-    "answer, never the tool mechanics. Decide which tools to call, how to chain "
-    "them, and when you have enough evidence to answer.\n"
-    "\n"
-    "TOOL USE\n"
-    "- web_search: for current facts, external verification, or source-grounded "
-    "research. Do not search definitions unless explicitly asked.\n"
-    "- verify_grounding: before finalizing any source-bound factual writing.\n"
-    "- polish: before writing a deliverable whose quality matters (cover letter, "
-    "statement, application/research prose, important email). Pick the writer model "
-    "by what this piece must do, using the model map in the tool description.\n"
-    "- export tools: only when the user asks for a file.\n"
-    "- Gather high-signal evidence, then synthesize. Do not over-search — stop "
-    "once you can answer.\n"
-    "\n"
-    "TRUTH\n"
-    "Every specific claim must trace to what the user gave, a retrieved source, or "
-    "genuine common knowledge — never invent or pad beyond the given facts. Every "
-    "citation [N] is a real retrieved URL. If you genuinely need a fact you weren't "
-    "given, ask the user for it instead of inventing, guessing, or padding.\n"
-    "\n"
-    "OUTPUT\n"
-    "Answer directly — no preamble (\"Here's a...\"), no sign-off, no offers to "
-    "tailor further. Match the requested format and length exactly. Never refer to "
-    "\"the source\", \"the provided context\", \"the material\", or tool/retrieval "
-    "mechanics in your answer — speak to the user naturally, as if you simply know "
-    "it. When the user asks about something they told you earlier, just state it."
-)
-
-SYSTEM_VISION = (
-    "Transcribe and describe the image for a text-only agent. Quote all visible "
-    "text exactly when possible, then summarize layout, context, and likely user "
-    "intent. Do not answer the user's task; produce only faithful image context."
-)
-
-SYSTEM_GATE = (
-    "Decide if a draft needs grounding verification before it can be shown. "
-    "Return JSON only: {\"needs_verification\": boolean, \"reason\": string}. "
-    "needs_verification=true for source-bound writing, current/external factual "
-    "claims, citations, claims about user credentials/history, numbers, dates, "
-    "or anything that would be a problem if fabricated. false for greetings, "
-    "purely creative writing, opinion, harmless brainstorming, or simple code "
-    "with no external factual claims."
-)
-
-SYSTEM_HONESTY = (
-    "You are an honesty auditor for an assistant's draft written for a user. You are "
-    "given the full USER REQUEST (which mixes facts the user states about themselves "
-    "with instructions about what to write) and the DRAFT.\n"
-    "Flag every claim in the DRAFT that asserts something about the USER — years of "
-    "experience, seniority, leadership, employers, education, credentials, metrics, "
-    "revenue, achievements — that the user did NOT actually state as true about "
-    "themselves. CRITICAL: an INSTRUCTION to include or 'emphasize' a claim is NOT "
-    "evidence the claim is true. If the user says 'emphasize my 8 years of leadership' "
-    "but never states they HAVE 8 years, a draft asserting it is UNSUPPORTED. Do not "
-    "flag genuine stylistic wording, the user's real stated facts, or reasonable "
-    "paraphrase of them.\n"
-    "Output strict JSON only: {\"unsupported\": [\"exact phrase\", ...], \"verdict\": "
-    "\"FABRICATION\" if any unsupported self-claims exist, else \"CLEAN\"}."
-)
-
-SYSTEM_APPLICATION_CLAIM_AUDIT = (
-    "You are a calibrated application-writing claim auditor. The goal is NOT sterile "
-    "writing: cover letters and applications should be humane, personal, persuasive, "
-    "and grounded in reality. Classify claims in the DRAFT against the USER REQUEST "
-    "and any SOURCE — facts the user DID give (and reasonable paraphrase of them) are "
-    "SUPPORTED, never flag them. Hard candidate claims must be explicitly supplied by "
-    "the user (achievements, metrics, years, credentials, revenue, leadership, "
-    "employers, projects, impact, specific tool/product history, or concrete scenes). "
-    "Company/role framing may be persuasive if it is generic or supported. "
-    "Motivation/fit language is allowed when light and plausible, but must not falsely "
-    "attribute specific lived feelings, habits, personal attachment, or first-person "
-    "product relationships the user did not give. Flag only unsupported claims — "
-    "over-personalized autobiographical texture and emotional-history not in the "
-    "request/source. Output strict JSON only: "
-    "{\"unsupported_candidate_claims\":[],\"unsupported_company_claims\":[],"
-    "\"fake_motivation_or_fit\":[],\"acceptable_framing\":[],"
-    "\"verdict\":\"CLEAN\"|\"UNSUPPORTED\"}."
-)
-
-SYSTEM_TOOL_GUARD = (
-    "Decide whether a proposed tool call is necessary for the user's actual "
-    "request. Return JSON only: {\"allow\": boolean, \"reason\": string}. "
-    "Allow web_search for current/latest/recent facts, source-grounded research, "
-    "citations, market/prices/schedules/laws, or external facts that must be "
-    "checked. Reject web_search for stable conceptual explanations, ordinary "
-    "conversation, editing, brainstorming, or writing from provided source "
-    "material. Prefer answering the user's question directly over keyword-adjacent "
-    "research."
-)
 
 
 def _text_of(content) -> str:
@@ -347,7 +89,7 @@ async def _describe_images_for_agent(messages, *, session=None):
                 [{"role": "system", "content": SYSTEM_VISION},
                  {"role": "user", "content": vision_content}],
                 config.VISION_MODEL,
-                max_tokens=config.CHAT_MAX_TOKENS,
+                max_tokens=config.VISION_MAX_TOKENS,
                 temperature=0.0,
                 session=session,
             )
@@ -412,7 +154,7 @@ async def _memory_recall(chat_id: str, query: str, session=None) -> list[tuple[s
                 f"{config.TOOL_SERVER_URL}/memory/recall",
                 json={"chat_id": chat_id, "query": query, "top_k": 6},
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -432,7 +174,7 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
                 f"{config.TOOL_SERVER_URL}/memory/store",
                 json={"chat_id": chat_id, "role": role, "content": content},
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -698,6 +440,24 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
 
 
+async def _request_needs_work(messages, *, session=None) -> bool:
+    """Plain-chat gate: does this turn need the agentic loop (tools/source/verify)?
+    Uncertain -> True (use the safe buffered loop, never stream a risky turn)."""
+    q = _last_user_text(messages).strip()[:2000]
+    if not q:
+        return True
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_REQUEST_GATE},
+             {"role": "user", "content": q}],
+            config.GROUNDING_GATE_MODEL, max_tokens=60, temperature=0.0, session=session,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.S)
+        return bool(json.loads(match.group(0) if match else raw).get("needs_work", True))
+    except Exception:
+        return True
+
+
 async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) -> str:
     """Run a refine pass on the SAME prose model that wrote the draft when one was
     used (so paid Opus/GPT prose isn't silently reverted to the open model on a
@@ -748,16 +508,6 @@ def _prose_provider(voice):
     return None
 
 
-_PROSE_POLISH_SYS = (
-    "You are a prose editor. Rewrite the DRAFT into clearer, more natural, more "
-    "engaging prose for the user's request. STRICT RULES: change only wording and "
-    "flow — do NOT add facts, claims, numbers, names, or experience not already in "
-    "the draft or the SOURCE; do not invent. Do NOT inflate, strengthen, or reframe "
-    "what the writer has done or claimed: keep the draft's level of confidence and "
-    "every hedge, and never imply more was accomplished or solved than the draft "
-    "states. Keep the requested format and length. No preamble, no sign-off "
-    "commentary — output ONLY the rewritten deliverable."
-)
 
 
 def _prose_polish_messages(messages, candidate, source):
@@ -775,17 +525,6 @@ def _prose_polish_messages(messages, candidate, source):
     ]
 
 
-_VOICE_REGISTER = {
-    "warm": "natural and lightly warm, with a little personality; contractions are fine",
-    "formal": "polished and formal, professional; no contractions",
-}
-_VOICE_PASS_SYS = (
-    "You are a VOICE editor, not a content editor. Improve ONLY the voice of the DRAFT — its "
-    "rhythm and naturalness, so it reads like a skilled human wrote it — at this register: "
-    "{register}. STRICT: do NOT add, remove, strengthen, soften, or simplify any claim, fact, "
-    "number, or hedge; do not add confidence or imply more was accomplished than stated; do not "
-    "change meaning or materially change length. Output ONLY the revised text, no preamble."
-)
 
 
 async def _voice_pass(candidate, register, *, session=None):
@@ -969,57 +708,35 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
     grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
-    # Run the auditor CONCURRENTLY with the grounding gate. The auditor (honesty
-    # for normal deliverables; the calibrated app-claim audit for applications —
-    # exactly one) and the gate are independent unless the auditor refines the
-    # draft (the rare FABRICATION path), so overlapping them takes the ~1.5s gate
-    # off the critical path on the common clean turn. If an auditor refines, we
-    # re-gate the cleaned draft below so `needs` never reflects a stale draft.
-    # is_app is passed from the FULL conversation by the caller: in the overflow
-    # path `messages` is only the trimmed tail, so classifying here would mis-route
-    # a long cover-letter chat to the strict auditor and over-block its framing.
+    # One cheap classifier gates the whole chain. SYSTEM_GATE flags both external
+    # facts and claims about the user, so a casual turn — never an application —
+    # that needs neither skips straight through instead of paying for the audits.
     is_app = _is_application_writing(messages) if is_app is None else is_app
-    full_request = _all_user_text(messages) + _recall_extra
-    honesty_on = getattr(config, "ENABLE_HONESTY_AUDIT", True) and not is_app
-    app_on = getattr(config, "ENABLE_APPLICATION_CLAIM_AUDIT", True) and is_app
-    gate_coro = _needs_verification(messages, candidate, grounding_source, session=session)
+    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
+    if not needs and not is_app:
+        return "ok", candidate
 
-    if honesty_on:
-        honesty, needs = await asyncio.gather(
-            _honesty_audit(full_request, candidate, session=session), gate_coro
-        )
+    full_request = _all_user_text(messages) + _recall_extra
+
+    if config.ENABLE_HONESTY_AUDIT and not is_app:
+        honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
             refined = await _refine_honesty(full_request, candidate, unsupported, prose=prose, session=session)
-            if refined:
-                recheck = await _honesty_audit(full_request, refined, session=session)
-                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("FAB"):
-                    candidate = refined  # cleaned draft -> re-gate it
-                    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-                else:
-                    return "unsupported_self_claims", _honesty_block_msg(unsupported)
+            recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
+            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("FAB")):
+                candidate = refined
+                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
-    elif app_on:
-        app_audit, needs = await asyncio.gather(
-            _application_claim_audit(full_request, candidate, grounding_source, session=session), gate_coro
-        )
+    elif config.ENABLE_APPLICATION_CLAIM_AUDIT and is_app:
+        app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
-            refined = await _refine_application_claims(
-                full_request, candidate, grounding_source, app_audit, prose=prose, session=session
-            )
-            if refined:
-                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session)
-                if not recheck or not str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED"):
-                    candidate = refined
-                    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-                else:
-                    issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
-                    return (
-                        "unsupported_application_claims",
-                        "I could not safely finalize this application draft without "
-                        "unsupported claims:\n\n" + issues,
-                    )
+            refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, prose=prose, session=session)
+            recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
+            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED")):
+                candidate = refined
+                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
                 issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
                 return (
@@ -1027,8 +744,6 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
                     "I could not safely finalize this application draft without "
                     "unsupported claims:\n\n" + issues,
                 )
-    else:
-        needs = await gate_coro
 
     if not grounding_source.strip() and _has_citation_markers(candidate):
         return (
@@ -1096,7 +811,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     user_final_model = (user_model or "").strip()
     is_user_model = bool(user_final_model)
 
-    if _has_images(messages):
+    had_images = _has_images(messages)
+    if had_images:
         if config.SHOW_WORK:
             yield ("reasoning", "🖼️ Reading image context…\n")
         messages = await _describe_images_for_agent(messages, session=session)
@@ -1173,6 +889,29 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # context budget, so a document pasted in a since-trimmed turn can still ground
     # a faithful quote; recall_context separately carries older user-stated facts.
     user_source = _user_source(messages)
+
+    # Plain-chat fast path: stream the answer live when the turn needs no tools,
+    # source, or verification. No verifier runs — there is nothing to ground or
+    # audit. Anything uncertain falls through to the buffered loop below.
+    if (config.STREAM_SIMPLE_CHAT and not is_user_model and not had_images
+            and not user_source and not _is_application_writing(messages)
+            and not await _request_needs_work(messages, session=session)):
+        streamed = []
+        async for kind, tok in fireworks.stream(
+            scratch, config.AGENT_MODEL,
+            max_tokens=config.AGENT_MAX_TOKENS,
+            temperature=config.WRITER_TEMPERATURE, session=session,
+        ):
+            if kind == "content":
+                streamed.append(tok)
+            yield (kind, tok)
+        answer = "".join(streamed).strip()
+        if answer and chat_id:
+            user_memory = _consolidated_user_memory(messages)
+            if user_memory:
+                _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+            _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
+        return
 
     tool_sources = []
     repair_steps = 0
@@ -1314,7 +1053,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         # rewrite. Skip polish for user-chosen models.
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
         prose = None
-        if polish_voice and not is_clar and substantial:
+        if polish_voice and not is_clar and substantial and not is_user_model:
             prose = _prose_provider(polish_voice)
         if prose is not None:
             prose_client, prose_model = prose
