@@ -97,6 +97,10 @@ async def chat(
             payload["tools"] = tools
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
+        # Flash is only ever used here as a fast classifier/auditor — never let it
+        # spend latency on chain-of-thought.
+        if "deepseek-v4-flash" in model:
+            payload.setdefault("reasoning_effort", "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
         log.info(f"[fireworks] model={model} session={session_id[:8]} tokens={max_tokens}")

@@ -50,7 +50,7 @@ REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
 GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/glm-5p1")
 GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
-# The auditor model lives in the tool-server (gpt-oss-120b); we just call it.
+# The auditor model lives in the tool-server (deepseek-v4-flash, thinking off).
 
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
