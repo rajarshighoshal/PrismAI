@@ -120,11 +120,14 @@ MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 #
 # The cap is a fraction of the SMALLEST generation window (glm-5p1, ~200k tokens),
 # NOT deepseek's 1M: a grounded turn runs on glm, so the conversation must never be
-# allowed to fill more than its share of glm's window. Capping the conversation at
-# 20% leaves ~80% for the system prompt, tool schemas, accumulated tool results,
-# and the answer. ~3.5 chars/token for prose.
+# allowed to fill more than its share of glm's window. Compact at 80% of the window
+# (~160k tokens of conversation), leaving ~20% (~40k tokens) for the system prompt,
+# tool schemas, accumulated tool results, and the answer. ~3.5 chars/token for prose.
+# Note: 20% (~40k tokens) is comfortable for normal turns but near the edge for a
+# heavily tool-using GROUNDED turn (several web fetches) on a near-full window; dial
+# MEMORY_COMPACT_FRACTION down toward 0.70 if you ever see glm truncation.
 MODEL_CONTEXT_TOKENS = int(os.getenv("MODEL_CONTEXT_TOKENS", "200000"))      # glm-5p1 floor
-MEMORY_COMPACT_FRACTION = float(os.getenv("MEMORY_COMPACT_FRACTION", "0.20"))
+MEMORY_COMPACT_FRACTION = float(os.getenv("MEMORY_COMPACT_FRACTION", "0.80"))
 # ~3.5 chars/token is Latin-prose-tuned; dense scripts (e.g. CJK) run ~1-2
 # chars/token, so this under-counts tokens there — tolerable because the budget
 # sits far under the model window. Clamp to a floor so a stray MEMORY_COMPACT_
@@ -132,7 +135,7 @@ MEMORY_COMPACT_FRACTION = float(os.getenv("MEMORY_COMPACT_FRACTION", "0.20"))
 # chat on turn 1.
 MEMORY_CONTEXT_BUDGET_CHARS = max(20000, int(
     os.getenv("MEMORY_CONTEXT_BUDGET_CHARS",
-              str(int(MODEL_CONTEXT_TOKENS * MEMORY_COMPACT_FRACTION * 3.5)))  # ~140,000 chars
+              str(int(MODEL_CONTEXT_TOKENS * MEMORY_COMPACT_FRACTION * 3.5)))  # ~560,000 chars
 ))
 
 # Prose polish (premium Opus/Sonnet) is slow + costly. Only spend it on substantial
