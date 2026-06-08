@@ -16,6 +16,7 @@ import re
 import sqlite3
 import struct
 import time
+import weakref
 from typing import Optional
 
 import httpx
@@ -65,7 +66,9 @@ _memory_disabled = False
 _embedding_dim: Optional[int] = None
 _embedding_dim_warned = False
 _init_lock = asyncio.Lock()
-_compression_locks: dict[str, asyncio.Lock] = {}
+# Weak values so a chat's lock is dropped once no longer in use, instead of the
+# dict growing one entry per chat_id forever.
+_compression_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -389,17 +392,22 @@ async def _compress_chat_unlocked(chat_id: str) -> int:
             "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=?",
             (chat_id, chash),
         ).fetchone()
-        vec = await get_embedding(summary[:2000])
-        blob = _f32_pack(vec) if vec else None
         ids = [row_id for row_id, _, _ in rows]
         qs = ",".join("?" * len(ids))
 
         if not existing:
+            # Only delete the raw rows once a SEARCHABLE summary is in place. If the
+            # embedding call fails, keep the raw rows and retry next time rather than
+            # leaving a NULL-embedding summary that can never be recalled.
+            vec = await get_embedding(summary[:2000])
+            if not vec:
+                logger.warning("Memory compression: embedding failed for chat=%s, keeping raw rows", str(chat_id)[:20])
+                return 0
             conn.execute(
                 "INSERT INTO chat_turns "
                 "(chat_id, role, content, content_hash, embedding, created_at, is_summary) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chat_id, "summary", summary, chash, blob, time.time(), 1),
+                (chat_id, "summary", summary, chash, _f32_pack(vec), time.time(), 1),
             )
         conn.execute(f"DELETE FROM chat_turns WHERE id IN ({qs})", tuple(ids))
         conn.commit()
@@ -451,14 +459,14 @@ async def recall(
 
     try:
         total = conn.execute(
-            "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND is_summary=0",
+            "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
             (chat_id,),
         ).fetchone()[0]
         if total < MEMORY_MIN_TURNS:
             return []
 
         rows = conn.execute(
-            "SELECT role, content, content_hash, embedding "
+            "SELECT id, role, content, content_hash, embedding "
             "FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
             (chat_id,),
         ).fetchall()
@@ -469,37 +477,31 @@ async def recall(
         if not qvec:
             return []
 
+        # BM25 over the whole chat in ONE query (FTS rowid == chat_turns.id),
+        # instead of re-querying the index for every row.
+        bm25_lookup = {}
+        try:
+            fts_q = _fts5_safe_query(query)
+            if fts_q:
+                fmatch = conn.execute(
+                    "SELECT rowid, bm25(chat_turns_fts, 0.75, 0.0) "
+                    "FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
+                    (fts_q,),
+                ).fetchall()
+                bm25_lookup = {r[0]: r[1] for r in fmatch}
+        except Exception:
+            pass
+
         exclude_set = set(exclude_hashes)
         scored = []
-        for role, content, chash, blob in rows:
+        for row_id, role, content, chash, blob in rows:
             if chash in exclude_set:
                 continue
             try:
-                vec = _f32_unpack(blob)
-                cosine = _cosine_similarity(qvec, vec)
+                cosine = _cosine_similarity(qvec, _f32_unpack(blob))
             except Exception:
                 cosine = 0.0
-
-            # BM25 via FTS5
-            bm25_score = 0.0
-            try:
-                fts_q = _fts5_safe_query(query)
-                if fts_q:
-                    fmatch = conn.execute(
-                        "SELECT rowid, bm25(chat_turns_fts, 0.75, 0.0) "
-                        "FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
-                        (fts_q,),
-                    ).fetchall()
-                    bm25_lookup = {r[0]: r[1] for r in fmatch}
-                    row_id = conn.execute(
-                        "SELECT id FROM chat_turns WHERE chat_id=? AND content_hash=?",
-                        (chat_id, chash),
-                    ).fetchone()
-                    if row_id and row_id[0] in bm25_lookup:
-                        bm25_score = bm25_lookup[row_id[0]]
-            except Exception:
-                pass
-
+            bm25_score = bm25_lookup.get(row_id, 0.0)
             # Weighted hybrid: 60% cosine, 40% BM25
             final = 0.6 * cosine + 0.4 * min(1.0, max(0.0, -bm25_score / 10.0))
             scored.append((final, role, content))
