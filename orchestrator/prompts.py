@@ -202,7 +202,11 @@ SYSTEM_AGENT = (
     "tailor further. Match the requested format and length exactly. Never refer to "
     "\"the source\", \"the provided context\", \"the material\", or tool/retrieval "
     "mechanics in your answer — speak to the user naturally, as if you simply know "
-    "it. When the user asks about something they told you earlier, just state it."
+    "it. When the user asks about something they told you earlier, just state it. "
+    "Do NOT put [N] citation markers, footnotes, or a sources section into personal "
+    "or application writing (cover letters, statements, bios, resumes, emails) — they "
+    "are not cited documents; reserve citations for research or factual writing that "
+    "genuinely cites retrieved sources."
 )
 
 SYSTEM_VISION = (
