@@ -70,9 +70,23 @@ TOOL_TEMPERATURE = float(os.getenv("TOOL_TEMPERATURE", "0.2"))
 WRITER_TEMPERATURE = float(os.getenv("WRITER_TEMPERATURE", "0.55"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))
 
-# Networking.
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "180"))
+# Networking. Per-purpose timeouts (seconds). The old single 180s blanket let one
+# stalled upstream hang a whole turn for 3 minutes with no user feedback; each
+# call now carries a budget matched to what it actually does. All env-overridable.
+# HTTP_TIMEOUT stays as a back-compat catch-all default for any caller without a
+# more specific budget.
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "90"))
 STREAM_IDLE_TIMEOUT = float(os.getenv("STREAM_IDLE_TIMEOUT", "90"))
+# Fireworks non-streaming completion: agent steps, gates, query compression.
+GEN_TIMEOUT = float(os.getenv("GEN_TIMEOUT", "90"))
+# tool-server calls: verify_grounding (LLM auditor), web_search, fetch_url, export.
+TOOL_SERVER_TIMEOUT = float(os.getenv("TOOL_SERVER_TIMEOUT", "60"))
+# Per-chat memory recall/store — must be quick. If the memory service is slow,
+# degrade (skip recall / drop the async store) rather than hang the turn.
+MEMORY_TIMEOUT = float(os.getenv("MEMORY_TIMEOUT", "15"))
+# Premium prose polish (Opus/Sonnet/GPT-5.5/Gemini). Long-form generation is
+# legitimately slow, so this stays generous — but still bounded, not 3 minutes.
+PROSE_TIMEOUT = float(os.getenv("PROSE_TIMEOUT", "120"))
 
 # Optional bearer token OWUI must present (the connection's API key).
 # Empty = accept any (service is localhost-bound on a private docker net).
@@ -152,6 +166,11 @@ POLISH_VOICE_MIN_CHARS = int(os.getenv("POLISH_VOICE_MIN_CHARS", "1200"))
 # seconds; a genuinely new ask of the same question later re-runs for a fresh answer.
 ENABLE_DEDUP = _flag("ENABLE_DEDUP", "true")
 DEDUP_TTL_SECONDS = float(os.getenv("DEDUP_TTL_SECONDS", "120"))
+# A follower attached to an in-flight identical request waits at most this long
+# for the lead's answer before falling back to running its own — and the fallback
+# is LOGGED, not silently swallowed. Keep < DEDUP_TTL so a slow lead still
+# populates the cache the follower can use on its own re-run.
+DEDUP_WAIT_TIMEOUT = float(os.getenv("DEDUP_WAIT_TIMEOUT", "90"))
 
 # Prose tier classifier model — cheap, fast model to determine if a request is
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).

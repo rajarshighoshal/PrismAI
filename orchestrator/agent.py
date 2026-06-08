@@ -412,7 +412,7 @@ async def _memory_recall(chat_id: str, query: str, session=None) -> list[tuple[s
                 f"{config.TOOL_SERVER_URL}/memory/recall",
                 json={"chat_id": chat_id, "query": query, "top_k": 6},
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -432,7 +432,7 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
                 f"{config.TOOL_SERVER_URL}/memory/store",
                 json={"chat_id": chat_id, "role": role, "content": content},
                 headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()

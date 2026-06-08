@@ -56,7 +56,7 @@ async def post(path: str, payload: dict, *, session=None, headers=None):
             f"{config.TOOL_SERVER_URL}{path}",
             json=payload,
             headers=_forward_headers(headers),
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=config.TOOL_SERVER_TIMEOUT),
         ) as resp:
             data = await resp.json(content_type=None)
             if resp.status >= 400:
