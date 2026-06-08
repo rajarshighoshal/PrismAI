@@ -818,6 +818,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         yield ("content", "")
         return
 
+    # Instant feedback: a heavy turn (uploaded doc, big paste) spends a few seconds
+    # on the first generation before any other breadcrumb — show something now so
+    # the user isn't staring at a blank.
+    if config.SHOW_WORK:
+        yield ("reasoning", "🧠 Reading your request…\n")
+
     user_final_model = (user_model or "").strip()
     is_user_model = bool(user_final_model)
 
