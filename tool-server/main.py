@@ -205,9 +205,12 @@ def _strip_reasoning_leak(markdown: str) -> str:
 
 def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
     markdown = _strip_reasoning_leak(markdown)
-    # Strip [1]-style grounding/traceability markers — they belong in the chat
-    # view, not the final document.
-    markdown = re.sub(r"[ \t]*\[\d+\]", "", markdown)
+    # [N] markers: in a cited work (research paper with a References section) they're
+    # real citations — keep them. Everywhere else (cover letters, emails, bios) they
+    # are chat-only grounding/traceability markers — strip them from the document.
+    has_refs = re.search(r"(?im)^#{0,6}\s*(references|bibliography|works cited|sources)\s*$", markdown)
+    if not has_refs:
+        markdown = re.sub(r"[ \t]*\[\d+\]", "", markdown)
     with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
