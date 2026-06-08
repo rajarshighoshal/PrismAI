@@ -50,7 +50,7 @@ OPENWEBUI_ATTACH_EXPORTS = os.getenv("OPENWEBUI_ATTACH_EXPORTS", "true").lower()
 # For /verify_grounding: the auditor LLM. Key from env; endpoint no-ops with a
 # clear error if unset, so the server still starts without it.
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
-VERIFY_MODEL = os.getenv("VERIFY_MODEL", "accounts/fireworks/models/gpt-oss-120b")
+VERIFY_MODEL = os.getenv("VERIFY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 
 
 # --- Request models -------------------------------------------------------
@@ -753,6 +753,8 @@ def verify_grounding(req: VerifyGroundingRequest) -> dict:
             {"role": "user", "content": f"SOURCE:\n{req.source}\n\nDRAFT:\n{req.draft}\n\nUnsupported claims:"},
         ],
     }
+    if "flash" in VERIFY_MODEL:  # deepseek-v4-flash: auditor, not a thinker
+        payload["reasoning_effort"] = "none"
     try:
         with httpx.Client(timeout=60.0) as client:
             r = client.post(
