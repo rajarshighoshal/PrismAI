@@ -123,6 +123,12 @@ MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
 SHOW_WORK = _flag("SHOW_WORK", "true")
 
+# Plain-chat live streaming: when a cheap classifier says the turn needs no tools,
+# sources, or verification, stream the answer token-by-token instead of running the
+# buffered agentic loop. Critical turns (facts/source/application writing) still go
+# through the verify-first loop.
+STREAM_SIMPLE_CHAT = _flag("STREAM_SIMPLE_CHAT", "true")
+
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 
