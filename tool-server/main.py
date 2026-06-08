@@ -218,11 +218,15 @@ def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
 
 
 def _auth_header_from_request(request: Optional[Request]) -> dict[str, str]:
+    # Prefer the configured service token. OWUI sends a model connection its own
+    # connection key (often "none"), which is NOT a valid user token for the files
+    # API — so the inbound header can't authenticate the upload. The service token
+    # is the one that actually works; only fall back to inbound if it's unset.
+    if OPENWEBUI_API_KEY:
+        return {"Authorization": f"Bearer {OPENWEBUI_API_KEY}"}
     inbound_auth = request.headers.get("authorization") if request else ""
     if inbound_auth:
         return {"Authorization": inbound_auth}
-    if OPENWEBUI_API_KEY:
-        return {"Authorization": f"Bearer {OPENWEBUI_API_KEY}"}
     return {}
 
 
