@@ -221,6 +221,13 @@ SYSTEM_GATE = (
     "with no external factual claims."
 )
 
+SYSTEM_PREAMBLE = (
+    "You are acknowledging a user request before the main system answers it. In ONE "
+    "short, friendly sentence, say what you're about to do (e.g. 'Let me draft that "
+    "cover letter from your resume and the posting'). Do NOT answer, make any factual "
+    "claim, or write the deliverable — just a brief acknowledgment of the plan."
+)
+
 SYSTEM_REQUEST_GATE = (
     "Decide if answering this user message needs tools, external/current facts, "
     "sources, file export, or writing about the user that must be verified — versus "
