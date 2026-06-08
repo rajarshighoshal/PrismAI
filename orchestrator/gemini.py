@@ -72,7 +72,7 @@ async def chat(
             f"{GEMINI_BASE_URL}/chat/completions",
             headers=_headers(),
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=config.PROSE_TIMEOUT),
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()

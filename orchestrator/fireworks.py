@@ -104,7 +104,7 @@ async def chat(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=config.GEN_TIMEOUT),
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()

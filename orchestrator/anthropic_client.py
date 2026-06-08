@@ -110,7 +110,7 @@ async def chat(
             f"{ANTHROPIC_BASE_URL}/messages",
             headers=_headers(),
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=config.HTTP_TIMEOUT),
+            timeout=aiohttp.ClientTimeout(total=config.PROSE_TIMEOUT),
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
