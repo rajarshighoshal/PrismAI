@@ -136,6 +136,13 @@ STREAM_SIMPLE_CHAT = _flag("STREAM_SIMPLE_CHAT", "true")
 # in ~0.5s instead of a blank wait while the first heavy generation runs.
 STREAM_PREAMBLE = _flag("STREAM_PREAMBLE", "true")
 
+# Optimistic answer streaming: stream the open-model answer live (token-by-token,
+# interleaved with the thinking breadcrumbs), then verify the finished artifact and
+# openly self-correct if a claim was unsupported — instead of holding the whole
+# answer until it's verified. The deliverable a model is about to polish is NOT
+# streamed (the polished version is); user-chosen-model regens stream their model.
+STREAM_ANSWER = _flag("STREAM_ANSWER", "true")
+
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 
