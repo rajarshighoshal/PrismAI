@@ -13,7 +13,7 @@ import re
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
     SYSTEM_HONESTY, SYSTEM_APPLICATION_CLAIM_AUDIT, SYSTEM_TOOL_GUARD,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
@@ -928,6 +928,22 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
             _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
         return
+
+    # Heavy turn: stream a one-line acknowledgment from the fast model into the
+    # thinking panel immediately, so the user sees tokens flowing while the first
+    # heavy generation runs. Pure planning — no claims, never the answer.
+    if config.SHOW_WORK and config.STREAM_PREAMBLE:
+        try:
+            async for kind, tok in fireworks.stream(
+                [{"role": "system", "content": SYSTEM_PREAMBLE},
+                 {"role": "user", "content": _last_user_text(messages)[:1500]}],
+                config.GROUNDING_GATE_MODEL, max_tokens=80, temperature=0.3, session=session,
+            ):
+                if kind == "content":
+                    yield ("reasoning", tok)
+            yield ("reasoning", "\n")
+        except Exception:
+            pass
 
     tool_sources = []
     export_links = []

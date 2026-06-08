@@ -165,6 +165,7 @@ async def _run_tests():
     config.AGENT_MAX_STEPS = 6
     config.GROUNDING_REPAIR_STEPS = 2
     config.STREAM_SIMPLE_CHAT = False  # buffered loop for the existing suite; streaming has its own test
+    config.STREAM_PREAMBLE = False     # off for the existing suite; preamble has its own test
 
     tool_names = {t["function"]["name"] for t in agent.TOOL_SCHEMAS}
     check("tools: all required tools exposed", {
@@ -198,6 +199,19 @@ async def _run_tests():
     check("stream: arrived as multiple content chunks", sum(1 for k, _ in ev if k == "content") >= 2)
     check("stream: no verifier ran on plain chat", _calls["verify"] == [])
     config.STREAM_SIMPLE_CHAT = False
+
+    # Fast preamble: a heavy turn streams a quick acknowledgment as reasoning first,
+    # before the real answer (which still goes through the buffered loop).
+    _reset()
+    config.STREAM_PREAMBLE = True
+    _stream_out[:] = ["Let me ", "draft that."]
+    _chat_queue.append(_chat_content("Plain answer."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "write something for me"}])
+    reasoning = "".join(t for k, t in ev if k == "reasoning")
+    check("preamble: streamed as reasoning before the answer", "Let me draft that." in reasoning)
+    check("preamble: answer still produced", _content(ev) == "Plain answer.")
+    config.STREAM_PREAMBLE = False
 
     # Model-driven web search: tool call first, then grounded final is verified.
     _reset()

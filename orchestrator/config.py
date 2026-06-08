@@ -131,6 +131,11 @@ SHOW_WORK = _flag("SHOW_WORK", "true")
 # through the verify-first loop.
 STREAM_SIMPLE_CHAT = _flag("STREAM_SIMPLE_CHAT", "true")
 
+# On a heavy turn (deliverable/source), stream a one-line acknowledgment from the
+# fast model into the thinking panel immediately, so the user sees tokens flowing
+# in ~0.5s instead of a blank wait while the first heavy generation runs.
+STREAM_PREAMBLE = _flag("STREAM_PREAMBLE", "true")
+
 # Minimum source length (chars) before a deliverable is worth verifying.
 MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 
