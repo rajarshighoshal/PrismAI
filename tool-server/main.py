@@ -256,11 +256,13 @@ def _attach_file_to_openwebui(
             # Relative URL — the user's browser session serves it (get_verified_user).
             download_url = f"/api/v1/files/{file_id}/content/{filename}"
 
-            # Best-effort: also attach to the message if OWUI gave us its ids. It
-            # doesn't forward a message-id to model connections, so this usually
-            # no-ops — the download link is the reliable path.
+            # Attach the file to the assistant message so it shows inline. Needs
+            # the chat-id + message-id headers (forwarded by the orchestrator once
+            # the forward_message_id OWUI patch is applied). The download link is
+            # the fallback when they're absent.
             chat_id = request.headers.get("x-open-webui-chat-id") if request else ""
             message_id = request.headers.get("x-open-webui-message-id") if request else ""
+            attached = False
             if chat_id and message_id:
                 try:
                     file_item = {"type": "file", "id": file_id, "name": filename,
@@ -270,10 +272,12 @@ def _attach_file_to_openwebui(
                         headers={**headers, "Accept": "application/json"},
                         json={"type": "files", "data": {"files": [file_item]}},
                     ).raise_for_status()
+                    attached = True
                 except Exception:
                     pass
 
-            return {"openwebui_file_id": file_id, "download_url": download_url}
+            return {"openwebui_file_id": file_id, "download_url": download_url,
+                    "attached_to_chat": attached}
     except Exception as e:
         logger.warning("OpenWebUI file upload failed for %s: %s", filename, e)
         return {"download_url": None, "attach_reason": f"upload failed: {type(e).__name__}"}
