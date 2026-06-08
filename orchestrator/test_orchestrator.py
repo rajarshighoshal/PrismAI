@@ -349,7 +349,8 @@ async def _run_tests():
     _reset()
     _post_queue.append([
         "data:text/markdown;base64,ZmFrZS1maWxl",
-        {"status": "success", "filename": "draft.md", "mime_type": "text/markdown"},
+        {"status": "success", "filename": "draft.md", "mime_type": "text/markdown",
+         "download_url": "/api/v1/files/abc123/content/draft.md"},
     ])
     _chat_queue.extend([
         _chat_tools(_tool_call("export_markdown", {"markdown": "# Draft", "filename": "draft"})),
@@ -364,7 +365,8 @@ async def _run_tests():
     check("export: endpoint called", _calls["post"][0][0] == "/export/markdown")
     check("export: attach headers forwarded", _calls["post"][0][2]["x-open-webui-chat-id"] == "c1")
     check("export: base64 not returned to model", "ZmFrZS1maWxl" not in tool_context)
-    check("export: final text returned", _content(ev) == "Exported draft.md.")
+    check("export: final text returned", _content(ev).startswith("Exported draft.md."))
+    check("export: download link surfaced", "/api/v1/files/abc123/content/draft.md" in _content(ev))
 
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()

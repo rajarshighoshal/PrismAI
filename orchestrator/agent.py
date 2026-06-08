@@ -381,6 +381,16 @@ def _budgeted_tools(tool_call_count: int, web_search_count: int):
     return TOOL_SCHEMAS
 
 
+def _export_download(name: str, result):
+    """(filename, relative_url) for a successful export, else None."""
+    if not name.startswith("export_") or not isinstance(result, list):
+        return None
+    for item in result:
+        if isinstance(item, dict) and item.get("download_url"):
+            return item.get("filename") or "file", item["download_url"]
+    return None
+
+
 def _source_from_tool(name: str, result) -> str:
     if name == "web_search" and isinstance(result, list):
         return search.format_context(_url_backed_results(result))
@@ -914,6 +924,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         return
 
     tool_sources = []
+    export_links = []
     repair_steps = 0
     tool_call_count = 0
     web_search_count = 0
@@ -1004,6 +1015,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 source_text = _source_from_tool(name, raw_result)
                 if source_text:
                     tool_sources.append(source_text)
+                dl = _export_download(name, raw_result)
+                if dl and dl not in export_links:
+                    export_links.append(dl)
                 visible = _compact_json(_visible_tool_result(name, raw_result))
                 # External/source-bearing tool output (web, fetched pages,
                 # citations) is untrusted: wrap it so embedded instructions are
@@ -1094,6 +1108,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             session=session,
         )
         if status == "ok":
+            if export_links:
+                text += "\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)
             # Store in memory asynchronously (don't block the response). Hold a
             # strong reference (_track_task): the event loop keeps only a weak ref
             # to a bare create_task, so an orphan store could be GC'd mid-flight

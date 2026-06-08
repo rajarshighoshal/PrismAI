@@ -233,15 +233,11 @@ def _attach_file_to_openwebui(
     filename: str,
 ) -> dict[str, Any]:
     if not OPENWEBUI_ATTACH_EXPORTS:
-        return {"attached_to_chat": False, "attach_reason": "disabled"}
+        return {"download_url": None, "attach_reason": "disabled"}
 
-    chat_id = request.headers.get("x-open-webui-chat-id") if request else ""
-    message_id = request.headers.get("x-open-webui-message-id") if request else ""
     headers = _auth_header_from_request(request)
-    if not chat_id or not message_id:
-        return {"attached_to_chat": False, "attach_reason": "missing chat/message headers"}
     if not headers:
-        return {"attached_to_chat": False, "attach_reason": "missing OpenWebUI auth"}
+        return {"download_url": None, "attach_reason": "missing OpenWebUI auth"}
 
     try:
         with httpx.Client(timeout=20.0) as client:
@@ -255,36 +251,32 @@ def _attach_file_to_openwebui(
             uploaded = upload.json()
             file_id = uploaded.get("id") or uploaded.get("file", {}).get("id")
             if not file_id:
-                return {
-                    "attached_to_chat": False,
-                    "attach_reason": "upload returned no file id",
-                }
+                return {"download_url": None, "attach_reason": "upload returned no file id"}
 
-            file_item = {
-                "type": "file",
-                "id": file_id,
-                "name": filename,
-                "url": file_id,
-                "size": len(data),
-                "mime_type": media_type,
-                "file": uploaded,
-            }
-            event = client.post(
-                f"{OPENWEBUI_BASE_URL}/api/v1/chats/{chat_id}/messages/{message_id}/event",
-                headers={**headers, "Accept": "application/json"},
-                json={"type": "files", "data": {"files": [file_item]}},
-            )
-            event.raise_for_status()
-            return {
-                "attached_to_chat": True,
-                "openwebui_file_id": file_id,
-            }
+            # Relative URL — the user's browser session serves it (get_verified_user).
+            download_url = f"/api/v1/files/{file_id}/content/{filename}"
+
+            # Best-effort: also attach to the message if OWUI gave us its ids. It
+            # doesn't forward a message-id to model connections, so this usually
+            # no-ops — the download link is the reliable path.
+            chat_id = request.headers.get("x-open-webui-chat-id") if request else ""
+            message_id = request.headers.get("x-open-webui-message-id") if request else ""
+            if chat_id and message_id:
+                try:
+                    file_item = {"type": "file", "id": file_id, "name": filename,
+                                 "url": file_id, "size": len(data), "mime_type": media_type, "file": uploaded}
+                    client.post(
+                        f"{OPENWEBUI_BASE_URL}/api/v1/chats/{chat_id}/messages/{message_id}/event",
+                        headers={**headers, "Accept": "application/json"},
+                        json={"type": "files", "data": {"files": [file_item]}},
+                    ).raise_for_status()
+                except Exception:
+                    pass
+
+            return {"openwebui_file_id": file_id, "download_url": download_url}
     except Exception as e:
-        logger.warning("OpenWebUI file attach failed for %s: %s", filename, e)
-        return {
-            "attached_to_chat": False,
-            "attach_reason": f"OpenWebUI attach failed: {type(e).__name__}",
-        }
+        logger.warning("OpenWebUI file upload failed for %s: %s", filename, e)
+        return {"download_url": None, "attach_reason": f"upload failed: {type(e).__name__}"}
 
 
 def _file_result(
