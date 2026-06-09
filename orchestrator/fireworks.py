@@ -59,7 +59,7 @@ def _headers() -> dict:
     return h
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="") -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="", reasoning_effort=None) -> str:
     """Non-streaming completion. Returns the final answer text (content only)."""
     result = await chat(
         messages,
@@ -69,6 +69,7 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
         session=session,
         user_id=user_id,
         label=label,
+        reasoning_effort=reasoning_effort,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -84,6 +85,7 @@ async def chat(
     tool_choice=None,
     user_id=None,
     label="",
+    reasoning_effort=None,
 ) -> dict:
     """Non-streaming chat completion.
 
@@ -107,10 +109,10 @@ async def chat(
             payload["tools"] = tools
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
-        # Flash is only ever used here as a fast classifier/auditor — never let it
-        # spend latency on chain-of-thought.
+        # Flash defaults to no chain-of-thought (fast classifier). A caller that needs
+        # careful grounding (the honesty audit) passes reasoning_effort to turn it on.
         if "deepseek-v4-flash" in model:
-            payload.setdefault("reasoning_effort", "none")
+            payload.setdefault("reasoning_effort", reasoning_effort or "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
         t0 = time.perf_counter()

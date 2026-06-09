@@ -736,10 +736,14 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
     if not candidate.strip():
         return None
     fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
+    # De-dup only: the source lives in SOURCE MATERIAL, so drop the identical <source>
+    # blocks from the request (no information lost). NO truncation — the auditor sees
+    # the whole request, the whole source, and the whole draft.
+    request = _SOURCE_BLOCK_RE.sub("", full_request).strip()
     user = (
-        f"USER REQUEST:\n{full_request}\n\n"
+        f"USER REQUEST (instructions; the FACTS are in SOURCE MATERIAL):\n{request}\n\n"
         f"SOURCE MATERIAL:\n{fitted if fitted else '(none)'}\n\n"
-        f"DRAFT:\n{candidate[:config.AUDIT_DRAFT_BUDGET]}"
+        f"DRAFT:\n{candidate}"
     )
     try:
         raw = await fireworks.complete(
@@ -748,11 +752,23 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
             config.HONESTY_MODEL,
             max_tokens=900,
             temperature=0.0,
+            reasoning_effort=config.AUDIT_REASONING_EFFORT,
             session=session,
             label="audit",
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
+        if isinstance(data, dict) and config.LOG_SOURCE_DIAG:
+            # Settle model-vs-bug with data: how many flagged phrases are actually
+            # present in the source (i.e. false positives the auditor mis-flagged)?
+            src_words = set(_WORD_RE.findall(fitted.lower()))
+            def _grounded(p):
+                pw = set(_WORD_RE.findall(str(p).lower())) - {"the","a","an","of","and","to","in","my","i","with","for","at"}
+                return pw and len(pw & src_words) / len(pw) >= 0.6
+            flagged = data.get("unsupported") or []
+            false_pos = sum(1 for f in flagged if _grounded(f))
+            log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} src_chars={len(fitted)} "
+                     f"verdict={data.get('verdict')} flagged={len(flagged)} likely_false_pos={false_pos}")
         return data if isinstance(data, dict) else None
     except Exception:
         return None
