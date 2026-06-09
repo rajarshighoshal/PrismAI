@@ -750,7 +750,7 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
             [{"role": "system", "content": SYSTEM_FACT_AUDIT},
              {"role": "user", "content": user}],
             config.HONESTY_MODEL,
-            max_tokens=900,
+            max_tokens=config.AUDIT_MAX_TOKENS,
             temperature=0.0,
             reasoning_effort=config.AUDIT_REASONING_EFFORT,
             session=session,
