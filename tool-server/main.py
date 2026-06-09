@@ -814,6 +814,17 @@ class MemorySweepRequest(BaseModel):
     chat_id: str = Field(..., description="OWUI chat ID to sweep")
 
 
+class DeliverableStoreRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+    content: str = Field(..., description="The verified deliverable text")
+    filename: str = Field(default="", description="Delivered file name")
+    fmt: str = Field(default="", description="Format: docx | pdf | md | …")
+
+
+class DeliverableGetRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+
+
 @app.on_event("startup")
 async def startup_init_memory():
     """Pre-init the memory DB on startup so first request is fast."""
@@ -861,3 +872,25 @@ async def memory_sweep(req: MemorySweepRequest) -> dict:
     compacted = await memory.maybe_compress_chat(req.chat_id)
     removed = await memory.sweep_chat(req.chat_id)
     return {"chat_id": req.chat_id, "removed_rows": removed, "compacted_rows": compacted}
+
+
+@app.post(
+    "/deliverable/store",
+    summary="Persist the document a turn delivered, for later editing",
+    operation_id="deliverable_store",
+)
+async def deliverable_store(req: DeliverableStoreRequest) -> dict:
+    """Store the verified deliverable so a follow-up turn can edit the real artifact."""
+    version = await memory.store_deliverable(req.chat_id, req.content, req.filename, req.fmt)
+    return {"stored": version > 0, "version": version, "chat_id": req.chat_id}
+
+
+@app.post(
+    "/deliverable/get",
+    summary="Fetch the latest deliverable for a chat (the document to edit)",
+    operation_id="deliverable_get",
+)
+async def deliverable_get(req: DeliverableGetRequest) -> dict:
+    """Return the latest stored deliverable for this chat, or null."""
+    d = await memory.get_deliverable(req.chat_id)
+    return {"chat_id": req.chat_id, "deliverable": d}

@@ -159,6 +159,26 @@ async def get_conn() -> Optional[sqlite3.Connection]:
                 "ON chat_turns(chat_id, created_at)"
             )
 
+            # Persistent deliverables — the verified document a turn produced (cover
+            # letter, report, …). Append-only for version history, so a later turn can
+            # surgically EDIT the real prior artifact instead of reconstructing it from
+            # scratch (which produced a different document and blew the token budget).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS deliverables (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL,
+                    filename TEXT,
+                    fmt TEXT,
+                    content TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deliverables_chat "
+                "ON deliverables(chat_id, version)"
+            )
+
             # FTS5 for hybrid retrieval
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts "
@@ -337,6 +357,49 @@ async def store(chat_id: str, role: str, content: str) -> bool:
     except Exception as e:
         logger.warning(f"Memory store failed: {e}")
         return False
+
+
+async def store_deliverable(chat_id: str, content: str, filename: str = "", fmt: str = "") -> int:
+    """Persist a delivered document for this chat. Append-only: each call is a new
+    version, so edits keep history (Canvas-style). Returns the new version (0 on failure)."""
+    conn = await get_conn()
+    if not conn or not (chat_id and (content or "").strip()):
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM deliverables WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        version = (row[0] or 0) + 1
+        conn.execute(
+            "INSERT INTO deliverables (chat_id, filename, fmt, content, version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, filename, fmt, content, version, time.time()),
+        )
+        conn.commit()
+        return version
+    except Exception as e:
+        logger.warning(f"Deliverable store failed: {e}")
+        return 0
+
+
+async def get_deliverable(chat_id: str) -> Optional[dict]:
+    """Return the LATEST deliverable for a chat (the document a follow-up edits), or None."""
+    conn = await get_conn()
+    if not conn or not chat_id:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT filename, fmt, content, version FROM deliverables "
+            "WHERE chat_id=? ORDER BY version DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"filename": row[0], "fmt": row[1], "content": row[2], "version": row[3]}
+    except Exception as e:
+        logger.warning(f"Deliverable get failed: {e}")
+        return None
 
 
 def _compression_lock(chat_id: str) -> asyncio.Lock:

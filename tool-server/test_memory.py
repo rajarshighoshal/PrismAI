@@ -98,6 +98,19 @@ async def main():
     raw = conn.execute("SELECT COUNT(*) FROM chat_turns WHERE chat_id='c3' AND is_summary=0").fetchone()[0]
     check("compression guard: raw rows preserved on embed failure", raw == 8)
 
+    # Deliverable store: latest is returned, and edits append as new versions.
+    await _fresh_db()
+    check("deliverable: none stored yet -> None", await memory.get_deliverable("d1") is None)
+    v1 = await memory.store_deliverable("d1", "Dear Committee, version one.", "letter.docx", "docx")
+    check("deliverable: first store is version 1", v1 == 1)
+    v2 = await memory.store_deliverable("d1", "Dear Committee, version two (edited).", "letter.docx", "docx")
+    check("deliverable: an edit appends as version 2", v2 == 2)
+    got = await memory.get_deliverable("d1")
+    check("deliverable: get returns the LATEST version", got and got["version"] == 2 and "version two" in got["content"])
+    check("deliverable: metadata round-trips", got["filename"] == "letter.docx" and got["fmt"] == "docx")
+    check("deliverable: empty content is not stored", await memory.store_deliverable("d1", "   ") == 0)
+    check("deliverable: a different chat is isolated", await memory.get_deliverable("d2") is None)
+
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0
 
