@@ -177,20 +177,17 @@ SYSTEM_VISION = (
 )
 
 SYSTEM_GATE = (
-    "Decide if a draft needs grounding verification before it can be shown. "
+    "Decide if a DRAFT needs fact-grounding verification before it is shown. "
     "Return JSON only: {\"needs_verification\": boolean, \"reason\": string}. "
-    "needs_verification=true for source-bound writing, current/external factual "
-    "claims, citations, claims about user credentials/history, numbers, dates, "
-    "or anything that would be a problem if fabricated. false for greetings, "
-    "purely creative writing, opinion, harmless brainstorming, or simple code "
-    "with no external factual claims."
-)
-
-SYSTEM_PREAMBLE = (
-    "You are acknowledging a user request before the main system answers it. In ONE "
-    "short, friendly sentence, say what you're about to do (e.g. 'Let me draft that "
-    "cover letter from your resume and the posting'). Do NOT answer, make any factual "
-    "claim, or write the deliverable — just a brief acknowledgment of the plan."
+    "true ONLY when the draft is a written DELIVERABLE that asserts facts as true — a "
+    "cover letter, resume, bio, email, report, research or academic writing, or a "
+    "summary of provided documents — i.e. it states the user's credentials/history, "
+    "numbers, dates, citations, or current/external facts that would mislead if wrong. "
+    "false for casual conversation, opinions, ASSESSING or CRITIQUING or answering a "
+    "question ABOUT an attached file or pasted text, explanations of stable concepts, "
+    "brainstorming, greetings, and code — EVEN when a source or image is attached. The "
+    "mere presence of a source never requires verification; only the draft asserting "
+    "checkable facts does."
 )
 
 SYSTEM_REQUEST_GATE = (

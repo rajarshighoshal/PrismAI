@@ -13,7 +13,7 @@ import re
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
@@ -861,7 +861,7 @@ async def _summarize_correction(before: str, after: str, *, session=None) -> str
         return ""
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, force: bool = False, session=None):
     """ONE fact-integrity check for any kind of writing — email, resume, letter,
     report, research, chat. No document-type branching: flag only unsupported FACTS,
     leave motivation / opinion / framing untouched, surgically correct, escalate to a
@@ -878,12 +878,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
     grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
-    # A cheap classifier lets PLAIN, source-less chat skip straight through. But if the
-    # user supplied source material, this is a grounded deliverable — ALWAYS audit it,
-    # never trust the snap gate to skip verification (a flaky "no" once let a whole
-    # cover letter through unchecked).
-    needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-    if not needs and not grounding_source.strip():
+    # Verify only a FACTUAL DELIVERABLE — the cheap classifier decides, and an exported
+    # file always counts (a document the user will rely on). The mere PRESENCE of a
+    # source does not force a verification: that blanket rule made the honesty pass fire
+    # on every casual turn that happened to have pasted text or an image, and strip
+    # reasonable asides ("software like Keybr or TypingClub") from an opinion. Opinion,
+    # assessment, and Q&A about an attachment are not deliverables and skip straight through.
+    needs = force or await _needs_verification(messages, candidate, grounding_source, session=session)
+    if not needs:
         return "ok", candidate
 
     full_request = _all_user_text(messages) + _recall_extra
@@ -1080,22 +1082,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
         return
 
-    # Heavy turn: stream a one-line acknowledgment from the fast model into the
-    # thinking panel immediately, so the user sees tokens flowing while the first
-    # heavy generation runs. Pure planning — no claims, never the answer.
+    # Heavy turn: show an instant status line so the user sees activity while the first
+    # heavy generation runs. A deterministic line — not a model call: spending a flash
+    # generation to emit filler added latency and cost and cluttered the thinking panel
+    # with non-model text. (feat/progress-ux will make these stages user-visible.)
     if config.SHOW_WORK and config.STREAM_PREAMBLE:
-        try:
-            async for kind, tok in fireworks.stream(
-                [{"role": "system", "content": SYSTEM_PREAMBLE},
-                 {"role": "user", "content": _last_user_text(messages)[:1500]}],
-                config.GROUNDING_GATE_MODEL, max_tokens=80, temperature=0.3, session=session,
-                label="preamble",
-            ):
-                if kind == "content":
-                    yield ("reasoning", tok)
-            yield ("reasoning", "\n")
-        except Exception:
-            pass
+        yield ("reasoning", "🧭 Planning the response…\n")
 
     tool_sources = []
     export_links = []        # immediate exports (csv) — link collected as they run
@@ -1327,7 +1319,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 yield ("reasoning", f"✨ Voice pass ({polish_voice_pass})…\n")
             candidate = await _voice_pass(candidate, polish_voice_pass, session=session)
 
-        if config.SHOW_WORK:
+        # Don't emit status as reasoning once content has streamed live — OWUI renders a
+        # post-content reasoning token as a stray <details> block visible IN the answer.
+        if config.SHOW_WORK and not streamed_live:
             yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
             messages_for_verify,
@@ -1335,6 +1329,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             source,
             recall_context=recall_context,
             prose=prose,
+            force=bool(pending_exports),  # an exported file is always a deliverable -> verify
             session=session,
         )
         links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""

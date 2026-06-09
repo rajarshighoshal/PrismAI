@@ -75,7 +75,7 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
-    if "Decide if a draft needs grounding verification" in sys:
+    if "needs fact-grounding verification" in sys:  # SYSTEM_GATE
         value = _gate_queue.pop(0) if _gate_queue else False
         return json.dumps({"needs_verification": value, "reason": "test"})
     if "needs tools, external" in sys:
@@ -231,16 +231,15 @@ async def _run_tests():
     check("stream: no verifier ran on plain chat", _calls["fact_audit"] == [])
     config.STREAM_SIMPLE_CHAT = False
 
-    # Fast preamble: a heavy turn streams a quick acknowledgment as reasoning first,
-    # before the real answer (which still goes through the buffered loop).
+    # Fast preamble: a heavy turn shows an INSTANT deterministic status line as reasoning
+    # (no LLM call) before the real answer, so the user sees activity immediately.
     _reset()
     config.STREAM_PREAMBLE = True
-    _stream_out[:] = ["Let me ", "draft that."]
     _chat_queue.append(_chat_content("Plain answer."))
     _gate_queue.append(False)
     ev = await _collect([{"role": "user", "content": "write something for me"}])
     reasoning = "".join(t for k, t in ev if k == "reasoning")
-    check("preamble: streamed as reasoning before the answer", "Let me draft that." in reasoning)
+    check("preamble: instant status shown as reasoning before the answer", "Planning the response" in reasoning)
     check("preamble: answer still produced", _content(ev) == "Plain answer.")
     config.STREAM_PREAMBLE = False
 
@@ -629,6 +628,38 @@ async def _run_tests():
     )}])
     check("honesty: a same-vocabulary inflation ('led' for 'collaborated') is still stripped",
           _content(ev) == "Corrected final answer." and _calls["refine_prompts"])
+
+    # SELECTIVE VERIFICATION: a casual turn that merely HAS an attachment (assessing it,
+    # asking about it) is not a deliverable. The gate says no and there is no export, so
+    # the honesty pass must NOT run and must NOT strip a reasonable aside ("like Keybr").
+    # (The old "any source present -> always audit" rule fired on every such chat.)
+    _reset()
+    _chat_queue.append(_chat_content(
+        "Yeah, solid typing tutor — for a free tool it covers the fundamentals well, "
+        "though it won't have the adaptive drills of paid apps like Keybr."
+    ))
+    _gate_queue.append(False)  # classifier: opinion about an attachment, not a deliverable
+    ev = await _collect([{"role": "user", "content": (
+        '<source id="1" name="screenshot">A web-based touch-typing tutor showing the home row.'
+        "</source>\nis this helpful to type better?"
+    )}])
+    check("selective: casual Q&A about an attachment is NOT fact-audited",
+          not _calls["fact_audit"] and "Keybr" in _content(ev))
+
+    # ...but an EXPORTED file is always a deliverable: verify even if the gate flakes to
+    # 'no', because the user will rely on the document.
+    _reset()
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": "I have 12 years at Meta.", "filename": "bio"})),
+        _chat_content("Done — file ready."),
+    ])
+    _post_queue.append([{"status": "success", "filename": "bio.docx", "download_url": "/api/v1/files/a/content/bio.docx"}])
+    _gate_queue.append(False)  # gate flakes to 'no'...
+    _honesty_queue.append({"unsupported": ["12 years at Meta"], "verdict": "FABRICATION"})  # ...but export forces the audit
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
+    ev = await _collect([{"role": "user", "content": "Make a short bio and export it as docx."}])
+    check("selective: an exported file is verified even when the gate says no",
+          _calls["fact_audit"] and _calls["refine_prompts"])
 
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
