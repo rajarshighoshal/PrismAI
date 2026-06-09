@@ -797,6 +797,25 @@ async def _run_tests():
           not _calls.get("prose"))
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
+
+    # REVISION invariant: if the model 'finishes' an edit WITHOUT re-exporting (live smoke
+    # caught it acknowledging in 174 chars, no file), the harness nudges once and the
+    # revised document still ships as a file.
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee, I expect to finish my MS in May 2026.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/n/content/letter.docx"}])
+    _chat_queue.extend([
+        _chat_content("Done — I've updated that line for you."),  # no export call!
+        _chat_tools(_tool_call("export_docx", {"markdown": "Dear Committee, I finished my MS in May 2026.", "filename": "letter"})),
+        _chat_content("Updated file ready."),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "I already finished my MS — update the doc"}],
+                        request_headers={"x-openwebui-chat-id": "edit7"})
+    check("edit/enforce-export: a no-export edit is nudged and the revised file ships",
+          _calls["post"] and "I finished my MS" in _calls["post"][0][1]["markdown"]
+          and "letter.docx" in _content(ev))
     _oc2.available, _oc2.complete = _oc2_avail, _oc2_complete
     config.ENABLE_OPENAI_PROSE = False
 

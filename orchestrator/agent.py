@@ -1037,10 +1037,13 @@ async def _refine_facts(full_request: str, source: str, candidate: str, unsuppor
     prompt = (
         _edit_directive(rewrite) + " "
         "Remove or neutrally rephrase each listed claim so the draft asserts no fact "
-        "the user or SOURCE did not support. Do NOT invent replacements. KEEP all "
-        "motivation, interest, framing, tone, and structure exactly — only the "
-        "unsupported FACTS change. If removing a claim leaves the draft thinner, that "
-        "is fine; do not pad with invented detail. Output only the revised deliverable."
+        "the user or SOURCE did not support. Do NOT invent replacements. If only PART of "
+        "a flagged claim is unsupported (an invented elaboration attached to a fact the "
+        "user did state), remove ONLY the unsupported part — never delete a fact the user "
+        "themselves stated or the source contains. KEEP all motivation, interest, framing, "
+        "tone, and structure exactly — only the unsupported FACTS change. If removing a "
+        "claim leaves the draft thinner, that is fine; do not pad with invented detail. "
+        "Output only the revised deliverable."
     )
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
@@ -1361,6 +1364,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     tool_call_count = 0
     web_search_count = 0
     budget_note_added = False
+    edit_nudged = False
     polish_voice = None
     polish_voice_pass = None
 
@@ -1493,6 +1497,24 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     "content": "Internal harness note: produce a final answer or call a tool.",
                 }
             )
+            continue
+
+        # REVISION invariant, harness-enforced: an edit of a delivered file MUST re-export
+        # the revised document. The live smoke run proved hope is not an invariant — the
+        # model acknowledged the edit in 174 chars and never called the export tool, so no
+        # new file existed. One bounded nudge; if it still refuses, the turn proceeds.
+        if edit_baseline and not pending_exports and not export_links and not edit_nudged:
+            edit_nudged = True
+            scratch.append({"role": "assistant", "content": candidate})
+            scratch.append({
+                "role": "system",
+                "content": (
+                    "Internal harness note: this is a REVISION of a document you delivered "
+                    "as a file. You have not re-exported it. Call the same export tool now "
+                    "with the COMPLETE revised document (the prior document with only the "
+                    "requested change applied) and the same filename."
+                ),
+            })
             continue
 
         # A file export carries the deliverable, so its body is kept out of the chat
