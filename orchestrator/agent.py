@@ -191,6 +191,45 @@ async def _memory_store(chat_id: str, role: str, content: str, session=None) -> 
     return False
 
 
+async def _deliverable_store(chat_id: str, content: str, filename: str = "", fmt: str = "") -> bool:
+    """Persist a delivered document so a LATER turn can edit the real artifact instead
+    of rebuilding it from scratch. Fire-and-forget; failure just means no edit memory."""
+    if not (chat_id and (content or "").strip()):
+        return False
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/deliverable/store",
+                json={"chat_id": chat_id, "content": content, "filename": filename, "fmt": fmt},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("stored", False)
+    except Exception:
+        pass
+    return False
+
+
+async def _deliverable_get(chat_id: str):
+    """Fetch the latest delivered document for this chat (what a follow-up edits), or None."""
+    if not chat_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/deliverable/get",
+                json={"chat_id": chat_id},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("deliverable")
+    except Exception:
+        pass
+    return None
+
+
 # Strong references to fire-and-forget background writes. asyncio keeps only a
 # WEAK reference to a running task, so a bare create_task() can be garbage
 # collected mid-flight once the request returns — silently dropping the write.
@@ -436,7 +475,7 @@ def _pending_prose_deliverable(pending) -> str:
     return max(docs, key=len) if docs else ""
 
 
-async def _export_final(pending, final_text, prose, messages, source, *, headers=None, session=None):
+async def _export_final(pending, final_text, prose, messages, source, *, chat_id="", headers=None, session=None):
     """Build the deferred export files. When the verified chat deliverable IS this
     document (same text the honesty gate approved), the file carries that verified
     version — so a surgical correction lands in the file, not the model's raw export
@@ -475,6 +514,11 @@ async def _export_final(pending, final_text, prose, messages, source, *, headers
         dl = _export_download(exp["tool"], result)
         if dl and dl not in out:
             out.append(dl)
+        # Persist exactly what went INTO the file so a later turn edits the real artifact
+        # (not a reconstruction). Fire-and-forget; never blocks the response.
+        if chat_id and md.strip():
+            fmt = "docx" if "docx" in exp["tool"] else "pdf" if "pdf" in exp["tool"] else "md"
+            _track_task(asyncio.create_task(_deliverable_store(chat_id, md, exp["filename"], fmt)))
     links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
     return links, filed_deliverable
 
@@ -1348,7 +1392,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # Build the deferred prose exports from the FINAL, verified text.
             file_links, filed_deliverable = await _export_final(
                 pending_exports, text, prose, messages_for_verify, source,
-                headers=request_headers, session=session,
+                chat_id=chat_id, headers=request_headers, session=session,
             )
             links += file_links
             changed = text.strip() != candidate.strip()
