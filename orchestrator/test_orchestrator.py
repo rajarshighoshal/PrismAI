@@ -18,12 +18,12 @@ _calls = {
     "search": [],
     "post": [],
     "verify": [],
+    "fact_audit": [],
     "refine_prompts": [],
 }
 _chat_queue = []
 _gate_queue = []
 _tool_gate_queue = []
-_app_audit_queue = []
 _honesty_queue = []
 _verify_queue = []
 _post_queue = []
@@ -84,20 +84,11 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "Decide whether a proposed tool call is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
-    if "honesty auditor" in sys:
+    if "fact-integrity verifier" in sys:  # the one unified fact auditor
+        _calls["fact_audit"].append(messages[1]["content"] if len(messages) > 1 else "")
         if _honesty_queue:
             return json.dumps(_honesty_queue.pop(0))
         return json.dumps({"unsupported": [], "verdict": "CLEAN"})
-    if "FABRICATED FACTS" in sys:  # application-writing claim auditor
-        if _app_audit_queue:
-            return json.dumps(_app_audit_queue.pop(0))
-        return json.dumps({
-            "unsupported_candidate_claims": [],
-            "unsupported_company_claims": [],
-            "fake_motivation_or_fit": [],
-            "acceptable_framing": [],
-            "verdict": "CLEAN",
-        })
     if "Make the SMALLEST edit" in sys or "Write it again from" in sys:  # surgical or rewrite refine
         _calls["refine_prompts"].append(sys)
         return "Corrected final answer."
@@ -149,7 +140,6 @@ def _reset():
     _chat_queue.clear()
     _gate_queue.clear()
     _tool_gate_queue.clear()
-    _app_audit_queue.clear()
     _honesty_queue.clear()
     _verify_queue.clear()
     _post_queue.clear()
@@ -239,7 +229,7 @@ async def _run_tests():
     ev = await _collect([{"role": "user", "content": "hey"}])
     check("stream: plain chat streams the answer live", _content(ev) == "Hi there!")
     check("stream: arrived as multiple content chunks", sum(1 for k, _ in ev if k == "content") >= 2)
-    check("stream: no verifier ran on plain chat", _calls["verify"] == [])
+    check("stream: no verifier ran on plain chat", _calls["fact_audit"] == [])
     config.STREAM_SIMPLE_CHAT = False
 
     # Fast preamble: a heavy turn streams a quick acknowledgment as reasoning first,
@@ -266,7 +256,8 @@ async def _run_tests():
 
     _reset()
     _chat_queue.append(_chat_content("Bitcoin is exactly $1 today."))
-    _gate_queue.append(True)  # needs verification; no source -> blocked
+    _gate_queue.append(True)  # needs verification; unsupported stat -> blocked
+    _honesty_queue.extend([{"unsupported": ["exactly $1"], "verdict": "FABRICATION"}] * 3)  # persists through patch + rewrite
     ev = await _collect([{"role": "user", "content": "what is bitcoin worth?"}])
     body = _content(ev)
     check("optimistic: streamed draft is shown", "exactly $1" in body)
@@ -280,7 +271,7 @@ async def _run_tests():
         _chat_content("Grounded answer [1]."),
     ])
     _gate_queue.append(True)
-    _verify_queue.append({"grounded": True, "unsupported_claims": ""})
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
     ev = await _collect([{"role": "user", "content": "what is the latest mars news?"}])
     body = _content(ev)
     check("agent: executed web_search tool", _calls["search"] == [("mars news", 2)])
@@ -289,7 +280,7 @@ async def _run_tests():
         config.AGENT_MODEL,
         config.GROUNDED_MODEL,
     ])
-    check("agent: verify saw tool source", "Source One" in _calls["verify"][0][0])
+    check("agent: verify saw tool source", "Source One" in _calls["fact_audit"][0])
     # Untrusted-context hardening (borrowed from Odysseus): web/tool source text
     # the model sees must be wrapped so embedded instructions are treated as data.
     _tool_msgs = [
@@ -313,11 +304,11 @@ async def _run_tests():
         _chat_content("Real source claim [1]."),
     ])
     _gate_queue.append(True)
-    _verify_queue.append({"grounded": True, "unsupported_claims": ""})
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
     await _collect([{"role": "user", "content": "latest open model news with sources"}])
     last_context = json.dumps(_calls["chat_messages"][-1])
     check("search: uncited summary hidden from model-visible tool result", "uncited summary claim" not in last_context)
-    check("search: uncited summary excluded from verification source", "uncited summary claim" not in _calls["verify"][0][0])
+    check("search: uncited summary excluded from verification source", "uncited summary claim" not in _calls["fact_audit"][0])
     check("search: URL-backed source remains visible", "real source claim" in last_context)
     search.search = _fake_search
 
@@ -385,7 +376,10 @@ async def _run_tests():
         _chat_content("The source reports the current price changes continuously."),
     ])
     _gate_queue.extend([True, True])
-    _verify_queue.append({"grounded": True, "unsupported_claims": ""})
+    # first draft's stat is unsupported and can't be patched (no source) -> blocked ->
+    # repair -> search; the grounded answer after search verifies clean.
+    _honesty_queue.extend([{"unsupported": ["exactly $1"], "verdict": "FABRICATION"}] * 3
+                          + [{"unsupported": [], "verdict": "CLEAN"}])
     ev = await _collect([{"role": "user", "content": "what is bitcoin worth right now?"}])
     body = _content(ev)
     check("gate: blocked ungrounded factual draft", "exactly $1" not in body)
@@ -410,9 +404,9 @@ async def _run_tests():
     _reset()
     _chat_queue.append(_chat_content("Rajarshi built a RAG tool and managed 25 people."))
     _gate_queue.append(True)
-    _verify_queue.extend([
-        {"grounded": False, "unsupported_claims": "1. managed 25 people"},
-        {"grounded": True, "unsupported_claims": ""},
+    _honesty_queue.extend([
+        {"unsupported": ["managed 25 people"], "verdict": "FABRICATION"},
+        {"unsupported": [], "verdict": "CLEAN"},  # recheck after refine
     ])
     ev = await _collect([
         {"role": "user", "content": "Notes: Rajarshi built a RAG email-triage tool."},
@@ -509,52 +503,33 @@ async def _run_tests():
           _calls["chat_models"] in ([config.AGENT_MODEL], [config.GROUNDED_MODEL]))
     check("vision: injected image context into agent", "VISIBLE TEXT" in json.dumps(_calls["chat_messages"][0]))
 
-    # Application drafts may be persuasive, but fake candidate/motivation claims
-    # are refined out before display.
+    # The verifier flags a fabricated FACT but leaves motivation/voice untouched —
+    # for any kind of writing, not a hand-coded "application" category.
     _reset()
     _chat_queue.append(_chat_content(
-        "Dear Stripe Team,\n\nI am drawn to your mission because it deeply resonates with me. "
+        "I am drawn to your mission because it resonates with me. "
         "I led analytics dashboards that transformed executive decision-making."
     ))
-    _app_audit_queue.extend([
-        {
-            "unsupported_candidate_claims": ["led analytics dashboards that transformed executive decision-making"],
-            "unsupported_company_claims": [],
-            "fake_motivation_or_fit": ["deeply resonates with me"],
-            "acceptable_framing": ["Stripe Team"],
-            "verdict": "UNSUPPORTED",
-        },
-        {
-            "unsupported_candidate_claims": [],
-            "unsupported_company_claims": [],
-            "fake_motivation_or_fit": [],
-            "acceptable_framing": ["grounded role framing"],
-            "verdict": "CLEAN",
-        },
+    _honesty_queue.extend([
+        {"unsupported": ["led analytics dashboards that transformed executive decision-making"], "verdict": "FABRICATION"},
+        {"unsupported": [], "verdict": "CLEAN"},  # recheck after refine
     ])
-    _gate_queue.append(False)
+    _gate_queue.append(True)
     ev = await _collect([{"role": "user", "content": (
-        "Write a short cover letter for a data analyst role at Stripe. "
-        "Candidate facts: 3 years SQL, Tableau dashboards, A/B testing."
+        "Write a short cover letter for a data analyst role. Facts: 3 years SQL, dashboards."
     )}])
-    check("application audit: strips fake candidate/motivation claims", _content(ev) == "Corrected final answer.")
+    check("fact verifier: a fabricated credential is refined out", _content(ev) == "Corrected final answer.")
 
-    # The KTH over-block: motivation/fit/enthusiasm ALONE (no fabricated facts) must
-    # NOT block or rewrite the letter — that voice is the point of a cover letter.
+    # Motivation / interest / enthusiasm ALONE (no fabricated facts) must NEVER block
+    # or rewrite — it is not a claim that can be true or false.
     _reset()
-    motiv = ("Dear Committee, I am deeply drawn to your lab's work and eager to develop "
-             "Bayesian methods for this project. The mission resonates with my goals.")
+    motiv = ("I am deeply drawn to your lab's work and eager to develop methods for this "
+             "project. The mission resonates with my goals.")
     _chat_queue.append(_chat_content(motiv))
-    _app_audit_queue.append({
-        "unsupported_candidate_claims": [],
-        "unsupported_company_claims": [],
-        "fake_motivation_or_fit": ["deeply drawn to your lab's work", "eager to develop", "mission resonates with my goals"],
-        "acceptable_framing": [],
-        "verdict": "UNSUPPORTED",  # even if the auditor over-tags the verdict...
-    })
-    _gate_queue.append(False)
-    ev = await _collect([{"role": "user", "content": "Write a short cover letter for the PhD. Candidate facts: ML applicant."}])
-    check("application audit: motivation/fit alone does NOT block the letter",
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})  # motivation is never flagged
+    _gate_queue.append(True)
+    ev = await _collect([{"role": "user", "content": "Write a short statement of interest. Facts: ML applicant."}])
+    check("fact verifier: motivation alone does NOT block or alter the writing",
           "deeply drawn to your lab" in _content(ev) and "could not safely finalize" not in _content(ev).lower())
 
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
@@ -564,20 +539,15 @@ async def _run_tests():
     # verifier, a correctly recalled fact looks invented and gets stripped, so the
     # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
     _SENTINELS = ["Helios", "March 3rd", "$5 million", "$9,000"]
-    _orig_honesty, _orig_recall = agent._honesty_audit, agent._memory_recall
-    _orig_store, _orig_verify = agent._memory_store, toolserver.verify_grounding
-    _audit_inputs = []  # every full_request / source the auditors actually receive
+    _orig_fact, _orig_recall = agent._fact_audit, agent._memory_recall
+    _orig_store = agent._memory_store
+    _audit_inputs = []  # every request+source the unified verifier actually receives
 
-    async def _realistic_honesty(full_request, candidate, *, session=None):
-        _audit_inputs.append(full_request)
-        bad = [f for f in _SENTINELS if f in candidate and f not in full_request]
+    async def _realistic_fact(full_request, source, candidate, *, session=None):
+        seen = full_request + "\n" + (source or "")
+        _audit_inputs.append(seen)
+        bad = [f for f in _SENTINELS if f in candidate and f not in seen]
         return {"unsupported": bad, "verdict": "FABRICATION" if bad else "CLEAN"}
-
-    async def _realistic_verify(source, draft, *, session=None):
-        _audit_inputs.append(source)
-        _calls["verify"].append((source, draft))
-        bad = [f for f in _SENTINELS if f in draft and f not in source]
-        return {"grounded": not bad, "unsupported_claims": ", ".join(bad)}
 
     _recall_calls, _recall_return = [], []
 
@@ -588,10 +558,9 @@ async def _run_tests():
     async def _noop_store(chat_id, role, content, session=None):
         return True
 
-    agent._honesty_audit = _realistic_honesty
+    agent._fact_audit = _realistic_fact
     agent._memory_recall = _fake_recall
     agent._memory_store = _noop_store
-    toolserver.verify_grounding = _realistic_verify
 
     # Size filler to the configured budget so the test triggers overflow no matter
     # what the threshold is set to (~1.3x budget per block -> history >> budget).
@@ -676,8 +645,8 @@ async def _run_tests():
     )
     check("memory/normal: no recall on a short chat (native history used)", _recall_calls == [])
 
-    agent._honesty_audit, agent._memory_recall = _orig_honesty, _orig_recall
-    agent._memory_store, toolserver.verify_grounding = _orig_store, _orig_verify
+    agent._fact_audit, agent._memory_recall = _orig_fact, _orig_recall
+    agent._memory_store = _orig_store
 
     # ---- Request de-duplication (idempotency on retries) -----------------------
     dedup._results.clear(); dedup._inflight.clear()
