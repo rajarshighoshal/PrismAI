@@ -35,10 +35,25 @@ def _text_of(content) -> str:
     return ""
 
 
+# OWUI's RAG mode wraps the real message in <user_query>…</user_query> inside a
+# "### Task: Respond to the user query using the provided context…" template — and it does
+# so EVEN with "Bypass Embedding and Retrieval" enabled (open-webui issues #19281, #17720,
+# #17992). So we cannot rely on the OWUI setting; pull the user's actual words out here so
+# the edit classifier, the gates, and the verifier see what the USER said, not boilerplate.
+_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
+
+
+def _unwrap_owui(text: str) -> str:
+    if not text:
+        return ""
+    m = _USER_QUERY_RE.search(text)
+    return m.group(1).strip() if m else text
+
+
 def _last_user_text(messages) -> str:
     for m in reversed(messages):
         if m.get("role") == "user":
-            return _text_of(m.get("content")).strip()
+            return _unwrap_owui(_text_of(m.get("content")).strip())
     return ""
 
 
@@ -863,7 +878,7 @@ def _all_user_text(messages) -> str:
     the instructions too, so it can tell 'emphasize my 8 years' (an instruction)
     apart from a stated fact."""
     return "\n\n".join(
-        _text_of(m.get("content")).strip()
+        _unwrap_owui(_text_of(m.get("content")).strip())
         for m in messages
         if m.get("role") == "user" and _text_of(m.get("content")).strip()
     )
@@ -1052,7 +1067,14 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     # a fabrication and stripped. For normal chats recall_context is "" (no-op).
     _rc = (recall_context or "").strip()
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
-    grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
+    # The USER is the authority on their OWN facts. Anything they state in the conversation
+    # ("I've now finished my MS", "I work on geometric probes") grounds their own claims —
+    # alongside the uploaded source and recalled facts. Without this the verifier strips
+    # facts the user ADDED in chat just because they aren't in the original files (the
+    # exact bug that 'corrected out' the user's real geometric-probes research). The
+    # honesty guarantee still holds: the MODEL can't invent anything the user didn't give.
+    _user_said = _all_user_text(messages)
+    grounding_source = "\n\n".join(p for p in (source, _rc, _user_said) if p and p.strip())
 
     # Verify only a FACTUAL DELIVERABLE — the cheap classifier decides, and an exported
     # file always counts (a document the user will rely on). The mere PRESENCE of a

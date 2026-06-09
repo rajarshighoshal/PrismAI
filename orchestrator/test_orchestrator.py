@@ -656,6 +656,20 @@ async def _run_tests():
     check("honesty: a same-vocabulary inflation ('led' for 'collaborated') is still stripped",
           _content(ev) == "Corrected final answer." and _calls["refine_prompts"])
 
+    # USER'S OWN WORDS ground their facts: a claim the user STATED in chat (not in the
+    # uploaded files) must NOT be stripped as unsupported — the exact bug that 'corrected
+    # out' the user's real geometric-probes research because it wasn't in the .tex source.
+    _reset()
+    _chat_queue.append(_chat_content("I currently work on geometric probes for AI safety."))
+    _honesty_queue.append({"unsupported": ["geometric probes for AI safety"], "verdict": "FABRICATION"})
+    _gate_queue.append(True)
+    ev = await _collect([{"role": "user", "content": (
+        '<source id="1" name="cv.docx">Rajarshi Ghoshal — ML engineer, Georgia Tech.</source>\n'
+        "Add that I currently work on geometric probes for AI safety to my cover letter."
+    )}])
+    check("grounding: a fact the USER stated in chat is grounded, not stripped",
+          "geometric probes for AI safety" in _content(ev) and not _calls["refine_prompts"])
+
     # SELECTIVE VERIFICATION: a casual turn that merely HAS an attachment (assessing it,
     # asking about it) is not a deliverable. The gate says no and there is no export, so
     # the honesty pass must NOT run and must NOT strip a reasonable aside ("like Keybr").
