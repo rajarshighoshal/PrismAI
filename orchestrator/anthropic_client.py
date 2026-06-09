@@ -11,6 +11,7 @@ except ImportError:
     aiohttp = None
 
 from . import config
+from . import perf as _perf
 
 log = logging.getLogger(__name__)
 
@@ -56,13 +57,14 @@ def _convert_messages(messages):
     return system, converted
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, label="") -> str:
     result = await chat(
         messages,
         model,
         max_tokens=max_tokens,
         temperature=temperature,
         session=session,
+        label=label,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -74,6 +76,7 @@ async def chat(
     max_tokens,
     temperature=None,
     session=None,
+    label="",
 ) -> dict:
     own = session is None
     if own:
@@ -105,7 +108,7 @@ async def chat(
         if temp is not None and not _temperature_deprecated(model):
             payload["temperature"] = temp
 
-        log.info(f"[anthropic] model={model} messages={len(converted)} tokens={max_tokens}")
+        t0 = _perf.now()
         async with session.post(
             f"{ANTHROPIC_BASE_URL}/messages",
             headers=_headers(),
@@ -116,9 +119,8 @@ async def chat(
             data = await resp.json()
 
         usage = data.get("usage", {})
-        cache_read = usage.get("cache_read_input_tokens", 0)
-        cache_create = usage.get("cache_creation_input_tokens", 0)
-        log.info(f"[anthropic] completed cache_read={cache_read} cache_create={cache_create} output={usage.get('output_tokens', 0)}")
+        _perf.trace(label, model, t0=t0,
+                    in_tok=usage.get("input_tokens"), out_tok=usage.get("output_tokens"))
 
         content_blocks = data.get("content") or []
         text = "".join(
@@ -135,7 +137,7 @@ async def chat(
             await session.close()
 
 
-async def stream(messages, model, *, max_tokens, temperature=None, session=None):
+async def stream(messages, model, *, max_tokens, temperature=None, session=None, label=""):
     own = session is None
     if own:
         _require_aiohttp()
@@ -155,6 +157,9 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
             payload["temperature"] = temp
 
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
+        t0 = _perf.now()
+        ttft = None
+        in_tok = out_tok = None
         async with session.post(
             f"{ANTHROPIC_BASE_URL}/messages",
             headers=_headers(),
@@ -173,11 +178,19 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
                     event = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                if event.get("type") == "content_block_delta":
+                etype = event.get("type")
+                if etype == "message_start":
+                    in_tok = ((event.get("message") or {}).get("usage") or {}).get("input_tokens")
+                elif etype == "message_delta":
+                    out_tok = (event.get("usage") or {}).get("output_tokens", out_tok)
+                elif etype == "content_block_delta":
                     delta = event.get("delta") or {}
                     text = delta.get("text")
                     if text:
+                        if ttft is None:
+                            ttft = _perf.now()
                         yield ("content", text)
+        _perf.trace(label, model, t0=t0, ttft=ttft, in_tok=in_tok, out_tok=out_tok)
     finally:
         if own:
             await session.close()

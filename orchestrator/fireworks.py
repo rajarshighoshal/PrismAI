@@ -10,6 +10,7 @@ Two hard-won rules baked in:
 import hashlib
 import json
 import logging
+import time
 
 try:
     import aiohttp
@@ -17,8 +18,15 @@ except ImportError:
     aiohttp = None
 
 from . import config
+from .perf import trace as _perf_trace
 
 log = logging.getLogger(__name__)
+
+
+def _trace(label, model, *, t0, ttft=None, usage=None):
+    u = usage or {}
+    _perf_trace(label, model, t0=t0, ttft=ttft,
+                in_tok=u.get("prompt_tokens"), out_tok=u.get("completion_tokens"))
 
 
 def compute_session_id(messages, user_id: str = "") -> str:
@@ -51,7 +59,7 @@ def _headers() -> dict:
     return h
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None) -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="") -> str:
     """Non-streaming completion. Returns the final answer text (content only)."""
     result = await chat(
         messages,
@@ -60,6 +68,7 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
         temperature=temperature,
         session=session,
         user_id=user_id,
+        label=label,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -74,6 +83,7 @@ async def chat(
     tools=None,
     tool_choice=None,
     user_id=None,
+    label="",
 ) -> dict:
     """Non-streaming chat completion.
 
@@ -103,7 +113,7 @@ async def chat(
             payload.setdefault("reasoning_effort", "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
-        log.info(f"[fireworks] model={model} session={session_id[:8]} tokens={max_tokens}")
+        t0 = time.perf_counter()
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
             headers=headers,
@@ -113,9 +123,7 @@ async def chat(
             resp.raise_for_status()
             data = await resp.json()
         usage = data.get("usage") or {}
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-        if cached:
-            log.info(f"[fireworks] cached_tokens={cached}/{usage.get('prompt_tokens', 0)} model={model}")
+        _trace(label, model, t0=t0, usage=usage)
         choice = data["choices"][0]
         return {
             "message": choice.get("message") or {},
@@ -126,7 +134,7 @@ async def chat(
             await session.close()
 
 
-async def stream(messages, model, *, max_tokens, temperature=None, session=None, user_id=None):
+async def stream(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label=""):
     """Streaming completion. Yields (kind, text) where kind is 'content' or
     'reasoning'. Caller forwards 'content' as delta.content and may forward
     'reasoning' as delta.reasoning_content for the thinking UI.
@@ -143,14 +151,17 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
             "max_tokens": max_tokens,
             "temperature": config.TEMPERATURE if temperature is None else temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "user": session_id,
         }
         if "deepseek-v4-flash" in model:
             payload.setdefault("reasoning_effort", "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
-        log.info(f"[fireworks] stream model={model} session={session_id[:8]}")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
+        t0 = time.perf_counter()
+        ttft = None
+        usage = None
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
             headers=headers,
@@ -169,23 +180,30 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
                 rc = delta.get("reasoning_content")
                 if rc:
+                    if ttft is None:
+                        ttft = time.perf_counter()
                     yield ("reasoning", rc)
                 c = delta.get("content")
                 if c:
+                    if ttft is None:
+                        ttft = time.perf_counter()
                     yield ("content", c)
+        _trace(label, model, t0=t0, ttft=ttft, usage=usage)
     finally:
         if own:
             await session.close()
 
 
 async def stream_chat(messages, model, *, max_tokens, temperature=None, session=None,
-                      tools=None, tool_choice=None, user_id=None):
+                      tools=None, tool_choice=None, user_id=None, label=""):
     """Streaming chat that ALSO surfaces tool calls. Yields ('reasoning', text) and
     ('content', text) as they arrive, then a final ('final', {content, tool_calls,
     finish_reason}) once the stream completes — so the agent loop can stream the
@@ -203,6 +221,7 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
             "max_tokens": max_tokens,
             "temperature": config.TEMPERATURE if temperature is None else temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "user": session_id,
         }
         if tools is not None:
@@ -213,9 +232,11 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
             payload.setdefault("reasoning_effort", "none")
         headers = _headers()
         headers["x-session-affinity"] = session_id
-        log.info(f"[fireworks] stream_chat model={model} session={session_id[:8]} tokens={max_tokens}")
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         content_parts, calls, finish = [], {}, None
+        t0 = time.perf_counter()
+        ttft = None
+        usage = None
         async with session.post(
             f"{config.FIREWORKS_BASE_URL}/chat/completions",
             headers=headers, json=payload, timeout=timeout,
@@ -232,6 +253,8 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -241,9 +264,13 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
                 delta = choice.get("delta") or {}
                 rc = delta.get("reasoning_content")
                 if rc:
+                    if ttft is None:
+                        ttft = time.perf_counter()
                     yield ("reasoning", rc)
                 c = delta.get("content")
                 if c:
+                    if ttft is None:
+                        ttft = time.perf_counter()
                     content_parts.append(c)
                     yield ("content", c)
                 for tc in (delta.get("tool_calls") or []):
@@ -258,6 +285,7 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
                         slot["function"]["name"] += fn["name"]
                     if fn.get("arguments"):
                         slot["function"]["arguments"] += fn["arguments"]
+        _trace(label, model, t0=t0, ttft=ttft, usage=usage)
         yield ("final", {
             "content": "".join(content_parts),
             "tool_calls": [calls[i] for i in sorted(calls)],

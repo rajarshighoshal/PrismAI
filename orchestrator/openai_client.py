@@ -11,6 +11,7 @@ except ImportError:
     aiohttp = None
 
 from . import config
+from . import perf as _perf
 
 log = logging.getLogger(__name__)
 
@@ -48,13 +49,14 @@ def _token_payload(model, max_tokens, temperature) -> dict:
     }
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, label="") -> str:
     result = await chat(
         messages,
         model,
         max_tokens=max_tokens,
         temperature=temperature,
         session=session,
+        label=label,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -66,6 +68,7 @@ async def chat(
     max_tokens,
     temperature=None,
     session=None,
+    label="",
 ) -> dict:
     own = session is None
     if own:
@@ -74,7 +77,7 @@ async def chat(
     try:
         payload = {"model": model, "messages": messages,
                    **_token_payload(model, max_tokens, temperature)}
-        log.info(f"[openai] model={model} messages={len(messages)} tokens={max_tokens}")
+        t0 = _perf.now()
         async with session.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers=_headers(),
@@ -84,8 +87,8 @@ async def chat(
             resp.raise_for_status()
             data = await resp.json()
         usage = data.get("usage", {})
-        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-        log.info(f"[openai] completed cached_tokens={cached} total_tokens={usage.get('total_tokens', 0)}")
+        _perf.trace(label, model, t0=t0,
+                    in_tok=usage.get("prompt_tokens"), out_tok=usage.get("completion_tokens"))
         choice = data["choices"][0]
         return {
             "message": choice.get("message") or {},
@@ -96,15 +99,19 @@ async def chat(
             await session.close()
 
 
-async def stream(messages, model, *, max_tokens, temperature=None, session=None):
+async def stream(messages, model, *, max_tokens, temperature=None, session=None, label=""):
     own = session is None
     if own:
         _require_aiohttp()
         session = aiohttp.ClientSession()
     try:
         payload = {"model": model, "messages": messages, "stream": True,
+                   "stream_options": {"include_usage": True},
                    **_token_payload(model, max_tokens, temperature)}
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
+        t0 = _perf.now()
+        ttft = None
+        usage = None
         async with session.post(
             f"{OPENAI_BASE_URL}/chat/completions",
             headers=_headers(),
@@ -123,13 +130,20 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
                 c = delta.get("content")
                 if c:
+                    if ttft is None:
+                        ttft = _perf.now()
                     yield ("content", c)
+        u = usage or {}
+        _perf.trace(label, model, t0=t0, ttft=ttft,
+                    in_tok=u.get("prompt_tokens"), out_tok=u.get("completion_tokens"))
     finally:
         if own:
             await session.close()
