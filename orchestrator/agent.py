@@ -14,7 +14,7 @@ import re
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
-    SYSTEM_FACT_AUDIT, SYSTEM_FACT_DISTILL, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
+    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 
@@ -694,17 +694,26 @@ def _all_user_text(messages) -> str:
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
-_CLAIM_STOPWORDS = {"the", "a", "an", "of", "and", "to", "in", "my", "i", "with",
-                    "for", "at", "is", "are", "on", "as", "by", "that", "this", "it"}
 
 
-def _claim_in_source(phrase, source_words) -> bool:
-    """True when most of a flagged phrase's distinctive words appear in the source —
-    i.e. the claim is actually grounded and the auditor mis-flagged it. The deterministic
-    backstop that disposes of the LLM auditor's (or the distilled list's) false positives
-    so a real credential is NEVER stripped."""
-    pw = set(_WORD_RE.findall(str(phrase).lower())) - _CLAIM_STOPWORDS
-    return bool(pw) and len(pw & source_words) / len(pw) >= 0.6
+def _norm_token_str(text) -> str:
+    """Lowercase, reduce to [a-z0-9] tokens joined by single spaces and wrapped in
+    spaces, so a substring test matches only on whole-token boundaries."""
+    return " " + " ".join(_WORD_RE.findall(str(text).lower())) + " "
+
+
+def _claim_verbatim_in_source(phrase, source_norm: str) -> bool:
+    """True ONLY when a flagged phrase appears near-verbatim and CONTIGUOUS in the
+    source — the narrow case where the auditor flagged something literally present, so
+    it's a clear false positive to keep. Unlike a word-overlap score this never rescues
+    a semantic inflation ('led' for a sourced 'collaborated', '$1.5M/year' for '/month',
+    'p<0.001' for 'p<0.05'): those are not contiguous spans of the source, so the
+    auditor's flag stands and the claim is stripped. A tight backstop BEHIND the
+    full-source auditor, which makes the real semantic judgement."""
+    toks = _WORD_RE.findall(str(phrase).lower())
+    if len(toks) < 2:  # too short for a reliable verbatim match — defer to the auditor
+        return False
+    return (" " + " ".join(toks) + " ") in source_norm
 
 
 def _same_doc(a: str, b: str) -> bool:
@@ -756,29 +765,12 @@ def _fit_audit_source(source: str, draft: str, budget: int) -> str:
     return "\n\n".join(p for _i, p in kept) or source[:budget]
 
 
-async def _distill_source_facts(source, *, session=None) -> str:
-    """Distill a (possibly multi-file, verbose) source into a compact list of every
-    concrete verifiable fact. The auditor then checks the draft against this short list
-    instead of re-reading the raw source on every pass — which made flash reason for
-    30s+ and truncate its verdict. Extraction, not judgment, so reasoning stays off."""
-    if not source.strip():
-        return ""
-    try:
-        out = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_FACT_DISTILL},
-             {"role": "user", "content": source[:config.AUDIT_SOURCE_BUDGET]}],
-            config.HONESTY_MODEL, max_tokens=2000, temperature=0.0,
-            session=session, label="distill")
-        return (out or "").strip()
-    except Exception:
-        return ""
-
-
 async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
-    """The single fact-integrity verifier for ANY written deliverable. Flags only
+    """The single fact-integrity verifier for ANY written deliverable. Sees the USER
+    REQUEST, the full SOURCE MATERIAL, and the DRAFT side by side and flags only
     unsupported FACTUAL claims (against the user's stated facts + SOURCE + common
-    knowledge); motivation, opinion, and framing pass. `source` may be a distilled fact
-    list; `raw_source` (if given) is the full source, used only for the diagnostic.
+    knowledge); motivation, opinion, and framing pass. `raw_source` (if given) mirrors
+    `source` and is used only for the diagnostic.
     Returns {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
     if not candidate.strip():
         return None
@@ -806,14 +798,14 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
         if isinstance(data, dict) and config.LOG_SOURCE_DIAG:
-            # How many flagged phrases are actually present in the FULL source? A high
-            # count means a false positive — either the auditor mis-flagged or the
-            # distilled fact list dropped a real fact (so we'd see it via raw_source).
-            src_words = set(_WORD_RE.findall((raw_source or fitted).lower()))
+            # How many flagged phrases appear verbatim in the source? A non-zero count
+            # means the auditor mis-flagged something literally present — a false
+            # positive the verbatim backstop will keep.
+            source_norm = _norm_token_str(raw_source or fitted)
             flagged = data.get("unsupported") or []
-            false_pos = sum(1 for f in flagged if _claim_in_source(f, src_words))
+            false_pos = sum(1 for f in flagged if _claim_verbatim_in_source(f, source_norm))
             log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
-                     f"verdict={data.get('verdict')} flagged={len(flagged)} likely_false_pos={false_pos}")
+                     f"verdict={data.get('verdict')} flagged={len(flagged)} verbatim_false_pos={false_pos}")
         return data if isinstance(data, dict) else None
     except Exception:
         return None
@@ -897,23 +889,24 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     full_request = _all_user_text(messages) + _recall_extra
 
     if config.ENABLE_HONESTY_AUDIT:
-        src_words = set(_WORD_RE.findall(grounding_source.lower()))
-        # Distill the (possibly multi-file, verbose) source to a compact fact list ONCE,
-        # so the auditor checks the draft against a short list — not 8 raw files on every
-        # pass, which made it reason for 30s+ and truncate its verdict (fail-soft).
-        facts = await _distill_source_facts(grounding_source, session=session)
-        audit_src = facts or grounding_source
+        # Hand the auditor the FULL source (relevance-fitted inside _fact_audit), the
+        # request, and the draft — side by side — and let it make the SEMANTIC call. No
+        # distilled fact list in between: a lossy summary dropped real credentials (so the
+        # auditor flagged them) and can't preserve verbatim figures anyway. With the whole
+        # source in view it can tell 'led' is unsupported when the source says
+        # 'collaborated'; a tight verbatim backstop then keeps only the flags whose exact
+        # phrase is literally in the source (the auditor mis-flagging a quote).
+        source_norm = _norm_token_str(grounding_source)
 
         async def _flags(text):
-            """Genuinely-unsupported claims in `text`: what the auditor flags, MINUS any
-            phrase whose words are actually in the source. That deterministic backstop
-            disposes of false positives — when the distilled list dropped a real fact, or
-            the auditor over-flagged — so a grounded credential is never stripped. The
-            auditor only proposes; the source decides. [] means clean."""
-            a = await _fact_audit(full_request, audit_src, text, session=session, raw_source=grounding_source)
+            """Genuinely-unsupported claims in `text`: the auditor's flags MINUS any whose
+            exact phrase appears contiguously in the source (a literal false positive). The
+            auditor judges meaning; the backstop only rescues verbatim quotes — it never
+            keeps a same-words inflation. [] means clean."""
+            a = await _fact_audit(full_request, grounding_source, text, session=session, raw_source=grounding_source)
             if not (a and str(a.get("verdict", "")).upper().startswith("FAB")):
                 return []
-            return [u for u in (a.get("unsupported") or []) if not _claim_in_source(u, src_words)]
+            return [u for u in (a.get("unsupported") or []) if not _claim_verbatim_in_source(u, source_norm)]
 
         unsupported = await _flags(candidate)
         if unsupported:

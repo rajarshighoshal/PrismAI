@@ -124,8 +124,9 @@ HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v
 AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "low") or None
 # Reasoning-mode flash spends tokens THINKING before the JSON verdict, so the cap must
 # leave room for both — 900 truncated the verdict on a big source and the audit
-# fail-softed (didn't actually verify). Generous so the audit always completes.
-AUDIT_MAX_TOKENS = int(os.getenv("AUDIT_MAX_TOKENS", "4000"))
+# fail-softed (didn't actually verify). The auditor now reads the FULL source (no
+# distilled list), so give it ample headroom to think over many files and still finish.
+AUDIT_MAX_TOKENS = int(os.getenv("AUDIT_MAX_TOKENS", "8000"))
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))

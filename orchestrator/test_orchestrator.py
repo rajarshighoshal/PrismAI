@@ -84,8 +84,6 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "proposed web_search is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
-    if "Extract EVERY concrete" in sys:  # fact distiller — pass the source facts through
-        return messages[1]["content"]
     if "fact-integrity verifier" in sys:  # the one unified fact auditor
         _calls["fact_audit"].append(messages[1]["content"] if len(messages) > 1 else "")
         if _honesty_queue:
@@ -586,11 +584,11 @@ async def _run_tests():
     check("fact verifier: motivation alone does NOT block or alter the writing",
           "deeply drawn to your lab" in _content(ev) and "could not safely finalize" not in _content(ev).lower())
 
-    # REGRESSION — the over-strip bug: the auditor (or a lossy distilled fact list)
-    # flags GROUNDED credentials, ones whose words are right there in the source. The
-    # deterministic backstop must recognize each as present and KEEP it — a real
-    # credential is never stripped just because an LLM mis-flagged it. Every flag here
-    # is a false positive, so nothing genuine remains -> NO refine call at all.
+    # REGRESSION — the over-strip bug: the auditor mis-flags GROUNDED credentials whose
+    # exact phrase is right there in the source (a lossy distilled list used to cause
+    # this). The verbatim backstop recognizes each as literally present and KEEPS it — a
+    # real credential is never stripped just because an LLM mis-flagged it. Every flag
+    # here appears verbatim, so nothing genuine remains -> NO refine call at all.
     _reset()
     grounded_letter = (
         "At Clover Health I built a retrieval system delivering a 16,631x speedup, "
@@ -608,10 +606,29 @@ async def _run_tests():
         "Write a cover letter from my resume."
     )}])
     body = _content(ev)
-    check("safeguard: a grounded credential the auditor mis-flagged is NOT stripped",
+    check("backstop: a verbatim-grounded credential the auditor mis-flagged is NOT stripped",
           "16,631x" in body and "ICLR 2026" in body and "Microsoft and IBM" in body)
-    check("safeguard: all flags grounded in source -> no wasted refine cycle",
+    check("backstop: all flags verbatim in source -> no wasted refine cycle",
           not _calls["refine_prompts"])
+
+    # The OTHER direction — the honesty guarantee: a same-vocabulary INFLATION must NOT
+    # be rescued by the backstop. The source says 'collaborated'; the draft claims 'led'.
+    # The flagged phrase reuses source words but is NOT a contiguous span of the source,
+    # so the verbatim check returns False, the auditor's flag stands, and it is refined
+    # out. (A loose word-overlap score would have wrongly kept this lie.)
+    _reset()
+    _chat_queue.append(_chat_content("I led the product architecture team that rebuilt the system."))
+    _honesty_queue.extend([
+        {"unsupported": ["led the product architecture team"], "verdict": "FABRICATION"},
+        {"unsupported": [], "verdict": "CLEAN"},  # recheck after refine
+    ])
+    _gate_queue.append(True)
+    ev = await _collect([{"role": "user", "content": (
+        '<source id="1" name="resume.docx">Collaborated with the product team on system '
+        "architecture improvements.</source>\nWrite a cover letter from my resume."
+    )}])
+    check("honesty: a same-vocabulary inflation ('led' for 'collaborated') is still stripped",
+          _content(ev) == "Corrected final answer." and _calls["refine_prompts"])
 
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
