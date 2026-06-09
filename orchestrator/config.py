@@ -118,6 +118,10 @@ HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v
 # chain-of-thought so it actually locates each credential in the source instead of
 # guessing "unsupported" and over-stripping. Empty string = no reasoning (snap mode).
 AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "medium") or None
+# Reasoning-mode flash spends tokens THINKING before the JSON verdict, so the cap must
+# leave room for both — 900 truncated the verdict on a big source and the audit
+# fail-softed (didn't actually verify). Generous so the audit always completes.
+AUDIT_MAX_TOKENS = int(os.getenv("AUDIT_MAX_TOKENS", "4000"))
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
