@@ -137,6 +137,11 @@ MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
 SHOW_WORK = _flag("SHOW_WORK", "true")
 
+# The current date/time injected into the agent prompt is formatted in this local
+# timezone (the request itself carries none). Default = IST (+05:30), no DST.
+LOCAL_TZ_OFFSET_MINUTES = int(os.getenv("LOCAL_TZ_OFFSET_MINUTES", "330"))
+LOCAL_TZ_LABEL = os.getenv("LOCAL_TZ_LABEL", "IST")
+
 # Plain-chat live streaming: when a cheap classifier says the turn needs no tools,
 # sources, or verification, stream the answer token-by-token instead of running the
 # buffered agentic loop. Critical turns (facts/source/application writing) still go

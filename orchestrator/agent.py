@@ -10,7 +10,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
@@ -379,11 +379,15 @@ def _consolidated_user_memory(messages) -> str:
 
 
 def _now_line() -> str:
-    """Tell the model what 'today' is — otherwise it has no idea and burns tokens
-    debating whether a date (e.g. 'finished my MS in May 2026') is past or future."""
-    now = datetime.now(timezone.utc)
-    return ("The current date is " + now.strftime("%A, %d %B %Y") + " (UTC). Treat this as "
-            "'today'/'now' when reasoning about whether any date is in the past or future.")
+    """Tell the model what 'today' is, in the USER's local time — otherwise it has no idea
+    and burns tokens debating whether a date (e.g. 'finished my MS in May 2026') is past or
+    future. The OpenAI-style request OWUI sends carries no timezone, so we format in a
+    configured local offset (LOCAL_TZ_OFFSET_MINUTES) rather than the server's UTC clock."""
+    tz = timezone(timedelta(minutes=config.LOCAL_TZ_OFFSET_MINUTES))
+    now = datetime.now(tz)
+    return (f"The current date and time is {now:%A, %d %B %Y, %H:%M} {config.LOCAL_TZ_LABEL}. "
+            "Treat this as 'now' when reasoning about whether any date or time is in the past "
+            "or future.")
 
 
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
