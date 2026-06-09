@@ -7,6 +7,7 @@ orchestrator harness.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import logging
 import math
@@ -66,6 +67,16 @@ _memory_disabled = False
 _embedding_dim: Optional[int] = None
 _embedding_dim_warned = False
 _init_lock = asyncio.Lock()
+# All SQLite work runs on ONE dedicated worker thread: the calls never block the event
+# loop, yet are naturally serialized (single worker) and always touch the connection
+# from the same thread — so no locks (no deadlock) and no cross-thread sqlite errors.
+# The connection is opened check_same_thread=False so this off-loop thread may use it.
+_db_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="memdb")
+
+
+async def _db(fn):
+    """Run a synchronous DB block off the event loop on the dedicated DB thread."""
+    return await asyncio.get_running_loop().run_in_executor(_db_executor, fn)
 # Weak values so a chat's lock is dropped once no longer in use, instead of the
 # dict growing one entry per chat_id forever.
 _compression_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
@@ -128,7 +139,7 @@ async def get_conn() -> Optional[sqlite3.Connection]:
         try:
             db_dir = pathlib.Path(DB_PATH).parent
             db_dir.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
 
@@ -311,10 +322,10 @@ async def store(chat_id: str, role: str, content: str) -> bool:
 
     chash = _content_hash(cleaned)
     try:
-        existing = conn.execute(
+        existing = await _db(lambda: conn.execute(
             "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=?",
             (chat_id, chash),
-        ).fetchone()
+        ).fetchone())
         if existing:
             return False
 
@@ -332,27 +343,29 @@ async def store(chat_id: str, role: str, content: str) -> bool:
             )
 
         blob = _f32_pack(vec)
-        conn.execute(
-            "INSERT INTO chat_turns (chat_id, role, content, content_hash, embedding, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, role, cleaned, chash, blob, time.time()),
-        )
 
-        # Enforce per-chat cap without deleting summary rows first.
-        excess = conn.execute(
-            "SELECT COUNT(*) - ? FROM chat_turns WHERE chat_id=?",
-            (MEMORY_MAX_PER_CHAT, chat_id),
-        ).fetchone()[0]
-        if excess > 0:
+        def _write():
             conn.execute(
-                "DELETE FROM chat_turns WHERE id IN ("
-                "  SELECT id FROM chat_turns WHERE chat_id=? AND is_summary=0 "
-                "  ORDER BY created_at ASC LIMIT ?"
-                ")",
-                (chat_id, excess),
+                "INSERT INTO chat_turns (chat_id, role, content, content_hash, embedding, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, role, cleaned, chash, blob, time.time()),
             )
+            # Enforce per-chat cap without deleting summary rows first.
+            excess = conn.execute(
+                "SELECT COUNT(*) - ? FROM chat_turns WHERE chat_id=?",
+                (MEMORY_MAX_PER_CHAT, chat_id),
+            ).fetchone()[0]
+            if excess > 0:
+                conn.execute(
+                    "DELETE FROM chat_turns WHERE id IN ("
+                    "  SELECT id FROM chat_turns WHERE chat_id=? AND is_summary=0 "
+                    "  ORDER BY created_at ASC LIMIT ?"
+                    ")",
+                    (chat_id, excess),
+                )
+            conn.commit()
 
-        conn.commit()
+        await _db(_write)
         return True
     except Exception as e:
         logger.warning(f"Memory store failed: {e}")
@@ -366,18 +379,20 @@ async def store_deliverable(chat_id: str, content: str, filename: str = "", fmt:
     if not conn or not (chat_id and (content or "").strip()):
         return 0
     try:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(version), 0) FROM deliverables WHERE chat_id=?",
-            (chat_id,),
-        ).fetchone()
-        version = (row[0] or 0) + 1
-        conn.execute(
-            "INSERT INTO deliverables (chat_id, filename, fmt, content, version, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, filename, fmt, content, version, time.time()),
-        )
-        conn.commit()
-        return version
+        def _write():
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) FROM deliverables WHERE chat_id=?",
+                (chat_id,),
+            ).fetchone()
+            version = (row[0] or 0) + 1
+            conn.execute(
+                "INSERT INTO deliverables (chat_id, filename, fmt, content, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (chat_id, filename, fmt, content, version, time.time()),
+            )
+            conn.commit()
+            return version
+        return await _db(_write)
     except Exception as e:
         logger.warning(f"Deliverable store failed: {e}")
         return 0
@@ -389,11 +404,11 @@ async def get_deliverable(chat_id: str) -> Optional[dict]:
     if not conn or not chat_id:
         return None
     try:
-        row = conn.execute(
+        row = await _db(lambda: conn.execute(
             "SELECT filename, fmt, content, version FROM deliverables "
             "WHERE chat_id=? ORDER BY version DESC LIMIT 1",
             (chat_id,),
-        ).fetchone()
+        ).fetchone())
         if not row:
             return None
         return {"filename": row[0], "fmt": row[1], "content": row[2], "version": row[3]}
@@ -430,20 +445,21 @@ async def _compress_chat_unlocked(chat_id: str) -> int:
     if not conn:
         return 0
     try:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND is_summary=0",
-            (chat_id,),
-        ).fetchone()[0]
-        if total <= MEMORY_COMPRESS_WHEN_OVER:
-            return 0
-
-        rows = conn.execute(
-            "SELECT id, role, content FROM chat_turns "
-            "WHERE chat_id=? AND is_summary=0 "
-            "ORDER BY created_at ASC LIMIT ?",
-            (chat_id, MEMORY_COMPRESS_CHUNK),
-        ).fetchall()
-        if len(rows) < 5:
+        def _read():
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND is_summary=0",
+                (chat_id,),
+            ).fetchone()[0]
+            if total <= MEMORY_COMPRESS_WHEN_OVER:
+                return None
+            return conn.execute(
+                "SELECT id, role, content FROM chat_turns "
+                "WHERE chat_id=? AND is_summary=0 "
+                "ORDER BY created_at ASC LIMIT ?",
+                (chat_id, MEMORY_COMPRESS_CHUNK),
+            ).fetchall()
+        rows = await _db(_read)
+        if not rows or len(rows) < 5:
             return 0
 
         summary = await summarize_turns([(role, content) for _, role, content in rows])
@@ -451,13 +467,14 @@ async def _compress_chat_unlocked(chat_id: str) -> int:
             return 0
 
         chash = _content_hash(summary)
-        existing = conn.execute(
+        existing = await _db(lambda: conn.execute(
             "SELECT 1 FROM chat_turns WHERE chat_id=? AND content_hash=?",
             (chat_id, chash),
-        ).fetchone()
+        ).fetchone())
         ids = [row_id for row_id, _, _ in rows]
         qs = ",".join("?" * len(ids))
 
+        blob = None
         if not existing:
             # Only delete the raw rows once a SEARCHABLE summary is in place. If the
             # embedding call fails, keep the raw rows and retry next time rather than
@@ -466,14 +483,19 @@ async def _compress_chat_unlocked(chat_id: str) -> int:
             if not vec:
                 logger.warning("Memory compression: embedding failed for chat=%s, keeping raw rows", str(chat_id)[:20])
                 return 0
-            conn.execute(
-                "INSERT INTO chat_turns "
-                "(chat_id, role, content, content_hash, embedding, created_at, is_summary) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (chat_id, "summary", summary, chash, _f32_pack(vec), time.time(), 1),
-            )
-        conn.execute(f"DELETE FROM chat_turns WHERE id IN ({qs})", tuple(ids))
-        conn.commit()
+            blob = _f32_pack(vec)
+
+        def _finalize():
+            if not existing:
+                conn.execute(
+                    "INSERT INTO chat_turns "
+                    "(chat_id, role, content, content_hash, embedding, created_at, is_summary) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (chat_id, "summary", summary, chash, blob, time.time(), 1),
+                )
+            conn.execute(f"DELETE FROM chat_turns WHERE id IN ({qs})", tuple(ids))
+            conn.commit()
+        await _db(_finalize)
         logger.info(
             "Memory compression: chat=%s summarized %d raw rows",
             str(chat_id)[:20],
@@ -492,12 +514,16 @@ async def sweep_chat(chat_id: str, ttl_days: int = 90) -> int:
         return 0
     try:
         cutoff = time.time() - ttl_days * 86400
-        cur = conn.execute(
-            "DELETE FROM chat_turns WHERE chat_id=? AND created_at < ?",
-            (chat_id, cutoff),
-        )
-        removed = cur.rowcount
-        conn.commit()
+
+        def _delete():
+            cur = conn.execute(
+                "DELETE FROM chat_turns WHERE chat_id=? AND created_at < ?",
+                (chat_id, cutoff),
+            )
+            removed = cur.rowcount
+            conn.commit()
+            return removed
+        removed = await _db(_delete)
         if removed:
             logger.info(f"Memory sweep removed {removed} old rows for chat {chat_id}")
         return removed
@@ -521,18 +547,19 @@ async def recall(
     exclude_hashes = exclude_hashes or []
 
     try:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
-            (chat_id,),
-        ).fetchone()[0]
-        if total < MEMORY_MIN_TURNS:
-            return []
-
-        rows = conn.execute(
-            "SELECT id, role, content, content_hash, embedding "
-            "FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
-            (chat_id,),
-        ).fetchall()
+        def _read():
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
+                (chat_id,),
+            ).fetchone()[0]
+            if total < MEMORY_MIN_TURNS:
+                return None
+            return conn.execute(
+                "SELECT id, role, content, content_hash, embedding "
+                "FROM chat_turns WHERE chat_id=? AND embedding IS NOT NULL",
+                (chat_id,),
+            ).fetchall()
+        rows = await _db(_read)
         if not rows:
             return []
 
@@ -542,18 +569,20 @@ async def recall(
 
         # BM25 over the whole chat in ONE query (FTS rowid == chat_turns.id),
         # instead of re-querying the index for every row.
-        bm25_lookup = {}
-        try:
-            fts_q = _fts5_safe_query(query)
-            if fts_q:
+        def _bm25():
+            try:
+                fts_q = _fts5_safe_query(query)
+                if not fts_q:
+                    return {}
                 fmatch = conn.execute(
                     "SELECT rowid, bm25(chat_turns_fts, 0.75, 0.0) "
                     "FROM chat_turns_fts WHERE chat_turns_fts MATCH ?",
                     (fts_q,),
                 ).fetchall()
-                bm25_lookup = {r[0]: r[1] for r in fmatch}
-        except Exception:
-            pass
+                return {r[0]: r[1] for r in fmatch}
+            except Exception:
+                return {}
+        bm25_lookup = await _db(_bm25)
 
         exclude_set = set(exclude_hashes)
         scored = []
