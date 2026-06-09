@@ -81,7 +81,7 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "needs tools, external" in sys:
         value = _request_work_queue.pop(0) if _request_work_queue else True
         return json.dumps({"needs_work": value})
-    if "Decide whether a proposed tool call is necessary" in sys:
+    if "proposed web_search is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
     if "fact-integrity verifier" in sys:  # the one unified fact auditor
