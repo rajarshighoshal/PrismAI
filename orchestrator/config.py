@@ -48,7 +48,7 @@ REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 # Agentic harness model roles. The controller decides tool use; the final model
 # shifts to GLM after source-bearing tools because it measured stronger there.
 AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
-GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/glm-5p1")
+GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
 GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 # The auditor model lives in the tool-server (deepseek-v4-flash, thinking off).
 

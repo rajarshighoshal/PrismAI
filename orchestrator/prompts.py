@@ -67,21 +67,6 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "verify_grounding",
-            "description": "Audit a draft against provided source text and return unsupported claims. Use before finalizing source-bound factual writing.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string"},
-                    "draft": {"type": "string"},
-                },
-                "required": ["source", "draft"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "export_docx",
             "description": "Export complete final markdown as a Word .docx file.",
             "parameters": {
@@ -189,7 +174,6 @@ SYSTEM_AGENT = (
     "search definitions. When you DO need to search, issue ALL the queries you need "
     "in ONE step (they run in parallel and return together) — never search once, read "
     "it, then search again; that multiplies the wait.\n"
-    "- verify_grounding: before finalizing any source-bound factual writing.\n"
     "- polish: before writing a deliverable whose quality matters (cover letter, "
     "statement, application/research prose, important email). Pick the writer model "
     "by what this piece must do, using the model map in the tool description.\n"
