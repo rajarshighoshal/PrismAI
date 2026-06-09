@@ -355,30 +355,31 @@ async def _run_tests():
           "can't present those claims" in _content(ev).lower())
     config.GROUNDING_REPAIR_STEPS = _saved_repair
 
-    # Polish chain: when the agent calls the polish tool, the chosen paid writer
-    # actually runs on the final draft (and the result still passes verification).
+    # Auto-polish: an EXPORTED deliverable is automatically polished by the premium
+    # writer — there is no model-driven 'polish' tool (its bare "Acknowledged" made the
+    # model redraft the letter 2-3 times). The model just writes; the orchestrator polishes.
     _reset()
     import orchestrator.openai_client as _oc
     _oc_avail, _oc_complete = _oc.available, _oc.complete
     _oc.available = lambda: True
     async def _fake_prose(messages, model, *, max_tokens, temperature=None, session=None, label=""):
         _calls.setdefault("prose", []).append(model)
-        return "POLISHED FINAL LETTER."
+        draft = messages[-1]["content"].split("DRAFT TO POLISH:")[-1].strip()
+        return "[polished] " + draft  # preserve content so it's recognized as the same doc
     _oc.complete = _fake_prose
     config.ENABLE_OPENAI_PROSE = True
-    _chat_queue.append(_chat_tools(_tool_call("polish", {"model": "gpt-5.5", "voice_pass": "none"})))
-    # A real deliverable (>= POLISH_MIN_CHARS) — polish is gated to substantial
-    # prose now, so a one-liner would (correctly) skip the premium writer.
-    _chat_queue.append(_chat_content(
-        "Dear Hiring Team, I am writing to apply for the data analyst role. Over the "
-        "past two years I have worked as a data analyst, building dashboards and "
-        "running experiments to inform decisions. I would welcome the chance to bring "
-        "that experience to your team and contribute from day one. Thank you for your "
-        "consideration; I look forward to hearing from you."
-    ))
-    ev = await _collect([{"role": "user", "content": "Write a short cover letter. My facts: 2 years as a data analyst."}])
-    check("polish: paid writer ran on the final draft", "POLISHED FINAL LETTER." in _content(ev))
-    check("polish: routed to the chosen gpt-5.5 writer", _calls.get("prose") == [config.OPENAI_PROSE_MODEL_PREMIUM])
+    letter = ("Dear Hiring Team, I am applying for the data analyst role. Over two years I "
+              "built dashboards and ran experiments to inform decisions. " * 4)
+    _post_queue.append([{"status": "success", "filename": "cl.docx", "download_url": "/api/v1/files/p/content/cl.docx"}])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": letter, "filename": "cl"})),
+        _chat_content("Done — your letter is ready."),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Write a cover letter and export as docx. Facts: 2 years as a data analyst."}])
+    filed = _calls["post"][0][1]["markdown"]
+    check("auto-polish: exported deliverable polished by the premium writer", _calls.get("prose") == [config.OPENAI_PROSE_MODEL_PREMIUM])
+    check("auto-polish: file holds the polished deliverable", filed.startswith("[polished]"))
     _oc.available, _oc.complete = _oc_avail, _oc_complete
     config.ENABLE_OPENAI_PROSE = False
 

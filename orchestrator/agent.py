@@ -1106,19 +1106,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 args = _json_args(fn.get("arguments") or "{}")
-                if name == "polish":
-                    polish_voice = args.get("model") or args.get("voice") or polish_voice
-                    polish_voice_pass = args.get("voice_pass") or polish_voice_pass
-                    note = f"Acknowledged: polish with {polish_voice}"
-                    note += (f" + {polish_voice_pass} voice pass." if polish_voice_pass
-                             and polish_voice_pass != "none" else ".")
-                    scratch.append({
-                        "role": "tool",
-                        "tool_call_id": call.get("id") or name,
-                        "name": name,
-                        "content": note,
-                    })
-                    continue
                 if name in ("export_docx", "export_pdf", "export_markdown"):
                     # Defer prose exports to the FINAL answer (built after polish +
                     # verify below) so the downloaded file matches the polished chat
@@ -1226,11 +1213,14 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             doc = _pending_prose_deliverable(pending_exports)
             if doc and len(doc) >= config.POLISH_MIN_CHARS:
                 candidate = doc
+                # Auto-polish any exported document. The model no longer asks for this
+                # (the old polish tool returned a bare "Acknowledged" and the model
+                # spiralled into redrafting the letter 2-3 times). It just writes; we
+                # polish the deliverable behind the scenes.
+                polish_voice = polish_voice or config.AUTO_POLISH_MODEL
 
-        # Polish the final answer only when the agent asked for it (polish tool),
-        # it isn't a clarifying question, AND it is substantial prose. A short
-        # factual/numeric/conversational answer must not pay for a premium Opus
-        # rewrite. Skip polish for user-chosen models.
+        # Polish runs on a substantial deliverable (auto-set above for exports), not a
+        # clarifying question and not a user-chosen model.
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
         prose = None
         if polish_voice and not is_clar and substantial and not is_user_model:
