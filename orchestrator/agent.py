@@ -1523,7 +1523,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                         "rejected": True,
                         "tool": name,
                         "reason": reason or "tool call was not necessary for this request",
-                        "instruction": "Answer the user's actual question directly without this tool.",
+                        "instruction": (
+                            "Answer the user's actual question directly without this tool. "
+                            "If you genuinely cannot answer it from what you know, say so "
+                            "plainly and state what you'd need — NEVER say you will look it "
+                            "up or search later; there is no later, this answer is final."
+                        ),
                     }
                 return call, name, raw
 

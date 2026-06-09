@@ -211,6 +211,12 @@ def _convert_pandoc(markdown: str, fmt: str, extra_args: list[str]) -> bytes:
     has_refs = re.search(r"(?im)^#{0,6}\s*(references|bibliography|works cited|sources)\s*$", markdown)
     if not has_refs:
         markdown = re.sub(r"[ \t]*\[\d+\]", "", markdown)
+    # Remote images would make the converter fetch arbitrary URLs during render (SSRF —
+    # weasyprint/pandoc pull <img src> at conversion time; a prompt-injected
+    # ![](http://169.254.169.254/...) hits internal endpoints from this server). Exports
+    # are documents, not web pages: drop remote-URL images (keep alt text / data: URIs).
+    markdown = re.sub(r"!\[([^\]]*)\]\(\s*https?://[^)]*\)", r"\1", markdown)
+    markdown = re.sub(r"<img\b[^>]*\bsrc\s*=\s*['\"]https?://[^>]*>", "", markdown, flags=re.I)
     with tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False) as tmp:
         out_path = Path(tmp.name)
     try:
