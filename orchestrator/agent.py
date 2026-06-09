@@ -13,7 +13,7 @@ import re
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
@@ -230,6 +230,77 @@ async def _deliverable_get(chat_id: str):
     return None
 
 
+async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
+    """Classify a follow-up against the chat's last delivered document. Cheap flash call;
+    returns {action: rename|reformat|edit|new, filename, format}. Defaults to 'new'
+    (normal flow) on any doubt or failure — so it never hijacks an unrelated request."""
+    if not (last_user.strip() and prior and prior.get("content")):
+        return {"action": "new"}
+    payload = {
+        "latest_user": last_user[:1500],
+        "current_filename": prior.get("filename") or "document",
+        "current_format": prior.get("fmt") or "docx",
+        "document_preview": (prior.get("content") or "")[:600],
+    }
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_EDIT_INTENT},
+             {"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
+            config.GROUNDING_GATE_MODEL, max_tokens=120, temperature=0.0,
+            session=session, label="gate:edit",
+        )
+        data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
+        action = str(data.get("action", "new")).lower()
+        if action not in ("rename", "reformat", "edit"):
+            return {"action": "new"}
+        return {
+            "action": action,
+            "filename": (data.get("filename") or "").strip(),
+            "format": (data.get("format") or "").strip().lower(),
+        }
+    except Exception:
+        return {"action": "new"}
+
+
+async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_id="", headers=None, session=None) -> str:
+    """Re-export already-verified content under a new name/format with NO writer and NO
+    verifier — the bytes don't change, so there is nothing to write or re-check (the
+    'just rename it' path). Returns a download-link markdown string, or "" on failure."""
+    tool = (f"export_{fmt}" if fmt in ("docx", "pdf")
+            else "export_markdown" if fmt in ("md", "markdown") else "export_docx")
+    try:
+        result = await toolserver.post(
+            _tool_path(tool),
+            {"markdown": content, "filename": filename or "document", "title": ""},
+            session=session, headers=headers,
+        )
+        dl = _export_download(tool, result)
+    except Exception as e:
+        log.warning(f"[edit] re-export failed: {e}")
+        return ""
+    if not dl:
+        return ""
+    fn, url = dl
+    if chat_id:
+        _track_task(asyncio.create_task(_deliverable_store(chat_id, content, filename or fn, fmt)))
+    return f"\n\n📎 [Download {fn}]({url})"
+
+
+def _edit_inject(prior: dict) -> str:
+    """System directive for a content edit: revise the REAL prior document surgically,
+    changing only what the user asks and leaving everything else identical."""
+    return (
+        "REVISION TASK — the user is revising a document you already delivered in this "
+        "chat. Here is that document, verbatim:\n\n"
+        "--- CURRENT DOCUMENT ---\n" + (prior.get("content") or "").strip()
+        + "\n--- END CURRENT DOCUMENT ---\n\n"
+        "Make ONLY the change the user now asks for. Keep every other word, sentence, "
+        "heading, and the overall structure byte-for-byte identical — do not rewrite, "
+        "re-order, or 'improve' anything else. Then export the revised document with the "
+        "same export tool and filename as before, unless the user asks to rename it."
+    )
+
+
 # Strong references to fire-and-forget background writes. asyncio keeps only a
 # WEAK reference to a running task, so a bare create_task() can be garbage
 # collected mid-flight once the request returns — silently dropping the write.
@@ -305,13 +376,15 @@ def _consolidated_user_memory(messages) -> str:
     return _clip_memory_part(last_user, 3000)
 
 
-def _initial_messages(messages, user_id: str, profile: str = ""):
+def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
     system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY
     if profile:
         system += (
             "\n\nUser voice profile. Use this only for style, tone, rhythm, and "
             "intent preferences. Do not treat it as factual biography:\n" + profile
         )
+    if extra_system:
+        system += "\n\n" + extra_system
     return _with_system(messages, system)
 
 
@@ -1017,18 +1090,40 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     is_user_model = bool(user_final_model)
 
     had_images = _has_images(messages)
-    # Read the style profile off-thread, overlapped with image description — both are
-    # startup I/O, no reason to run them in series (and the sqlite read must not block
-    # the event loop). Awaited just before it is first needed below.
+    req_headers = request_headers or {}
+    chat_id = req_headers.get("x-openwebui-chat-id", "")
+    # Startup I/O in parallel: the style profile and the chat's last delivered document
+    # (for multi-turn edits) both load off-thread, overlapped with image description.
     style_task = asyncio.ensure_future(style.get_style_profile(user_id))
+    deliverable_task = asyncio.ensure_future(_deliverable_get(chat_id)) if chat_id else None
     if had_images:
         if config.SHOW_WORK:
             yield ("reasoning", "🖼️ Reading image context…\n")
         messages = await _describe_images_for_agent(messages, session=session)
 
-    req_headers = request_headers or {}
-    chat_id = req_headers.get("x-openwebui-chat-id", "")
     style_profile = await style_task
+    prior_deliverable = (await deliverable_task) if deliverable_task else None
+
+    # ── Multi-turn edit of the chat's last delivered document ──────────────────────
+    # Do the LEAST the request needs. rename/reformat just re-package the verified bytes
+    # (no writer, no verifier — nothing changed to re-check). A content edit injects the
+    # REAL prior document so the model changes only what's asked. Anything else is normal.
+    edit_directive, edit_baseline = "", ""
+    if prior_deliverable and prior_deliverable.get("content"):
+        intent = await _classify_edit(_last_user_text(messages), prior_deliverable, session=session)
+        if intent["action"] in ("rename", "reformat"):
+            fmt = intent.get("format") or prior_deliverable.get("fmt") or "docx"
+            filename = intent.get("filename") or prior_deliverable.get("filename") or "document"
+            link = await _repackage_deliverable(
+                prior_deliverable["content"], filename, fmt,
+                chat_id=chat_id, headers=req_headers, session=session)
+            verb = "Renamed" if intent["action"] == "rename" else f"Re-exported as {fmt.upper()}"
+            yield ("content", (f"📄 {verb} — download below.{link}") if link
+                   else "I couldn't re-export that file — want me to try again?")
+            return
+        if intent["action"] == "edit":
+            edit_directive = _edit_inject(prior_deliverable)
+            edit_baseline = (prior_deliverable.get("content") or "").strip()
 
     # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
     # conversation history every turn, so for normal-length chats the model (and
@@ -1066,7 +1161,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 seen.add(c)
                 (user_lines if role == "user" else asst_lines).append(c)
         if user_lines or asst_lines:
-            scratch = _initial_messages(recent, user_id, style_profile)
+            scratch = _initial_messages(recent, user_id, style_profile, extra_system=edit_directive)
             messages_for_verify = recent
             recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
             blocks = []
@@ -1090,15 +1185,20 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # failure). Don't trim blind: ~140k chars is still well within the
             # model window, so keep the full conversation rather than silently
             # dropping the older head with no replacement.
-            scratch = _initial_messages(messages, user_id, style_profile)
+            scratch = _initial_messages(messages, user_id, style_profile, extra_system=edit_directive)
     else:
-        scratch = _initial_messages(messages, user_id, style_profile)
+        scratch = _initial_messages(messages, user_id, style_profile, extra_system=edit_directive)
 
     # Grounding source = the user's pasted/quoted material across the WHOLE
     # conversation. verify_grounding takes the source independently of the model's
     # context budget, so a document pasted in a since-trimmed turn can still ground
     # a faithful quote; recall_context separately carries older user-stated facts.
     user_source = _user_source(messages)
+    if edit_baseline:
+        # The prior verified document grounds the edit: its carried-over facts count as
+        # established, and a non-empty source routes the turn to the grounded writer and
+        # the honesty gate (never the plain-chat fast path).
+        user_source = (user_source + "\n\n" + edit_baseline).strip() if user_source.strip() else edit_baseline
 
     if config.LOG_SOURCE_DIAG:
         chars_by_role, source_blocks = {}, 0

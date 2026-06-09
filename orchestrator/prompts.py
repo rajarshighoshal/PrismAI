@@ -197,6 +197,21 @@ SYSTEM_GATE = (
     "checkable facts does."
 )
 
+SYSTEM_EDIT_INTENT = (
+    "A user already received a finished document earlier in THIS chat. Decide what they "
+    "want now, relative to that document. Return JSON only: {\"action\": "
+    "\"rename\"|\"reformat\"|\"edit\"|\"new\", \"filename\": string, \"format\": "
+    "\"docx\"|\"pdf\"|\"md\"}.\n"
+    "- rename: keep the content EXACTLY; change only the file's name -> put the new name "
+    "(no extension) in filename.\n"
+    "- reformat: keep the content EXACTLY; change only the file TYPE -> put the target in "
+    "format.\n"
+    "- edit: change the document's CONTENT (fix a line, shorten, add or remove text).\n"
+    "- new: a different request, not a revision of that document.\n"
+    "Choose rename/reformat/edit ONLY when the user clearly refers to the existing "
+    "document; otherwise 'new'. filename and format are \"\" unless the user gives them."
+)
+
 SYSTEM_REQUEST_GATE = (
     "Decide if answering this user message needs tools, external/current facts, "
     "sources, file export, or writing about the user that must be verified — versus "

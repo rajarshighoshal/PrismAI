@@ -29,6 +29,17 @@ _verify_queue = []
 _post_queue = []
 _request_work_queue = []
 _stream_out = []
+_edit_intent_queue = []      # responses for the multi-turn edit classifier
+_deliverable_holder = []     # the chat's "prior delivered document" (empty = none)
+
+
+async def _fake_deliverable_get(chat_id, session=None):
+    return _deliverable_holder[0] if _deliverable_holder else None
+
+
+async def _fake_deliverable_store(chat_id, content, filename="", fmt="", session=None):
+    _calls.setdefault("deliverable_store", []).append((chat_id, content, filename, fmt))
+    return True
 
 
 def _tool_call(name, args, call_id="call_1"):
@@ -75,6 +86,8 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
+    if "relative to that document" in sys:  # SYSTEM_EDIT_INTENT
+        return json.dumps(_edit_intent_queue.pop(0) if _edit_intent_queue else {"action": "new"})
     if "needs fact-grounding verification" in sys:  # SYSTEM_GATE
         value = _gate_queue.pop(0) if _gate_queue else False
         return json.dumps({"needs_verification": value, "reason": "test"})
@@ -145,6 +158,8 @@ def _reset():
     _post_queue.clear()
     _request_work_queue.clear()
     _stream_out.clear()
+    _edit_intent_queue.clear()
+    _deliverable_holder.clear()
 
 
 async def _run_tests():
@@ -187,6 +202,8 @@ async def _run_tests():
     fireworks.stream = _fake_stream
     search.search = _fake_search
     toolserver.post = _fake_post
+    agent._deliverable_get = _fake_deliverable_get
+    agent._deliverable_store = _fake_deliverable_store
     toolserver.verify_grounding = _fake_verify
     config.ENABLE_VERIFICATION = True
     config.ENABLE_GROUNDING_GATE = True
@@ -660,6 +677,74 @@ async def _run_tests():
     ev = await _collect([{"role": "user", "content": "Make a short bio and export it as docx."}])
     check("selective: an exported file is verified even when the gate says no",
           _calls["fact_audit"] and _calls["refine_prompts"])
+
+    # ── Multi-turn edit engine: the action is PROPORTIONAL to the request ───────────
+    # RENAME: re-package the already-verified bytes under a new name — NO writer, NO
+    # verifier (nothing changed to re-check). The "just rename it" cut.
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee,\n\nverified letter body.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "rename", "filename": "KTH_Cover_Letter", "format": ""})
+    _post_queue.append([{"status": "success", "filename": "KTH_Cover_Letter.docx",
+                         "download_url": "/api/v1/files/a/content/KTH_Cover_Letter.docx"}])
+    ev = await _collect([{"role": "user", "content": "rename it to KTH_Cover_Letter"}],
+                        request_headers={"x-openwebui-chat-id": "edit1"})
+    body = _content(ev)
+    check("edit/rename: re-exports under the new name with a download link",
+          "Renamed" in body and "KTH_Cover_Letter.docx" in body)
+    check("edit/rename: the writer never runs (pure re-package)", not _calls["chat_models"])
+    check("edit/rename: no honesty audit (bytes unchanged)", not _calls["fact_audit"])
+
+    # REFORMAT: same content, new file type — also mechanical, no writer.
+    _reset()
+    _deliverable_holder[:] = [{"content": "verified body text here", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "reformat", "filename": "", "format": "pdf"})
+    _post_queue.append([{"status": "success", "filename": "letter.pdf",
+                         "download_url": "/api/v1/files/a/content/letter.pdf"}])
+    ev = await _collect([{"role": "user", "content": "give me a pdf version"}],
+                        request_headers={"x-openwebui-chat-id": "edit2"})
+    body = _content(ev)
+    check("edit/reformat: re-exports in the new format, no writer",
+          "PDF" in body and "letter.pdf" in body and not _calls["chat_models"])
+
+    # CONTENT EDIT: the writer runs, handed the REAL prior document to revise surgically.
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee,\n\nI finish my MS in May 2026.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _chat_queue.append(_chat_content("Dear Committee,\n\nI finished my MS in May 2026."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "change 'I finish' to 'I finished'"}],
+                        request_headers={"x-openwebui-chat-id": "edit3"})
+    sysmsgs = json.dumps(_calls["chat_messages"])
+    check("edit/content: the writer runs on the REAL prior document (surgical revision)",
+          bool(_calls["chat_models"]) and "REVISION TASK" in sysmsgs and "I finish my MS in May 2026" in sysmsgs)
+
+    # NEW: an unrelated follow-up must NOT be hijacked into a revision.
+    _reset()
+    _deliverable_holder[:] = [{"content": "prior letter", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "new"})
+    _chat_queue.append(_chat_content("Here is a fresh recommendation letter."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "write a recommendation letter instead"}],
+                        request_headers={"x-openwebui-chat-id": "edit4"})
+    check("edit/new: an unrelated request is not hijacked into a revision",
+          "REVISION TASK" not in json.dumps(_calls["chat_messages"])
+          and _content(ev) == "Here is a fresh recommendation letter.")
+
+    # Streaming guard: a mid-stream crash becomes a graceful message, never a broken
+    # chunked response (which OWUI surfaces as a raw TransferEncodingError).
+    async def _boom(messages, **kw):
+        yield "content", "partial answer"
+        raise RuntimeError("upstream died")
+        yield  # pragma: no cover (marks this an async generator)
+    _orig_agent_run = pipeline._agent_run
+    pipeline._agent_run = _boom
+    try:
+        out = [(k, t) async for k, t in pipeline.run([{"role": "user", "content": "hi"}])]
+    finally:
+        pipeline._agent_run = _orig_agent_run
+    guard_body = "".join(t for k, t in out if k == "content")
+    check("guard: a mid-stream crash yields a graceful retry message, not a broken stream",
+          "partial answer" in guard_body and "try again" in guard_body)
 
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
