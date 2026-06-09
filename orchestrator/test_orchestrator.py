@@ -489,6 +489,23 @@ async def _run_tests():
           "Dear Admissions Committee" not in body and "applying for the doctoral position" not in body)
     check("export-arg: chat shows the download link", "/api/v1/files/L1/content/letter.docx" in body)
 
+    # A model that calls export twice for the same format must yield ONE file + ONE link.
+    _reset()
+    rep = "# Report\n\n" + "Quarterly numbers held steady across all regions. " * 12
+    _post_queue.append([
+        {"status": "success", "filename": "r.docx", "download_url": "/api/v1/files/d/content/r.docx"},
+    ])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": rep, "filename": "r"}),
+                    _tool_call("export_docx", {"markdown": rep, "filename": "r"}, "call_2")),
+        _chat_content(rep),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Write a report and export as docx."}])
+    body = _content(ev)
+    check("export dedup: double export_docx renders one file", len(_calls["post"]) == 1)
+    check("export dedup: one download link", body.count("/api/v1/files/d/content/r.docx") == 1)
+
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()
     _chat_queue.append(_chat_content("The image says the PhD application is due Friday."))

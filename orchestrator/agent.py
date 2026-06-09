@@ -1090,13 +1090,15 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 if name in ("export_docx", "export_pdf", "export_markdown"):
                     # Defer prose exports to the FINAL answer (built after polish +
                     # verify below) so the downloaded file matches the polished chat
-                    # answer rather than this rough mid-draft.
-                    pending_exports.append({
-                        "tool": name,
-                        "markdown": str(args.get("markdown") or ""),
-                        "filename": args.get("filename") or "document",
-                        "title": args.get("title") or "",
-                    })
+                    # answer rather than this rough mid-draft. One file per FORMAT —
+                    # a model that calls export twice must not produce two downloads.
+                    if not any(e["tool"] == name for e in pending_exports):
+                        pending_exports.append({
+                            "tool": name,
+                            "markdown": str(args.get("markdown") or ""),
+                            "filename": args.get("filename") or "document",
+                            "title": args.get("title") or "",
+                        })
                     fmt = name.replace("export_", "")
                     scratch.append({
                         "role": "tool",
