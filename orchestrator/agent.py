@@ -14,7 +14,7 @@ import re
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
-    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
+    SYSTEM_FACT_AUDIT, SYSTEM_FACT_DISTILL, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 
@@ -745,11 +745,30 @@ def _fit_audit_source(source: str, draft: str, budget: int) -> str:
     return "\n\n".join(p for _i, p in kept) or source[:budget]
 
 
-async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None):
+async def _distill_source_facts(source, *, session=None) -> str:
+    """Distill a (possibly multi-file, verbose) source into a compact list of every
+    concrete verifiable fact. The auditor then checks the draft against this short list
+    instead of re-reading the raw source on every pass — which made flash reason for
+    30s+ and truncate its verdict. Extraction, not judgment, so reasoning stays off."""
+    if not source.strip():
+        return ""
+    try:
+        out = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_FACT_DISTILL},
+             {"role": "user", "content": source[:config.AUDIT_SOURCE_BUDGET]}],
+            config.HONESTY_MODEL, max_tokens=2000, temperature=0.0,
+            session=session, label="distill")
+        return (out or "").strip()
+    except Exception:
+        return ""
+
+
+async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
     """The single fact-integrity verifier for ANY written deliverable. Flags only
     unsupported FACTUAL claims (against the user's stated facts + SOURCE + common
-    knowledge); motivation, opinion, and framing pass. Returns {unsupported:[...],
-    verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
+    knowledge); motivation, opinion, and framing pass. `source` may be a distilled fact
+    list; `raw_source` (if given) is the full source, used only for the diagnostic.
+    Returns {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
     if not candidate.strip():
         return None
     fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
@@ -776,15 +795,16 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
         if isinstance(data, dict) and config.LOG_SOURCE_DIAG:
-            # Settle model-vs-bug with data: how many flagged phrases are actually
-            # present in the source (i.e. false positives the auditor mis-flagged)?
-            src_words = set(_WORD_RE.findall(fitted.lower()))
+            # How many flagged phrases are actually present in the FULL source? A high
+            # count means a false positive — either the auditor mis-flagged or the
+            # distilled fact list dropped a real fact (so we'd see it via raw_source).
+            src_words = set(_WORD_RE.findall((raw_source or fitted).lower()))
             def _grounded(p):
                 pw = set(_WORD_RE.findall(str(p).lower())) - {"the","a","an","of","and","to","in","my","i","with","for","at"}
                 return pw and len(pw & src_words) / len(pw) >= 0.6
             flagged = data.get("unsupported") or []
             false_pos = sum(1 for f in flagged if _grounded(f))
-            log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} src_chars={len(fitted)} "
+            log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
                      f"verdict={data.get('verdict')} flagged={len(flagged)} likely_false_pos={false_pos}")
         return data if isinstance(data, dict) else None
     except Exception:
@@ -870,14 +890,19 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
 
     if config.ENABLE_HONESTY_AUDIT:
         def _fab(r): return r and str(r.get("verdict", "")).upper().startswith("FAB")
-        audit = await _fact_audit(full_request, grounding_source, candidate, session=session)
+        # Distill the (possibly multi-file, verbose) source to a compact fact list ONCE,
+        # so the auditor checks the draft against a short list — not 8 raw files on every
+        # pass, which made it reason for 30s+ and truncate its verdict (fail-soft).
+        facts = await _distill_source_facts(grounding_source, session=session)
+        audit_src = facts or grounding_source
+        audit = await _fact_audit(full_request, audit_src, candidate, session=session, raw_source=grounding_source)
         if _fab(audit):
             unsupported = audit.get("unsupported") or []
             refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, session=session)
-            recheck = await _fact_audit(full_request, grounding_source, refined, session=session) if refined else None
+            recheck = await _fact_audit(full_request, audit_src, refined, session=session, raw_source=grounding_source) if refined else None
             if not (refined and not _fab(recheck)):  # surgical patch didn't clear it — redo with feedback
                 refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, session=session)
-                recheck = await _fact_audit(full_request, grounding_source, refined, session=session) if refined else None
+                recheck = await _fact_audit(full_request, audit_src, refined, session=session, raw_source=grounding_source) if refined else None
             if refined and not _fab(recheck):
                 candidate = refined
             else:

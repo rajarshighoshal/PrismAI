@@ -84,6 +84,8 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "proposed web_search is necessary" in sys:
         value = _tool_gate_queue.pop(0) if _tool_gate_queue else True
         return json.dumps({"allow": value, "reason": "test"})
+    if "Extract EVERY concrete" in sys:  # fact distiller — pass the source facts through
+        return messages[1]["content"]
     if "fact-integrity verifier" in sys:  # the one unified fact auditor
         _calls["fact_audit"].append(messages[1]["content"] if len(messages) > 1 else "")
         if _honesty_queue:
@@ -595,8 +597,8 @@ async def _run_tests():
     _orig_store = agent._memory_store
     _audit_inputs = []  # every request+source the unified verifier actually receives
 
-    async def _realistic_fact(full_request, source, candidate, *, session=None):
-        seen = full_request + "\n" + (source or "")
+    async def _realistic_fact(full_request, source, candidate, *, session=None, raw_source=None):
+        seen = full_request + "\n" + (raw_source or source or "")
         _audit_inputs.append(seen)
         bad = [f for f in _SENTINELS if f in candidate and f not in seen]
         return {"unsupported": bad, "verdict": "FABRICATION" if bad else "CLEAN"}
