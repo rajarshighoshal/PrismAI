@@ -1293,6 +1293,13 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             f"[source-diag] user_source_chars={len(user_source)} "
             f"owui_source_blocks={source_blocks} chars_by_role={chars_by_role}"
         )
+        # One-shot structure probe: what OWUI actually sends, and whether the unwrap fires.
+        for i, m in enumerate(messages):
+            t = _text_of(m.get("content"))
+            log.info(f"[msg-struct] #{i} role={m.get('role')} len={len(t)} "
+                     f"task={'### Task' in t} uq={'<user_query>' in t} "
+                     f"head={t[:90].replace(chr(10), '⏎')!r}")
+        log.info(f"[unwrap-check] last_user_unwrapped={_last_user_text(messages)[:90]!r}")
 
     # Plain-chat fast path: stream the answer live when the turn needs no tools,
     # source, or verification. No verifier runs — there is nothing to ground or
