@@ -694,6 +694,17 @@ def _all_user_text(messages) -> str:
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_CLAIM_STOPWORDS = {"the", "a", "an", "of", "and", "to", "in", "my", "i", "with",
+                    "for", "at", "is", "are", "on", "as", "by", "that", "this", "it"}
+
+
+def _claim_in_source(phrase, source_words) -> bool:
+    """True when most of a flagged phrase's distinctive words appear in the source —
+    i.e. the claim is actually grounded and the auditor mis-flagged it. The deterministic
+    backstop that disposes of the LLM auditor's (or the distilled list's) false positives
+    so a real credential is NEVER stripped."""
+    pw = set(_WORD_RE.findall(str(phrase).lower())) - _CLAIM_STOPWORDS
+    return bool(pw) and len(pw & source_words) / len(pw) >= 0.6
 
 
 def _same_doc(a: str, b: str) -> bool:
@@ -799,11 +810,8 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
             # count means a false positive — either the auditor mis-flagged or the
             # distilled fact list dropped a real fact (so we'd see it via raw_source).
             src_words = set(_WORD_RE.findall((raw_source or fitted).lower()))
-            def _grounded(p):
-                pw = set(_WORD_RE.findall(str(p).lower())) - {"the","a","an","of","and","to","in","my","i","with","for","at"}
-                return pw and len(pw & src_words) / len(pw) >= 0.6
             flagged = data.get("unsupported") or []
-            false_pos = sum(1 for f in flagged if _grounded(f))
+            false_pos = sum(1 for f in flagged if _claim_in_source(f, src_words))
             log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
                      f"verdict={data.get('verdict')} flagged={len(flagged)} likely_false_pos={false_pos}")
         return data if isinstance(data, dict) else None
@@ -889,21 +897,32 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     full_request = _all_user_text(messages) + _recall_extra
 
     if config.ENABLE_HONESTY_AUDIT:
-        def _fab(r): return r and str(r.get("verdict", "")).upper().startswith("FAB")
+        src_words = set(_WORD_RE.findall(grounding_source.lower()))
         # Distill the (possibly multi-file, verbose) source to a compact fact list ONCE,
         # so the auditor checks the draft against a short list — not 8 raw files on every
         # pass, which made it reason for 30s+ and truncate its verdict (fail-soft).
         facts = await _distill_source_facts(grounding_source, session=session)
         audit_src = facts or grounding_source
-        audit = await _fact_audit(full_request, audit_src, candidate, session=session, raw_source=grounding_source)
-        if _fab(audit):
-            unsupported = audit.get("unsupported") or []
+
+        async def _flags(text):
+            """Genuinely-unsupported claims in `text`: what the auditor flags, MINUS any
+            phrase whose words are actually in the source. That deterministic backstop
+            disposes of false positives — when the distilled list dropped a real fact, or
+            the auditor over-flagged — so a grounded credential is never stripped. The
+            auditor only proposes; the source decides. [] means clean."""
+            a = await _fact_audit(full_request, audit_src, text, session=session, raw_source=grounding_source)
+            if not (a and str(a.get("verdict", "")).upper().startswith("FAB")):
+                return []
+            return [u for u in (a.get("unsupported") or []) if not _claim_in_source(u, src_words)]
+
+        unsupported = await _flags(candidate)
+        if unsupported:
             refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, session=session)
-            recheck = await _fact_audit(full_request, audit_src, refined, session=session, raw_source=grounding_source) if refined else None
-            if not (refined and not _fab(recheck)):  # surgical patch didn't clear it — redo with feedback
+            remaining = (await _flags(refined)) if refined else unsupported
+            if remaining:  # surgical patch left genuine fabrications — one full-rewrite attempt
                 refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, session=session)
-                recheck = await _fact_audit(full_request, audit_src, refined, session=session, raw_source=grounding_source) if refined else None
-            if refined and not _fab(recheck):
+                remaining = (await _flags(refined)) if refined else unsupported
+            if refined and not remaining:
                 candidate = refined
             else:
                 return "unsupported_claims", _facts_block_msg(unsupported)

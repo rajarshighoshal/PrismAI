@@ -586,6 +586,33 @@ async def _run_tests():
     check("fact verifier: motivation alone does NOT block or alter the writing",
           "deeply drawn to your lab" in _content(ev) and "could not safely finalize" not in _content(ev).lower())
 
+    # REGRESSION — the over-strip bug: the auditor (or a lossy distilled fact list)
+    # flags GROUNDED credentials, ones whose words are right there in the source. The
+    # deterministic backstop must recognize each as present and KEEP it — a real
+    # credential is never stripped just because an LLM mis-flagged it. Every flag here
+    # is a false positive, so nothing genuine remains -> NO refine call at all.
+    _reset()
+    grounded_letter = (
+        "At Clover Health I built a retrieval system delivering a 16,631x speedup, "
+        "work accepted to ICLR 2026, building on prior roles at Microsoft and IBM."
+    )
+    _chat_queue.append(_chat_content(grounded_letter))
+    _honesty_queue.append({
+        "unsupported": ["16,631x speedup", "accepted to ICLR 2026", "Microsoft and IBM"],
+        "verdict": "FABRICATION",
+    })
+    _gate_queue.append(True)
+    ev = await _collect([{"role": "user", "content": (
+        '<source id="1" name="resume.docx">Clover Health: built a retrieval system with a '
+        "16,631x speedup, accepted to ICLR 2026. Prior roles at Microsoft and IBM.</source>\n"
+        "Write a cover letter from my resume."
+    )}])
+    body = _content(ev)
+    check("safeguard: a grounded credential the auditor mis-flagged is NOT stripped",
+          "16,631x" in body and "ICLR 2026" in body and "Microsoft and IBM" in body)
+    check("safeguard: all flags grounded in source -> no wasted refine cycle",
+          not _calls["refine_prompts"])
+
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
     # text the auditor was handed is treated as a fabrication. This makes the
