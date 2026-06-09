@@ -1070,6 +1070,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
 
         if tool_calls:
             scratch.append(_clean_assistant_tool_message(message))
+            executable = []  # search/fetch/etc. — collected here, then run concurrently
             for call in tool_calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
@@ -1115,27 +1116,27 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     web_search_count += 1
                 if config.SHOW_WORK:
                     yield ("reasoning", _tool_status(name, args) + "\n")
-                allowed, reason = await _tool_allowed(
-                    name,
-                    args,
-                    messages,
-                    source,
-                    session=session,
-                )
+                executable.append((call, name, args))
+
+            # Run the batch CONCURRENTLY: when the model fires several searches/fetches
+            # in one step, every result returns in a SINGLE round instead of N
+            # sequential trips. Guard + execute run together, per call.
+            async def _run_tool(call, name, args):
+                allowed, reason = await _tool_allowed(name, args, messages, source, session=session)
                 if allowed:
-                    raw_result = await _execute_tool(
-                        name,
-                        args,
-                        session=session,
-                        headers=request_headers,
-                    )
+                    raw = await _execute_tool(name, args, session=session, headers=request_headers)
                 else:
-                    raw_result = {
+                    raw = {
                         "rejected": True,
                         "tool": name,
                         "reason": reason or "tool call was not necessary for this request",
                         "instruction": "Answer the user's actual question directly without this tool.",
                     }
+                return call, name, raw
+
+            for call, name, raw_result in await asyncio.gather(
+                *[_run_tool(c, n, a) for c, n, a in executable]
+            ):
                 source_text = _source_from_tool(name, raw_result)
                 if source_text:
                     tool_sources.append(source_text)
@@ -1143,20 +1144,16 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 if dl and dl not in export_links:
                     export_links.append(dl)
                 visible = _compact_json(_visible_tool_result(name, raw_result))
-                # External/source-bearing tool output (web, fetched pages,
-                # citations) is untrusted: wrap it so embedded instructions are
-                # treated as data, not commands. Local tools (export/verify) are
-                # not externally sourced and pass through unwrapped.
+                # External/source-bearing tool output (web, fetched pages, citations)
+                # is untrusted: wrap it so embedded instructions are treated as data.
                 if source_text:
                     visible = prompt_security.wrap_untrusted(name, visible)
-                scratch.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id") or name,
-                        "name": name,
-                        "content": visible,
-                    }
-                )
+                scratch.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or name,
+                    "name": name,
+                    "content": visible,
+                })
             continue
 
         candidate = (message.get("content") or "").strip()
