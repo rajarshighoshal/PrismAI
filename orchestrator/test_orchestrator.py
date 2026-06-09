@@ -996,6 +996,12 @@ async def _run_tests():
           key == dedup.make_key(list(msgs), "PrismAI", "user-1"))
     check("dedup: different user -> different key",
           key != dedup.make_key(msgs, "PrismAI", "user-2"))
+    # Identical text in a DIFFERENT chat must run fresh: its side effects (deliverable
+    # store, memory) belong to that chat — a cached answer would leave it with no
+    # document to edit (caught live by smoke round 6's 0-second cache hit).
+    check("dedup: different chat -> different key",
+          dedup.make_key(msgs, "PrismAI", "user-1", "chat-a")
+          != dedup.make_key(msgs, "PrismAI", "user-1", "chat-b"))
 
     # first request leads; an identical one arriving mid-flight follows the SAME future
     mode, fut = dedup.begin(key)

@@ -34,8 +34,10 @@ def enabled() -> bool:
     return getattr(config, "ENABLE_DEDUP", True)
 
 
-def make_key(messages, model: str, user_id: str) -> str:
-    raw = json.dumps([messages, model, user_id], sort_keys=True, default=str, ensure_ascii=True)
+def make_key(messages, model: str, user_id: str, chat_id: str = "") -> str:
+    # chat_id is in the key: identical text in a different chat runs fresh, because its
+    # side effects (deliverable store, chat memory) belong to that chat.
+    raw = json.dumps([messages, model, user_id, chat_id], sort_keys=True, default=str, ensure_ascii=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 

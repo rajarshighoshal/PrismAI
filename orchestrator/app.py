@@ -93,7 +93,12 @@ async def chat_completions(request: Request):
     owui_headers = {k: v for k, v in request_headers.items() if "openwebui" in k}
     log.info(f"[request] user={user_id} model={model} messages={len(messages)} owui_headers={owui_headers}")
 
-    dkey = dedup.make_key(messages, model, user_id) if (dedup.enabled() and messages) else None
+    # The chat id is part of the key: identical text in a DIFFERENT chat must run fresh —
+    # its side effects (deliverable store, memory) belong to that chat, and a cached
+    # answer would leave the new chat with no document to edit.
+    dkey = (dedup.make_key(messages, model, user_id,
+                           request_headers.get("x-openwebui-chat-id", ""))
+            if (dedup.enabled() and messages) else None)
 
     if want_stream:
         async def event_stream():
