@@ -466,9 +466,12 @@ def _now_line() -> str:
     configured local offset (LOCAL_TZ_OFFSET_MINUTES) rather than the server's UTC clock."""
     tz = timezone(timedelta(minutes=config.LOCAL_TZ_OFFSET_MINUTES))
     now = datetime.now(tz)
-    return (f"The current date and time is {now:%A, %d %B %Y, %H:%M} {config.LOCAL_TZ_LABEL}. "
-            "Treat this as 'now' when reasoning about whether any date or time is in the past "
-            "or future.")
+    # Both date orders, so a letterhead in either style ("10 June 2026" / "June 10, 2026")
+    # is a contiguous verbatim span of the grounding source — the backstop then protects a
+    # dated letterhead mechanically regardless of which format the writer picks.
+    return (f"The current date and time is {now:%A, %d %B %Y} ({now:%B %d, %Y}), "
+            f"{now:%H:%M} {config.LOCAL_TZ_LABEL}. Treat this as 'now' when reasoning "
+            "about whether any date or time is in the past or future.")
 
 
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
@@ -1029,7 +1032,7 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
 
 
 async def _refine_facts(full_request: str, source: str, candidate: str, unsupported,
-                        *, rewrite=False, prose=None, session=None) -> str:
+                        *, rewrite=False, prose=None, user_said: str = "", session=None) -> str:
     """Remove the unsupported FACTS the verifier flagged, keeping everything else —
     motivation, framing, tone, structure — exactly. Surgical by default; full rewrite
     only when the draft is too wrong to patch."""
@@ -1045,9 +1048,17 @@ async def _refine_facts(full_request: str, source: str, candidate: str, unsuppor
         "claim leaves the draft thinner, that is fine; do not pad with invented detail. "
         "Output only the revised deliverable."
     )
+    # The user's own statements are a HARD keep-list: when a flagged sentence mixes an
+    # invented elaboration with a fact the user stated, only the elaboration goes — the
+    # live smoke run caught the refiner deleting the whole sentence about half the time
+    # when this was mere prompt nuance instead of an explicit constraint.
+    keep = (f"FACTS THE USER THEMSELVES STATED — these are established; NEVER remove them, "
+            f"even if a flagged claim contains one (trim only the unsupported part):\n"
+            f"{user_said}\n\n") if user_said.strip() else ""
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
         f"SOURCE MATERIAL:\n{source if source.strip() else '(none)'}\n\n"
+        + keep +
         f"UNSUPPORTED CLAIMS TO FIX:\n{listed}\n\n"
         f"DRAFT:\n{candidate}"
     )
@@ -1145,10 +1156,10 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
 
         unsupported = await _flags(candidate)
         if unsupported:
-            refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, session=session)
+            refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, user_said=_user_said, session=session)
             remaining = (await _flags(refined)) if refined else unsupported
             if remaining:  # surgical patch left genuine fabrications — one full-rewrite attempt
-                refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, session=session)
+                refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, user_said=_user_said, session=session)
                 remaining = (await _flags(refined)) if refined else unsupported
             if refined and not remaining:
                 candidate = refined
