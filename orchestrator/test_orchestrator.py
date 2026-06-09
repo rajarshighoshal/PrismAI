@@ -469,6 +469,32 @@ async def _run_tests():
     check("nodupe: chat shows the download link", "/api/v1/files/r1/content/report.docx" in body)
     check("nodupe: file is built from the verified deliverable", _calls["post"][0][1]["markdown"] == report)
 
+    # Regression (the KTH cover-letter bug): the model writes the DOCUMENT in the
+    # export argument and only a SUMMARY as its chat message. The file must carry the
+    # DOCUMENT (verified), never the summary, and the chat must not contain the body.
+    _reset()
+    letter = ("Dear Admissions Committee,\n\n"
+              + "I am applying for the doctoral position because my machine-learning research aligns with the project. " * 9
+              + "\n\nSincerely,\nJane Doe")
+    summ = "Your cover letter has been generated and exported. It opens with your interest, then three paragraphs on research fit, and closes."
+    _post_queue.append([
+        {"status": "success", "filename": "letter.docx",
+         "download_url": "/api/v1/files/L1/content/letter.docx"},
+    ])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": letter, "filename": "letter"})),
+        _chat_content(summ),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Write a cover letter for the PhD and export as docx."}])
+    body = _content(ev)
+    filed = _calls["post"][0][1]["markdown"]
+    check("export-arg: FILE holds the document, not the summary",
+          "Dear Admissions Committee" in filed and "three paragraphs on research fit" not in filed)
+    check("export-arg: chat does NOT contain the document body",
+          "Dear Admissions Committee" not in body and "applying for the doctoral position" not in body)
+    check("export-arg: chat shows the download link", "/api/v1/files/L1/content/letter.docx" in body)
+
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()
     _chat_queue.append(_chat_content("The image says the PhD application is due Friday."))
