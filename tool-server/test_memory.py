@@ -111,6 +111,16 @@ async def main():
     check("deliverable: empty content is not stored", await memory.store_deliverable("d1", "   ") == 0)
     check("deliverable: a different chat is isolated", await memory.get_deliverable("d2") is None)
 
+    # Version history is bounded per chat (no unbounded growth on edit-heavy chats).
+    await _fresh_db()
+    for i in range(memory.DELIVERABLES_MAX_PER_CHAT + 5):
+        await memory.store_deliverable("dcap", f"version {i}")
+    conn = await memory.get_conn()
+    cnt = conn.execute("SELECT COUNT(*) FROM deliverables WHERE chat_id=?", ("dcap",)).fetchone()[0]
+    check("deliverable: history is capped per chat", cnt == memory.DELIVERABLES_MAX_PER_CHAT)
+    check("deliverable: the latest version survives the cap",
+          (await memory.get_deliverable("dcap"))["version"] == memory.DELIVERABLES_MAX_PER_CHAT + 5)
+
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0
 

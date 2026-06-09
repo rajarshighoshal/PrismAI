@@ -37,6 +37,9 @@ MEMORY_TOP_K = int(os.getenv("CHAT_MEMORY_TOP_K", "6"))
 # empty chat. 1 = retrieve whatever is stored when asked.
 MEMORY_MIN_TURNS = int(os.getenv("CHAT_MEMORY_MIN_TURNS", "1"))
 MEMORY_MAX_PER_CHAT = int(os.getenv("CHAT_MEMORY_MAX_TURNS_PER_CHAT", "100"))
+# Keep a bounded version history per chat so an edit-heavy chat can't grow the
+# deliverables table without limit.
+DELIVERABLES_MAX_PER_CHAT = int(os.getenv("DELIVERABLES_MAX_PER_CHAT", "30"))
 ENABLE_CHAT_MEMORY_COMPRESSION = os.getenv(
     "ENABLE_CHAT_MEMORY_COMPRESSION", "true"
 ).lower() not in {"0", "false", "no"}
@@ -389,6 +392,11 @@ async def store_deliverable(chat_id: str, content: str, filename: str = "", fmt:
                 "INSERT INTO deliverables (chat_id, filename, fmt, content, version, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (chat_id, filename, fmt, content, version, time.time()),
+            )
+            # Bound the per-chat history: drop versions older than the most recent N.
+            conn.execute(
+                "DELETE FROM deliverables WHERE chat_id=? AND version <= ?",
+                (chat_id, version - DELIVERABLES_MAX_PER_CHAT),
             )
             conn.commit()
             return version
