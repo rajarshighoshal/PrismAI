@@ -128,7 +128,7 @@ if v2:
     check("T2: the document actually changed", v2["content"] != v1["content"])
 
 print("T3: user-stated fact must survive the verifier …")
-hist, a3 = turn(hist, "also add that I currently work on geometric probes for AI safety "
+hist, a3 = turn(hist, "also add taht I currenlty work on geormetric probes for AI sfety "
                       "and connect it to this position")
 v3 = deliverable()
 check("T3: new version stored", bool(v3) and v2 and v3["version"] > v2["version"])

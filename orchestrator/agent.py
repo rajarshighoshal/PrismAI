@@ -1053,7 +1053,9 @@ async def _refine_facts(full_request: str, source: str, candidate: str, unsuppor
     # live smoke run caught the refiner deleting the whole sentence about half the time
     # when this was mere prompt nuance instead of an explicit constraint.
     keep = (f"FACTS THE USER THEMSELVES STATED — these are established; NEVER remove them, "
-            f"even if a flagged claim contains one (trim only the unsupported part):\n"
+            f"even if a flagged claim contains one (trim only the unsupported part). The "
+            f"user types with typos: match by MEANING, not spelling, and their current "
+            f"statements override older uploaded documents:\n"
             f"{user_said}\n\n") if user_said.strip() else ""
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
@@ -1229,9 +1231,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     gap_note = _gap_note(await active_task) if active_task else ""
 
     # ── Multi-turn edit of the chat's last delivered document ──────────────────────
-    # Do the LEAST the request needs. rename/reformat just re-package the verified bytes
-    # (no writer, no verifier — nothing changed to re-check). A content edit injects the
-    # REAL prior document so the model changes only what's asked. Anything else is normal.
+    # Do the LEAST the request needs, DETERMINISTICALLY. rename/reformat re-package the
+    # verified bytes (no writer, no verifier). A content edit runs a DIRECTED pipeline:
+    # one writer call (revised document as its plain response — no tool choice involved),
+    # verify, then the HARNESS exports with the stored filename/format. The smoke harness
+    # proved any path where the model must CHOOSE to call export is a coin flip.
     edit_directive, edit_baseline = "", ""
     if prior_deliverable and prior_deliverable.get("content"):
         intent = await _classify_edit(_last_user_text(messages), prior_deliverable, session=session)
@@ -1246,8 +1250,50 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                    else "I couldn't re-export that file — want me to try again?")
             return
         if intent["action"] == "edit":
+            if config.SHOW_WORK:
+                yield ("reasoning", "✏️ Revising the document…\n")
+            baseline = (prior_deliverable.get("content") or "").strip()
+            revised = ""
+            try:
+                revised = (await fireworks.complete(
+                    [{"role": "system", "content":
+                        _now_line() + "\n\n" + _edit_inject(prior_deliverable)
+                        + "\n\nOutput ONLY the complete revised document — no commentary, "
+                        "no preamble, no tool calls."},
+                     {"role": "user", "content": _last_user_text(messages)}],
+                    config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
+                    temperature=config.WRITER_TEMPERATURE, session=session,
+                    label="edit:write")).strip()
+            except Exception as e:
+                log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
+            # Sanity: the revision must still BE the document (not an ack/refusal). If it
+            # isn't, fall through to the normal loop with the injected-doc directive.
+            if revised and _same_doc(revised, baseline):
+                if config.SHOW_WORK:
+                    yield ("reasoning", "✍️ Verifying the revision…\n")
+                src = ((_user_source(messages) + "\n\n" + baseline).strip()
+                       if _user_source(messages).strip() else baseline)
+                status, text = await _verified_or_blocked(
+                    messages, revised, src, force=True, session=session)
+                if status != "ok":
+                    yield ("content", text)
+                    return
+                link = await _repackage_deliverable(
+                    text, prior_deliverable.get("filename") or "document",
+                    prior_deliverable.get("fmt") or "docx",
+                    chat_id=chat_id, headers=req_headers, session=session)
+                summary = await _summarize_correction(baseline, text, session=session)
+                yield ("content", ("📄 Updated — download below."
+                       + (("\n\n" + summary) if summary else "") + link) if link
+                       else "I couldn't rebuild the file — want me to try again?")
+                if chat_id:
+                    user_memory = _consolidated_user_memory(messages)
+                    if user_memory:
+                        _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+                    _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
+                return
             edit_directive = _edit_inject(prior_deliverable)
-            edit_baseline = (prior_deliverable.get("content") or "").strip()
+            edit_baseline = baseline
 
     # Extra system context handed to the writer: the resume-after-gap note (if any) and,
     # for a content edit, the prior document to revise.

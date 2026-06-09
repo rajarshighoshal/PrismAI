@@ -35,6 +35,7 @@ _deliverable_holder = []     # the chat's "prior delivered document" (empty = no
 
 
 _last_active_holder = []     # unix time of the chat's previous turn (empty = none)
+_edit_write_queue = []       # directed-edit writer responses (empty/"" = revision fails)
 
 
 async def _fake_deliverable_get(chat_id, session=None):
@@ -94,6 +95,8 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
+    if "REVISION TASK" in sys:  # directed-edit writer (one plain completion, no tools)
+        return _edit_write_queue.pop(0) if _edit_write_queue else ""
     if "relative to that document" in sys:  # SYSTEM_EDIT_INTENT
         return json.dumps(_edit_intent_queue.pop(0) if _edit_intent_queue else {"action": "new"})
     if "needs fact-grounding verification" in sys:  # SYSTEM_GATE
@@ -169,6 +172,7 @@ def _reset():
     _edit_intent_queue.clear()
     _deliverable_holder.clear()
     _last_active_holder.clear()
+    _edit_write_queue.clear()
 
 
 async def _run_tests():
@@ -756,17 +760,20 @@ async def _run_tests():
     check("edit/reformat: re-exports in the new format, no writer",
           "PDF" in body and "letter.pdf" in body and not _calls["chat_models"])
 
-    # CONTENT EDIT: the writer runs, handed the REAL prior document to revise surgically.
+    # CONTENT EDIT — the DIRECTED pipeline: one writer call on the REAL prior document,
+    # verify, then the HARNESS exports with the stored filename/format. No tool-call hope
+    # anywhere (live smoke proved the model skips export ~half the time when asked to).
     _reset()
     _deliverable_holder[:] = [{"content": "Dear Committee,\n\nI finish my MS in May 2026.", "filename": "letter", "fmt": "docx"}]
     _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
-    _chat_queue.append(_chat_content("Dear Committee,\n\nI finished my MS in May 2026."))
-    _gate_queue.append(False)
+    _edit_write_queue.append("Dear Committee,\n\nI finished my MS in May 2026.")
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/d/content/letter.docx"}])
     ev = await _collect([{"role": "user", "content": "change 'I finish' to 'I finished'"}],
                         request_headers={"x-openwebui-chat-id": "edit3"})
-    sysmsgs = json.dumps(_calls["chat_messages"])
-    check("edit/content: the writer runs on the REAL prior document (surgical revision)",
-          bool(_calls["chat_models"]) and "REVISION TASK" in sysmsgs and "I finish my MS in May 2026" in sysmsgs)
+    check("edit/content: directed pipeline ships the revised file with no agent loop",
+          not _calls["chat_models"] and _calls["post"]
+          and "I finished my MS" in _calls["post"][0][1]["markdown"]
+          and "letter.docx" in _content(ev))
 
     # A surgical edit must NOT re-polish / re-voice the whole document: v1 was already
     # polished and voiced; re-running both wastes ~40s and rewrites text the user didn't
@@ -786,11 +793,7 @@ async def _run_tests():
     _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
     edited_letter = prior_letter.replace("doctoral role", "doctoral position")
     _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/e/content/letter.docx"}])
-    _chat_queue.extend([
-        _chat_tools(_tool_call("export_docx", {"markdown": edited_letter, "filename": "letter"})),
-        _chat_content("Updated — file ready."),
-    ])
-    _gate_queue.append(False)
+    _edit_write_queue.append(edited_letter)
     ev = await _collect([{"role": "user", "content": "change 'doctoral role' to 'doctoral position' in the letter"}],
                         request_headers={"x-openwebui-chat-id": "edit6"})
     check("edit/no-repolish: a surgical edit is NOT re-polished or re-voiced",
@@ -798,12 +801,13 @@ async def _run_tests():
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
 
-    # REVISION invariant: if the model 'finishes' an edit WITHOUT re-exporting (live smoke
-    # caught it acknowledging in 174 chars, no file), the harness nudges once and the
-    # revised document still ships as a file.
+    # FALLBACK: if the directed writer fails (empty / not the document), the turn falls
+    # through to the agent loop with the injected doc — and if the model 'finishes' there
+    # WITHOUT re-exporting, the harness nudges once and the revised file still ships.
     _reset()
     _deliverable_holder[:] = [{"content": "Dear Committee, I expect to finish my MS in May 2026.", "filename": "letter", "fmt": "docx"}]
     _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _edit_write_queue.append("")  # directed revision fails -> fall through to the loop
     _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/n/content/letter.docx"}])
     _chat_queue.extend([
         _chat_content("Done — I've updated that line for you."),  # no export call!
