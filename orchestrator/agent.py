@@ -231,6 +231,46 @@ async def _deliverable_get(chat_id: str):
     return None
 
 
+async def _last_active(chat_id: str):
+    """Unix time of the chat's previous stored turn (for resume-after-a-gap awareness), or None."""
+    if not chat_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/memory/last_active",
+                json={"chat_id": chat_id},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("last_active")
+    except Exception:
+        pass
+    return None
+
+
+def _gap_note(last_active) -> str:
+    """One line telling the model the user is RESUMING after a gap — but only when the
+    previous message was a prior calendar day or more (in local time). Same-day follow-ups
+    get nothing, so a continuous session stays clean. Fixes 'replies days later, acts like
+    no time passed' without timestamping every turn."""
+    if not last_active:
+        return ""
+    try:
+        tz = timezone(timedelta(minutes=config.LOCAL_TZ_OFFSET_MINUTES))
+        prev = datetime.fromtimestamp(float(last_active), tz)
+        days = (datetime.now(tz).date() - prev.date()).days
+    except Exception:
+        return ""
+    if days < 1:
+        return ""
+    when = "yesterday" if days == 1 else f"{days} days ago"
+    return (f"NOTE: the user is resuming this conversation after a gap — their previous "
+            f"message was {when} ({prev:%A, %d %B %Y}), not today. Earlier turns are older; "
+            f"don't treat the conversation as one continuous sitting.")
+
+
 async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
     """Classify a follow-up against the chat's last delivered document: rename|reformat|
     edit|new (reasoning-on; a semantic judgement, not keyword matching). run() uses this to
@@ -1110,6 +1150,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # (for multi-turn edits) both load off-thread, overlapped with image description.
     style_task = asyncio.ensure_future(style.get_style_profile(user_id))
     deliverable_task = asyncio.ensure_future(_deliverable_get(chat_id)) if chat_id else None
+    active_task = asyncio.ensure_future(_last_active(chat_id)) if chat_id else None
     if had_images:
         if config.SHOW_WORK:
             yield ("reasoning", "🖼️ Reading image context…\n")
@@ -1117,6 +1158,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
 
     style_profile = await style_task
     prior_deliverable = (await deliverable_task) if deliverable_task else None
+    gap_note = _gap_note(await active_task) if active_task else ""
 
     # ── Multi-turn edit of the chat's last delivered document ──────────────────────
     # Do the LEAST the request needs. rename/reformat just re-package the verified bytes
@@ -1138,6 +1180,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if intent["action"] == "edit":
             edit_directive = _edit_inject(prior_deliverable)
             edit_baseline = (prior_deliverable.get("content") or "").strip()
+
+    # Extra system context handed to the writer: the resume-after-gap note (if any) and,
+    # for a content edit, the prior document to revise.
+    agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
 
     # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
     # conversation history every turn, so for normal-length chats the model (and
@@ -1175,7 +1221,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 seen.add(c)
                 (user_lines if role == "user" else asst_lines).append(c)
         if user_lines or asst_lines:
-            scratch = _initial_messages(recent, user_id, style_profile, extra_system=edit_directive)
+            scratch = _initial_messages(recent, user_id, style_profile, extra_system=agent_extra)
             messages_for_verify = recent
             recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
             blocks = []
@@ -1199,9 +1245,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # failure). Don't trim blind: ~140k chars is still well within the
             # model window, so keep the full conversation rather than silently
             # dropping the older head with no replacement.
-            scratch = _initial_messages(messages, user_id, style_profile, extra_system=edit_directive)
+            scratch = _initial_messages(messages, user_id, style_profile, extra_system=agent_extra)
     else:
-        scratch = _initial_messages(messages, user_id, style_profile, extra_system=edit_directive)
+        scratch = _initial_messages(messages, user_id, style_profile, extra_system=agent_extra)
 
     # Grounding source = the user's pasted/quoted material across the WHOLE
     # conversation. verify_grounding takes the source independently of the model's

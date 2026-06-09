@@ -825,6 +825,10 @@ class DeliverableGetRequest(BaseModel):
     chat_id: str = Field(..., description="OWUI chat ID")
 
 
+class LastActiveRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+
+
 @app.on_event("startup")
 async def startup_init_memory():
     """Pre-init the memory DB on startup so first request is fast."""
@@ -894,3 +898,13 @@ async def deliverable_get(req: DeliverableGetRequest) -> dict:
     """Return the latest stored deliverable for this chat, or null."""
     d = await memory.get_deliverable(req.chat_id)
     return {"chat_id": req.chat_id, "deliverable": d}
+
+
+@app.post(
+    "/memory/last_active",
+    summary="When this chat last had a stored turn (for resume-after-gap awareness)",
+    operation_id="memory_last_active",
+)
+async def memory_last_active(req: LastActiveRequest) -> dict:
+    """Return the unix time of the chat's most recent stored turn, or null."""
+    return {"chat_id": req.chat_id, "last_active": await memory.last_active(req.chat_id)}

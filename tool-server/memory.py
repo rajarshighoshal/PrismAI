@@ -425,6 +425,21 @@ async def get_deliverable(chat_id: str) -> Optional[dict]:
         return None
 
 
+async def last_active(chat_id: str) -> Optional[float]:
+    """Most recent stored-turn time for a chat (unix seconds), or None — lets the agent
+    tell the model how long since the user's previous message (resume-after-gap awareness)."""
+    conn = await get_conn()
+    if not conn or not chat_id:
+        return None
+    try:
+        row = await _db(lambda: conn.execute(
+            "SELECT MAX(created_at) FROM chat_turns WHERE chat_id=?", (chat_id,)
+        ).fetchone())
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
 def _compression_lock(chat_id: str) -> asyncio.Lock:
     lock = _compression_locks.get(chat_id)
     if lock is None:

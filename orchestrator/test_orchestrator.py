@@ -8,6 +8,7 @@ patched so these tests assert harness behavior rather than model quality.
 """
 import asyncio
 import json
+import time
 
 from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver
 
@@ -33,8 +34,15 @@ _edit_intent_queue = []      # responses for the multi-turn edit classifier
 _deliverable_holder = []     # the chat's "prior delivered document" (empty = none)
 
 
+_last_active_holder = []     # unix time of the chat's previous turn (empty = none)
+
+
 async def _fake_deliverable_get(chat_id, session=None):
     return _deliverable_holder[0] if _deliverable_holder else None
+
+
+async def _fake_last_active(chat_id, session=None):
+    return _last_active_holder[0] if _last_active_holder else None
 
 
 async def _fake_deliverable_store(chat_id, content, filename="", fmt="", session=None):
@@ -160,6 +168,7 @@ def _reset():
     _stream_out.clear()
     _edit_intent_queue.clear()
     _deliverable_holder.clear()
+    _last_active_holder.clear()
 
 
 async def _run_tests():
@@ -204,6 +213,7 @@ async def _run_tests():
     toolserver.post = _fake_post
     agent._deliverable_get = _fake_deliverable_get
     agent._deliverable_store = _fake_deliverable_store
+    agent._last_active = _fake_last_active
     toolserver.verify_grounding = _fake_verify
     config.ENABLE_VERIFICATION = True
     config.ENABLE_GROUNDING_GATE = True
@@ -729,6 +739,26 @@ async def _run_tests():
     check("edit/new: an unrelated request is not hijacked into a revision",
           "REVISION TASK" not in json.dumps(_calls["chat_messages"])
           and _content(ev) == "Here is a fresh recommendation letter.")
+
+    # Resume-after-gap: a day+ gap injects a one-line note so the model knows time passed;
+    # a same-day follow-up stays clean (no marker on a continuous session).
+    _reset()
+    _last_active_holder[:] = [time.time() - 3 * 86400]  # previous message ~3 days ago
+    _chat_queue.append(_chat_content("Welcome back — where were we?"))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "ok where were we?"}],
+                        request_headers={"x-openwebui-chat-id": "gap1"})
+    check("gap: a multi-day gap injects a 'resuming after a gap' note",
+          "resuming this conversation after a gap" in json.dumps(_calls["chat_messages"]))
+
+    _reset()
+    _last_active_holder[:] = [time.time()]  # same instant -> same day
+    _chat_queue.append(_chat_content("Sure."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "one more thing"}],
+                        request_headers={"x-openwebui-chat-id": "gap2"})
+    check("gap: a same-day follow-up gets no gap note",
+          "resuming this conversation after a gap" not in json.dumps(_calls["chat_messages"]))
 
 
     # Streaming guard: a mid-stream crash becomes a graceful message, never a broken
