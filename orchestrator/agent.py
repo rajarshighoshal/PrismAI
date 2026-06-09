@@ -3,6 +3,22 @@
 The harness exposes tools and enforces verification. It does not classify the
 turn into prewritten task flows; the model chooses tools, the harness executes
 them, and final output is held until the grounding gate allows it.
+
+The full turn lifecycle (unwrap → startup I/O → vision → edit engine → grounding →
+agent loop → polish/voice → verify → deliver → persist), the model routing table,
+and the standing invariants live in docs/ARCHITECTURE.md — read that first.
+
+Map of this file (in lifecycle order):
+  OWUI parsing      _unwrap_owui, _last_user_text, _owui_source_blocks, _user_source
+  startup I/O       style profile (style.py), _deliverable_get, _last_active, _gap_note
+  vision            _describe_images_for_agent
+  edit engine       _classify_edit, _repackage_deliverable, _edit_inject
+  memory client     _memory_recall, _memory_store (tool-server HTTP)
+  agent loop        run() + tool execution, budgets, SYSTEM_TOOL_GUARD
+  polish & voice    _prose_provider, _classify_voice_register, _voice_pass
+  verification      _verified_or_blocked, _fact_audit, _refine_facts,
+                    _claim_verbatim_in_source (the verbatim backstop)
+  delivery          _export_final, _same_doc, _summarize_correction
 """
 
 import aiohttp
@@ -1306,13 +1322,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             f"[source-diag] user_source_chars={len(user_source)} "
             f"owui_source_blocks={source_blocks} chars_by_role={chars_by_role}"
         )
-        # One-shot structure probe: what OWUI actually sends, and whether the unwrap fires.
-        for i, m in enumerate(messages):
-            t = _text_of(m.get("content"))
-            log.info(f"[msg-struct] #{i} role={m.get('role')} len={len(t)} "
-                     f"task={'### Task' in t} uq={'<user_query>' in t} "
-                     f"head={t[:90].replace(chr(10), '⏎')!r}")
-        log.info(f"[unwrap-check] last_user_unwrapped={_last_user_text(messages)[:90]!r}")
 
     # Plain-chat fast path: stream the answer live when the turn needs no tools,
     # source, or verification. No verifier runs — there is nothing to ground or
