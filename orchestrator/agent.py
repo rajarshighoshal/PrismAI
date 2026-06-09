@@ -14,7 +14,7 @@ import re
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
-    SYSTEM_HONESTY, SYSTEM_APPLICATION_CLAIM_AUDIT, SYSTEM_TOOL_GUARD,
+    SYSTEM_HONESTY, SYSTEM_APPLICATION_CLAIM_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 
@@ -196,22 +196,47 @@ def _track_task(task):
     return task
 
 
+_SOURCE_BLOCK_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S | re.I)
+
+
+def _owui_source_blocks(text: str) -> list[str]:
+    """OpenWebUI injects an attached file's text (paperclip upload) into the chat
+    as <source id=.. name=..>..</source> blocks — by default appended to the final
+    user message, or to the system message when RAG_SYSTEM_CONTEXT is set. The whole
+    injected document lives here verbatim, so this is the authoritative grounding
+    source. Parsing it is what makes file attachments ground correctly WITHOUT the
+    user touching the RAG / full-context toggle — the file's own content, not a
+    fragile ≥120-char paragraph guess that drops short résumé lines."""
+    return [m.strip() for m in _SOURCE_BLOCK_RE.findall(text or "") if m.strip()]
+
+
 def _user_source(messages) -> str:
-    # Grounding "source" = explicitly source-like material the user supplied
-    # (pasted docs, quotes, code blocks, labeled sources/notes/resume/context)
-    # from ANY user turn — NOT ordinary conversational text. Treating every prior
-    # chat message as source forced the grounding+refine loop onto casual
-    # follow-ups ("what's my name?"): slow, and it leaked "the provided source"
-    # into the answer. The conversation itself is still available to the model and
-    # the auditors via `messages`; this is only what gets grounded against.
+    # Grounding "source" has two origins, in priority order:
+    #   1. Files the user ATTACHED — OWUI delivers these as <source> blocks (any
+    #      role). The full document is authoritative; take it whole.
+    #   2. Source-like material the user PASTED inline (quotes, code blocks, labeled
+    #      sources/notes/resume, long paragraphs) in their own turns.
+    # NOT ordinary conversational text — grounding casual follow-ups ("what's my
+    # name?") was slow and leaked "the provided source" into answers. The full
+    # conversation is still available to the model and auditors via `messages`.
     parts = []
     for m in messages:
-        if m.get("role") != "user":
-            continue
-        src = _same_message_source(_text_of(m.get("content")))
-        if src:
-            parts.append(src)
-    return "\n\n".join(parts).strip()
+        text = _text_of(m.get("content"))
+        blocks = _owui_source_blocks(text)
+        parts.extend(blocks)
+        if m.get("role") == "user":
+            # Strip the <source> blocks first so the paragraph heuristic neither
+            # double-counts them nor pulls in their XML wrappers as noise.
+            remainder = _SOURCE_BLOCK_RE.sub("", text) if blocks else text
+            src = _same_message_source(remainder)
+            if src:
+                parts.append(src)
+    seen, out = set(), []
+    for part in parts:
+        if part and part not in seen:
+            seen.add(part)
+            out.append(part)
+    return "\n\n".join(out).strip()
 
 
 def _clip_memory_part(text: str, limit: int) -> str:
@@ -391,25 +416,36 @@ def _export_download(name: str, result):
     return None
 
 
-async def _export_final(pending, prose, messages, source, *, headers=None, session=None) -> str:
-    """Build the deferred export files from the FINAL deliverable (polished, if a
-    prose pass was chosen) so the downloaded file matches the polished chat answer —
-    not the rough mid-draft. Returns the '📎 Download …' links to append."""
-    out = []
+async def _export_final(pending, final_text, prose, messages, source, *, headers=None, session=None):
+    """Build the deferred export files. When the verified chat deliverable IS this
+    document (same text the honesty gate approved), the file carries that verified
+    version — so a surgical correction lands in the file, not the model's raw export
+    argument. When the chat is only a short confirmation and the document lives in the
+    export argument, that argument is used (and polished) instead.
+
+    Returns (links_str, filed_deliverable) — filed_deliverable is True when the file
+    was built from the verified chat body, so the chat must NOT repeat it."""
+    deliverable = (final_text or "").strip()
+    out, filed_deliverable = [], False
     for exp in pending:
-        md = exp["markdown"]
-        if prose is not None and len(md) >= config.POLISH_MIN_CHARS:
-            try:
-                client, pmodel = prose
-                polished = await client.complete(
-                    _prose_polish_messages(messages, md, source), pmodel,
-                    max_tokens=config.DRAFT_MAX_TOKENS,
-                    temperature=config.WRITER_TEMPERATURE, session=session,
-                )
-                if polished and polished.strip():
-                    md = polished.strip()
-            except Exception as e:
-                log.warning(f"[export] polish of deliverable failed, exporting draft: {e}")
+        raw = exp["markdown"]
+        if deliverable and len(deliverable) >= config.POLISH_MIN_CHARS and _same_doc(deliverable, raw):
+            md = deliverable          # verified/corrected version of THIS document
+            filed_deliverable = True
+        else:
+            md = raw                  # document lives in the argument; polish the draft
+            if prose is not None and len(md) >= config.POLISH_MIN_CHARS:
+                try:
+                    client, pmodel = prose
+                    polished = await client.complete(
+                        _prose_polish_messages(messages, md, source), pmodel,
+                        max_tokens=config.DRAFT_MAX_TOKENS,
+                        temperature=config.WRITER_TEMPERATURE, session=session,
+                    )
+                    if polished and polished.strip():
+                        md = polished.strip()
+                except Exception as e:
+                    log.warning(f"[export] polish of deliverable failed, exporting draft: {e}")
         result = await toolserver.post(
             _tool_path(exp["tool"]),
             {"markdown": md, "filename": exp["filename"], "title": exp["title"]},
@@ -418,7 +454,8 @@ async def _export_final(pending, prose, messages, source, *, headers=None, sessi
         dl = _export_download(exp["tool"], result)
         if dl and dl not in out:
             out.append(dl)
-    return ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
+    links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
+    return links, filed_deliverable
 
 
 def _source_from_tool(name: str, result) -> str:
@@ -519,11 +556,32 @@ async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) 
         return ""
 
 
-async def _refine_to_source(source: str, candidate: str, claims: str, *, prose=None, session=None) -> str:
+# Corrections are SURGICAL by default — the draft was already shown to the user, so
+# the verifier patches only the flagged spans and leaves the rest untouched. Only
+# when a surgical patch can't clear the audit (the draft is too wrong to fix in
+# place) do we escalate to a full rewrite-with-feedback by the upstream writer.
+_SURGICAL_DIRECTIVE = (
+    "Make the SMALLEST edit that fixes the flagged problems: change ONLY the specific "
+    "words or sentences that are unsupported, and keep every other sentence, the "
+    "wording, structure, tone, and length EXACTLY as written. Do not re-style, "
+    "re-order, expand, or rewrite anything you are not explicitly fixing."
+)
+_REWRITE_DIRECTIVE = (
+    "The draft has too many unsupported claims to patch in place. Write it again from "
+    "the user's request and the SOURCE, fully addressing the feedback. Use ONLY real, "
+    "supported facts — invent nothing — and keep the requested format and length."
+)
+
+
+def _edit_directive(rewrite: bool) -> str:
+    return _REWRITE_DIRECTIVE if rewrite else _SURGICAL_DIRECTIVE
+
+
+async def _refine_to_source(source: str, candidate: str, claims: str, *, rewrite=False, prose=None, session=None) -> str:
     prompt = (
-        "Revise the draft so every factual claim is supported by SOURCE. Remove "
-        "or qualify unsupported claims; preserve the user's requested format and "
-        "keep the prose polished. Output only the revised final answer."
+        _edit_directive(rewrite) + " "
+        "Make every factual claim supported by SOURCE; remove or qualify unsupported "
+        "claims and preserve the requested format. Output only the revised final answer."
     )
     user = f"SOURCE:\n{source}\n\nUNSUPPORTED CLAIMS:\n{claims}\n\nDRAFT:\n{candidate}"
     return await _refine_complete(prompt, user, prose=prose, session=session)
@@ -625,12 +683,57 @@ def _is_application_writing(messages) -> bool:
     return any(n in text for n in needles)
 
 
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _same_doc(a: str, b: str) -> bool:
+    """True when two texts are clearly the same document (high word overlap) — used to
+    tell 'the chat body IS the exported deliverable' (so the file should carry the
+    verified version and the chat shouldn't repeat it) from 'the chat is a short
+    confirmation and the document lives only in the export argument'."""
+    wa, wb = set(_WORD_RE.findall((a or "").lower())), set(_WORD_RE.findall((b or "").lower()))
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
+
+
+def _fit_audit_source(source: str, draft: str, budget: int) -> str:
+    """Fit `source` into `budget` chars for the auditor WITHOUT head-truncating.
+
+    Head-truncation was the over-strip bug: a long job posting in front pushed the
+    résumé past the cut, so grounded credentials looked unsupported. Real documents
+    (résumé + posting ~11k) fit the budget whole and return unchanged. Only a
+    genuinely oversized source is trimmed — and then by *relevance to the draft*
+    (keep the paragraphs whose vocabulary the draft actually uses, in original
+    order), so the spans a claim is grounded in survive instead of the tail being
+    silently dropped. For sources far beyond one model's window the correct path is
+    chunk-and-audit (union of supported); this helper covers the realistic middle.
+    """
+    source = source.strip()
+    if len(source) <= budget:
+        return source
+    draft_words = set(_WORD_RE.findall(draft.lower()))
+    paras = [p for p in re.split(r"\n\s*\n", source) if p.strip()]
+    scored = [
+        (i, len(draft_words & set(_WORD_RE.findall(p.lower()))), p)
+        for i, p in enumerate(paras)
+    ]
+    kept, used = [], 0
+    for i, _score, p in sorted(scored, key=lambda t: t[1], reverse=True):
+        if used + len(p) > budget:
+            continue
+        kept.append((i, p))
+        used += len(p) + 2
+    kept.sort()
+    return "\n\n".join(p for _i, p in kept) or source[:budget]
+
+
 async def _honesty_audit(full_request: str, candidate: str, *, session=None):
     """Flag claims about the USER the user never stated. Returns the auditor dict
     {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
     if not candidate.strip():
         return None
-    user = f"USER REQUEST:\n{full_request}\n\nDRAFT:\n{candidate[:6000]}"
+    user = f"USER REQUEST:\n{full_request}\n\nDRAFT:\n{candidate[:config.AUDIT_DRAFT_BUDGET]}"
     try:
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_HONESTY},
@@ -650,10 +753,11 @@ async def _honesty_audit(full_request: str, candidate: str, *, session=None):
 async def _application_claim_audit(full_request: str, candidate: str, source: str, *, session=None):
     if not candidate.strip():
         return None
+    fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
-        f"SOURCE:\n{source[:6000] if source.strip() else '(none)'}\n\n"
-        f"DRAFT:\n{candidate[:6000]}"
+        f"SOURCE:\n{fitted if fitted else '(none)'}\n\n"
+        f"DRAFT:\n{candidate[:config.AUDIT_DRAFT_BUDGET]}"
     )
     try:
         raw = await fireworks.complete(
@@ -688,10 +792,11 @@ def _application_audit_issues(audit: dict) -> list[str]:
 
 
 async def _refine_application_claims(full_request: str, candidate: str, source: str,
-                                     audit: dict, *, prose=None, session=None) -> str:
+                                     audit: dict, *, rewrite=False, prose=None, session=None) -> str:
     issues = "\n".join(f"- {i}" for i in _application_audit_issues(audit)) or "(unspecified)"
     prompt = (
-        "Revise the application-writing draft so it is humane, personal, persuasive, "
+        _edit_directive(rewrite) + " "
+        "Keep the application-writing humane, personal, persuasive, "
         "and grounded in reality. Remove or neutralize each unsupported issue. Do "
         "NOT add new candidate achievements, credentials, metrics, years, revenue, "
         "leadership, impact, employers, projects, daily routines, work settings, "
@@ -710,11 +815,12 @@ async def _refine_application_claims(full_request: str, candidate: str, source: 
     return await _refine_complete(prompt, user, prose=prose, session=session)
 
 
-async def _refine_honesty(full_request: str, candidate: str, unsupported, *, prose=None, session=None) -> str:
-    """Rewrite the draft to drop unsupported self-claims WITHOUT inventing replacements."""
+async def _refine_honesty(full_request: str, candidate: str, unsupported, *, rewrite=False, prose=None, session=None) -> str:
+    """Drop unsupported self-claims WITHOUT inventing replacements — surgically."""
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported self-claims)"
     prompt = (
-        "Revise the draft so it makes NO claim about the user that the user did not "
+        _edit_directive(rewrite) + " "
+        "The draft must make NO claim about the user that the user did not "
         "actually state. Remove or neutrally rephrase each listed unsupported claim "
         "WITHOUT inventing replacements or new facts. Keep the requested format and "
         "polished prose. If removing claims leaves the draft thin, that is acceptable "
@@ -732,6 +838,22 @@ def _honesty_block_msg(unsupported) -> str:
         + "\n\nI can still write a truthful version using the facts you provided, "
         "or you can give me the real details and I'll include them accurately."
     )
+
+
+async def _summarize_correction(before: str, after: str, *, session=None) -> str:
+    """One cheap call describing WHAT the verifier changed, so the chat can show the
+    correction in a sentence or two instead of re-dumping the whole deliverable."""
+    if not (before.strip() and after.strip()):
+        return ""
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_CHANGE_SUMMARY},
+             {"role": "user", "content": f"BEFORE:\n{before[:8000]}\n\nAFTER:\n{after[:8000]}"}],
+            config.HONESTY_MODEL, max_tokens=200, temperature=0.0, session=session,
+        )
+        return (raw or "").strip()
+    except Exception:
+        return ""
 
 
 async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", is_app=None, prose=None, session=None):
@@ -762,9 +884,13 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
         honesty = await _honesty_audit(full_request, candidate, session=session)
         if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
             unsupported = honesty.get("unsupported") or []
+            def _fab(r): return r and str(r.get("verdict", "")).upper().startswith("FAB")
             refined = await _refine_honesty(full_request, candidate, unsupported, prose=prose, session=session)
             recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
-            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("FAB")):
+            if not (refined and not _fab(recheck)):  # surgical patch didn't clear it — redo with feedback
+                refined = await _refine_honesty(full_request, candidate, unsupported, rewrite=True, prose=prose, session=session)
+                recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
+            if refined and not _fab(recheck):
                 candidate = refined
                 needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
@@ -772,9 +898,13 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     elif config.ENABLE_APPLICATION_CLAIM_AUDIT and is_app:
         app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
         if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
+            def _unsup(r): return r and str(r.get("verdict", "")).upper().startswith("UNSUPPORTED")
             refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, prose=prose, session=session)
             recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
-            if refined and not (recheck and str(recheck.get("verdict", "")).upper().startswith("UNSUPPORTED")):
+            if not (refined and not _unsup(recheck)):  # surgical patch didn't clear it — redo with feedback
+                refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, rewrite=True, prose=prose, session=session)
+                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
+            if refined and not _unsup(recheck):
                 candidate = refined
                 needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
@@ -814,6 +944,12 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
         second = await toolserver.verify_grounding(grounding_source, refined, session=session)
         if second is not None and second.get("grounded"):
             return "ok", refined
+        # surgical patch still ungrounded — redo from scratch with the same feedback
+        refined = await _refine_to_source(grounding_source, candidate, claims, rewrite=True, prose=prose, session=session)
+        if refined:
+            third = await toolserver.verify_grounding(grounding_source, refined, session=session)
+            if third is not None and third.get("grounded"):
+                return "ok", refined
     return (
         "unsupported",
         "I could not safely finalize this without unsupported claims. The verification gate flagged:\n\n"
@@ -936,6 +1072,18 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # a faithful quote; recall_context separately carries older user-stated facts.
     user_source = _user_source(messages)
 
+    if config.LOG_SOURCE_DIAG:
+        chars_by_role, source_blocks = {}, 0
+        for m in messages:
+            r = m.get("role", "?")
+            t = _text_of(m.get("content"))
+            chars_by_role[r] = chars_by_role.get(r, 0) + len(t)
+            source_blocks += len(_owui_source_blocks(t))
+        log.info(
+            f"[source-diag] user_source_chars={len(user_source)} "
+            f"owui_source_blocks={source_blocks} chars_by_role={chars_by_role}"
+        )
+
     # Plain-chat fast path: stream the answer live when the turn needs no tools,
     # source, or verification. No verifier runs — there is nothing to ground or
     # audit. Anything uncertain falls through to the buffered loop below.
@@ -1023,7 +1171,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     yield ("reasoning", data)
             elif kind == "content":
                 parts.append(data)
-                if stream_live:
+                if stream_live and not pending_exports:
                     yield ("content", data)
             elif kind == "final":
                 message = {"role": "assistant", "content": data["content"],
@@ -1126,7 +1274,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             )
             continue
 
-        streamed_live = stream_live  # this candidate's tokens were shown live
+        # A file export carries the deliverable, so its body is kept out of the chat
+        # (shown as a download + a what-changed note instead) — meaning nothing was
+        # streamed live for it.
+        streamed_live = stream_live and not pending_exports
         is_clar = _is_clarification(candidate)
 
         # User-chosen model: regenerate final answer with their model
@@ -1156,9 +1307,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             if config.SHOW_WORK:
                 yield ("reasoning", "✨ Polishing…\n")
             # messages_for_verify (= the kept tail in overflow) bounds the premium
-            # polish prompt. Stream the polished deliverable live when optimistic
-            # streaming is on — this is the final text the user sees.
+            # polish prompt. Stream the polished deliverable live — but if a file will
+            # carry it, stream into the thinking panel (progress) instead of the chat,
+            # so the document lands in the file, not duplicated in the conversation.
             pmsgs = _prose_polish_messages(messages_for_verify, candidate, source)
+            to_chat = not pending_exports
             try:
                 if config.STREAM_ANSWER:
                     pparts = []
@@ -1168,10 +1321,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     ):
                         if k == "content":
                             pparts.append(t)
-                            yield ("content", t)
+                            yield ("content" if to_chat else "reasoning", t)
                     if "".join(pparts).strip():
                         candidate = "".join(pparts).strip()
-                        streamed_live = True
+                        streamed_live = to_chat
                 else:
                     polish = await prose_client.complete(
                         pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
@@ -1203,17 +1356,32 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
 
         if status == "ok":
-            # Build the deferred prose exports from the FINAL answer now.
-            links += await _export_final(
-                pending_exports, prose, messages_for_verify, source,
+            # Build the deferred prose exports from the FINAL, verified text.
+            file_links, filed_deliverable = await _export_final(
+                pending_exports, text, prose, messages_for_verify, source,
                 headers=request_headers, session=session,
             )
-            if streamed_live:
-                # Already shown live. Emit only what's new: an open correction if the
-                # verifier changed the text, plus any download links.
-                if text.strip() != candidate.strip():
+            links += file_links
+            changed = text.strip() != candidate.strip()
+            summary = await _summarize_correction(candidate, text, session=session) if (changed and filed_deliverable) else ""
+
+            if filed_deliverable:
+                # The file carries the deliverable. The chat never repeats its body —
+                # just a what-changed note (if the verifier touched it) + the download.
+                if changed:
+                    yield ("content", "\n\n---\n\n*Corrected before saving the file:*\n\n"
+                           + (summary or "- Tightened a few details to match your source.") + links)
+                else:
+                    yield ("content", ("\n\n" if streamed_live else "") + "📄 Your file is ready — download below." + links)
+                final_text = text
+            elif streamed_live:
+                # Chat IS the deliverable and was already shown live. Add only what's new:
+                # a what-changed note + corrected text if it was touched, else the links.
+                if changed:
                     final_text = text + links
-                    yield ("content", "\n\n---\n\n*On review I corrected unsupported claims — verified version:*\n\n" + final_text)
+                    yield ("content", "\n\n---\n\n*On review I corrected a few unsupported details:*\n\n"
+                           + (summary or "- Tightened to match your source.")
+                           + "\n\n*Corrected version:*\n\n" + final_text)
                 else:
                     final_text = candidate + links
                     if links:

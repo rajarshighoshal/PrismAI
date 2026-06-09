@@ -196,6 +196,24 @@ DEDUP_WAIT_TIMEOUT = float(os.getenv("DEDUP_WAIT_TIMEOUT", "90"))
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
 PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 
+# The honesty / application-claim auditors must see the WHOLE source they judge a
+# draft against. The old hard [:6000] clip silently dropped the tail of a long
+# source — e.g. a job posting (~6k chars) concatenated before a résumé pushed the
+# résumé's later roles past the cut, so real, grounded credentials looked
+# "unsupported" and got stripped. The auditor model has a large context; these
+# budgets only bound pathological inputs, not real documents. If a source ever
+# exceeds this, trim by relevance to the draft (see agent._fit_audit_source), never
+# by head.
+AUDIT_SOURCE_BUDGET = int(os.getenv("AUDIT_SOURCE_BUDGET", "60000"))
+AUDIT_DRAFT_BUDGET = int(os.getenv("AUDIT_DRAFT_BUDGET", "16000"))
+
+# One-line diagnostic: how big the extracted grounding source is vs. the raw chars
+# per role. Decisive for "did the uploaded file even reach `source`?" — if a large
+# system/context block exists but user_source stays small, OWUI is RAG-injecting the
+# file where the user-only source extractor can't see it. Logs COUNTS only, never
+# content; safe to leave on.
+LOG_SOURCE_DIAG = _flag("LOG_SOURCE_DIAG", "true")
+
 # On an ungrounded deliverable, run one refine pass that strips/fixes the
 # unsupported claims and append the corrected version. Off -> warn-only footer.
 ENABLE_REFINE = _flag("ENABLE_REFINE", "true")

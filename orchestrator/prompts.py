@@ -277,6 +277,14 @@ SYSTEM_APPLICATION_CLAIM_AUDIT = (
     "\"verdict\":\"CLEAN\"|\"UNSUPPORTED\"}."
 )
 
+SYSTEM_CHANGE_SUMMARY = (
+    "You are shown a BEFORE and AFTER version of a piece of writing that an honesty "
+    "verifier corrected. In 1-3 short bullet points, state plainly what was changed "
+    "and why, in the second person (e.g. '- Dropped the line about managing 25 people "
+    "— it wasn't in your source'). Be specific and brief. Do NOT restate the full text "
+    "or quote long passages. If only wording changed, say '- Minor wording only.'"
+)
+
 SYSTEM_TOOL_GUARD = (
     "Decide whether a proposed tool call is necessary for the user's actual "
     "request. Return JSON only: {\"allow\": boolean, \"reason\": string}. "
