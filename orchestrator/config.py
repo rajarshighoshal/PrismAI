@@ -114,6 +114,10 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # revert to the heavier auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
 HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
+# The honesty audit is a careful grounding task, not a snap classifier: run flash WITH
+# chain-of-thought so it actually locates each credential in the source instead of
+# guessing "unsupported" and over-stripping. Empty string = no reasoning (snap mode).
+AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "medium") or None
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))

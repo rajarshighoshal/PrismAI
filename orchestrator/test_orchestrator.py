@@ -70,7 +70,7 @@ async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, se
                      "finish_reason": item.get("finish_reason")})
 
 
-async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None, label=""):
+async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None, label="", reasoning_effort=None):
     _calls["complete_models"].append(model)
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
