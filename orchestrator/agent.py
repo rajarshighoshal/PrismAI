@@ -121,19 +121,27 @@ async def _classify_edit_once(payload, *, session=None) -> dict:
     return {"action": "new", "filename": "", "format": ""}
 
 
-async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
+async def _classify_edit(last_user: str, prior: dict, *, messages=None, session=None) -> dict:
     """Classify a follow-up against the chat's last delivered document: rename|reformat|
     edit|new (reasoning-on; a semantic judgement, not keyword matching).
 
-    The two misroute directions are NOT symmetric: new-misread-as-edit is self-correcting
-    (the revision fails _same_doc and falls back to the normal flow), while
-    edit-misread-as-new silently drops the user's document (live smoke caught the flash
-    classifier flaking ~1 in 4 on typo-heavy edits). So a 'new' verdict must win TWICE —
-    one extra cheap call in the rare case, biased toward the self-correcting direction."""
+    The judge gets the RECENT CONVERSATION, not just the lone message — follow-ups are
+    anaphoric ("also add…", "connect it to this position") and unclassifiable without
+    their antecedent (live smoke proved a context-starved judge reads them as 'new').
+    And the two misroute directions are NOT symmetric: new-misread-as-edit is
+    self-correcting (the revision fails _same_doc and falls back to the normal flow),
+    while edit-misread-as-new silently drops the user's document — so a 'new' verdict
+    must win TWICE, biasing the rare flake toward the recoverable direction."""
     last_user = (last_user or "").strip()
     if not (last_user and prior and prior.get("content")):
         return {"action": "new"}
+    recent = ""
+    if messages:
+        turns = [f"[{m.get('role')}]: {_unwrap_owui(_text_of(m.get('content')))[:200]}"
+                 for m in messages[:-1] if m.get("role") in ("user", "assistant")]
+        recent = "\n".join(turns[-4:])
     payload = {
+        "recent_conversation": recent,
         "latest_user": last_user[:1500],
         "current_filename": prior.get("filename") or "document",
         "current_format": prior.get("fmt") or "docx",
@@ -643,7 +651,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # proved any path where the model must CHOOSE to call export is a coin flip.
     edit_directive, edit_baseline = "", ""
     if prior_deliverable and prior_deliverable.get("content"):
-        intent = await _classify_edit(_last_user_text(messages), prior_deliverable, session=session)
+        intent = await _classify_edit(_last_user_text(messages), prior_deliverable,
+                                      messages=messages, session=session)
         if intent["action"] in ("rename", "reformat"):
             fmt = intent.get("format") or prior_deliverable.get("fmt") or "docx"
             filename = intent.get("filename") or prior_deliverable.get("filename") or "document"

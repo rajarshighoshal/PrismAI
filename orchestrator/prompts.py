@@ -205,7 +205,9 @@ SYSTEM_GATE = (
 
 SYSTEM_EDIT_INTENT = (
     "A user already received a finished document (a file) earlier in THIS chat. Their new "
-    "message is below. Decide what they want now, relative to that document. Return JSON "
+    "message is below, with the recent conversation for context — follow-ups are often "
+    "anaphoric ('also add…', 'connect it…') and only make sense against the turns before. "
+    "Decide what they want now, relative to that document. Return JSON "
     "only: {\"action\": \"rename\"|\"reformat\"|\"edit\"|\"new\", \"filename\": string, "
     "\"format\": \"docx\"|\"pdf\"|\"md\"}.\n"
     "- edit: any request to change the document's CONTENT — update/revise/fix/correct it, "
