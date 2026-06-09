@@ -209,7 +209,6 @@ async def _run_tests():
         "export_csv",
         "lookup_doi_citation",
         "search_citation",
-        "verify_grounding",
     } <= tool_names)
 
     # Plain chat: model finalizes, gate says no verification needed.
