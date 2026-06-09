@@ -100,9 +100,13 @@ async def _describe_images_for_agent(messages, *, session=None):
             description = "Image was attached, but the vision transcription failed."
         combined = user_text
         if description.strip():
+            # Frame the vision output as the ASSISTANT's own sight of the image, not as
+            # text the user pasted — otherwise the agent disclaims "I'm text-only, based
+            # on the transcription you provided" (factually right, but it never saw a
+            # user transcription; the system's vision step produced it).
             combined = (
                 (combined + "\n\n") if combined else ""
-            ) + "Image transcription/description:\n" + description.strip()
+            ) + "[What you see in the image the user attached:]\n" + description.strip()
         new_m = dict(m)
         new_m["content"] = combined or "Image was attached, but no text was available."
         return new_m
