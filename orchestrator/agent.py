@@ -104,12 +104,16 @@ def _with_system(messages, system_text):
 
 
 async def _classify_edit_once(payload, *, session=None) -> dict:
+    # The PRO model judges this gate: flash-at-low-reasoning misread even "can you
+    # update the doc?" as 'new' (live smoke, repeatedly, regardless of prompt wording).
+    # The gate only fires in chats that already delivered a document — pennies, and a
+    # wrong verdict here silently drops the user's document.
     try:
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_EDIT_INTENT},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
-            config.GROUNDING_GATE_MODEL, max_tokens=160, temperature=0.0,
-            reasoning_effort="low", session=session, label="gate:edit",
+            config.GROUNDED_MODEL, max_tokens=600, temperature=0.0,
+            session=session, label="gate:edit",
         )
         data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
         a = str(data.get("action", "new")).lower()
