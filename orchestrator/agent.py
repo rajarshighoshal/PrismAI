@@ -841,10 +841,12 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
     grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
-    # A cheap classifier decides whether this turn asserts facts worth checking at all
-    # — plain chat, opinion, and pure brainstorming skip straight through.
+    # A cheap classifier lets PLAIN, source-less chat skip straight through. But if the
+    # user supplied source material, this is a grounded deliverable — ALWAYS audit it,
+    # never trust the snap gate to skip verification (a flaky "no" once let a whole
+    # cover letter through unchecked).
     needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-    if not needs:
+    if not needs and not grounding_source.strip():
         return "ok", candidate
 
     full_request = _all_user_text(messages) + _recall_extra

@@ -117,7 +117,7 @@ HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v
 # The honesty audit is a careful grounding task, not a snap classifier: run flash WITH
 # chain-of-thought so it actually locates each credential in the source instead of
 # guessing "unsupported" and over-stripping. Empty string = no reasoning (snap mode).
-AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "medium") or None
+AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "low") or None
 # Reasoning-mode flash spends tokens THINKING before the JSON verdict, so the cap must
 # leave room for both — 900 truncated the verdict on a big source and the audit
 # fail-softed (didn't actually verify). Generous so the audit always completes.
