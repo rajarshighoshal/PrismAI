@@ -83,7 +83,8 @@ chunked response.
 | Job | Model |
 |---|---|
 | writer (grounded + chat) | deepseek-v4-pro |
-| gates/classifiers (verify? edit? voice? work?) + honesty audit | deepseek-v4-flash |
+| gates/classifiers (verify? voice? work?) + honesty audit | deepseek-v4-flash |
+| edit-intent gate (a wrong verdict drops the user's doc) | deepseek-v4-pro, 'new' must win twice |
 | vision | kimi-k2p6 |
 | export polish | gpt-5.5 |
 | voice pass | claude-sonnet-4-6 |
