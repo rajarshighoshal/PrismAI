@@ -231,18 +231,11 @@ async def _deliverable_get(chat_id: str):
     return None
 
 
-_EDIT_VERB = re.compile(
-    r"\b(updat|chang|fix|correct|revis|edit|reword|re-?writ|re-?do|shorten|lengthen|"
-    r"expand|tweak|amend|adjust|replac|remov|delet|rename|rephras|polish|trim|redo)\w*", re.I)
-_DOC_REF = re.compile(
-    r"\b(doc|document|letter|file|cover\s?letter|resume|cv|essay|report|bio|it|this|that)\b", re.I)
-
-
 async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
     """Classify a follow-up against the chat's last delivered document: rename|reformat|
-    edit|new. Returns {action, filename, format}. A deterministic backstop overrides a
-    flaky 'new' when the message plainly asks to change THIS document — missing an edit
-    (and reconstructing a DIFFERENT document) is the worse failure here."""
+    edit|new (reasoning-on; a semantic judgement, not keyword matching). run() uses this to
+    pick the rename/reformat fast path and whether to hand the writer the prior document.
+    Returns {action, filename, format}."""
     last_user = (last_user or "").strip()
     if not (last_user and prior and prior.get("content")):
         return {"action": "new"}
@@ -267,10 +260,6 @@ async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
             fmt = (data.get("format") or "").strip().lower()
     except Exception:
         pass
-    # Backstop: never fall back to reconstructing when the user plainly asked to change
-    # THIS document (an edit verb + a reference to the doc), even if the classifier flaked.
-    if action == "new" and _EDIT_VERB.search(last_user) and _DOC_REF.search(last_user):
-        action = "edit"
     log.info(f"[edit-intent] action={action} msg={last_user[:80]!r}")
     return {"action": action, "filename": filename, "format": fmt}
 
