@@ -103,20 +103,7 @@ def _with_system(messages, system_text):
     return [{"role": "system", "content": system_text}] + out
 
 
-async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
-    """Classify a follow-up against the chat's last delivered document: rename|reformat|
-    edit|new (reasoning-on; a semantic judgement, not keyword matching). run() uses this to
-    pick the rename/reformat fast path and whether to hand the writer the prior document.
-    Returns {action, filename, format}."""
-    last_user = (last_user or "").strip()
-    if not (last_user and prior and prior.get("content")):
-        return {"action": "new"}
-    payload = {
-        "latest_user": last_user[:1500],
-        "current_filename": prior.get("filename") or "document",
-        "current_format": prior.get("fmt") or "docx",
-    }
-    action, filename, fmt = "new", "", ""
+async def _classify_edit_once(payload, *, session=None) -> dict:
     try:
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_EDIT_INTENT},
@@ -127,13 +114,37 @@ async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
         data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
         a = str(data.get("action", "new")).lower()
         if a in ("rename", "reformat", "edit"):
-            action = a
-            filename = (data.get("filename") or "").strip()
-            fmt = (data.get("format") or "").strip().lower()
+            return {"action": a, "filename": (data.get("filename") or "").strip(),
+                    "format": (data.get("format") or "").strip().lower()}
     except Exception:
         pass
-    log.info(f"[edit-intent] action={action} msg={last_user[:80]!r}")
-    return {"action": action, "filename": filename, "format": fmt}
+    return {"action": "new", "filename": "", "format": ""}
+
+
+async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
+    """Classify a follow-up against the chat's last delivered document: rename|reformat|
+    edit|new (reasoning-on; a semantic judgement, not keyword matching).
+
+    The two misroute directions are NOT symmetric: new-misread-as-edit is self-correcting
+    (the revision fails _same_doc and falls back to the normal flow), while
+    edit-misread-as-new silently drops the user's document (live smoke caught the flash
+    classifier flaking ~1 in 4 on typo-heavy edits). So a 'new' verdict must win TWICE —
+    one extra cheap call in the rare case, biased toward the self-correcting direction."""
+    last_user = (last_user or "").strip()
+    if not (last_user and prior and prior.get("content")):
+        return {"action": "new"}
+    payload = {
+        "latest_user": last_user[:1500],
+        "current_filename": prior.get("filename") or "document",
+        "current_format": prior.get("fmt") or "docx",
+    }
+    result = await _classify_edit_once(payload, session=session)
+    if result["action"] == "new":
+        second = await _classify_edit_once(payload, session=session)
+        if second["action"] != "new":
+            result = second
+    log.info(f"[edit-intent] action={result['action']} msg={last_user[:80]!r}")
+    return result
 
 
 async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_id="", headers=None, session=None) -> str:

@@ -801,6 +801,19 @@ async def _run_tests():
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
 
+    # DOUBLE-VOTE: a flaky 'new' verdict must win twice — the second vote rescues an
+    # edit (live smoke caught the classifier flaking ~1 in 4 on typo-heavy edit messages,
+    # silently dropping the document). First vote new, second edit -> directed pipeline.
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee,\n\nI study probes in ML systems today.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.extend([{"action": "new"}, {"action": "edit", "filename": "", "format": ""}])
+    _edit_write_queue.append("Dear Committee,\n\nI study geometric probes in ML systems today.")
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/v/content/letter.docx"}])
+    ev = await _collect([{"role": "user", "content": "also add taht I work on geormetric probes"}],
+                        request_headers={"x-openwebui-chat-id": "edit8"})
+    check("edit/double-vote: a flaky 'new' is overruled by the second vote and the edit ships",
+          _calls["post"] and "geometric probes" in _calls["post"][0][1]["markdown"])
+
     # FALLBACK: if the directed writer fails (empty / not the document), the turn falls
     # through to the agent loop with the injected doc — and if the model 'finishes' there
     # WITHOUT re-exporting, the harness nudges once and the revised file still ships.
