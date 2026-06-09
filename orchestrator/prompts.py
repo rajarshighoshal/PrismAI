@@ -232,6 +232,16 @@ SYSTEM_FACT_AUDIT = (
     "\"FABRICATION\" if any unsupported factual claim exists, else \"CLEAN\"}."
 )
 
+SYSTEM_FACT_DISTILL = (
+    "Extract EVERY concrete, verifiable fact from the source material into a compact "
+    "bullet list — leave nothing checkable out. Include names, employers, job titles, "
+    "dates and durations, degrees and institutions, publications and venues, metrics and "
+    "numbers, projects, achievements, tools and skills, and any organization, person, or "
+    "project the source names. Copy figures EXACTLY (e.g. '16,631x speedup', "
+    "'$1.5M/month', 'p<0.001'). One fact per line, terse. Do NOT add, infer, generalize, "
+    "or omit — only what the source states. Output the bullet list only."
+)
+
 SYSTEM_VOICE_REGISTER = (
     "Pick the voice register for a finished written deliverable — the touch that makes "
     "it read like a person wrote it. Return JSON only: "
