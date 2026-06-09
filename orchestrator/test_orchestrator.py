@@ -18,6 +18,7 @@ _calls = {
     "search": [],
     "post": [],
     "verify": [],
+    "refine_prompts": [],
 }
 _chat_queue = []
 _gate_queue = []
@@ -97,7 +98,8 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
             "acceptable_framing": [],
             "verdict": "CLEAN",
         })
-    if "Revise the draft" in sys or "Revise the application-writing draft" in sys:
+    if "Make the SMALLEST edit" in sys or "Write it again from" in sys:  # surgical or rewrite refine
+        _calls["refine_prompts"].append(sys)
         return "Corrected final answer."
     return "completion"
 
@@ -162,6 +164,32 @@ async def _run_tests():
         print(f"{'PASS' if cond else 'FAIL'}: {name}")
         if not cond:
             fails.append(name)
+
+    # --- unit: OWUI file-attachment grounding via <source> blocks ---
+    # OWUI delivers a paperclip upload as a <source> block (default: appended to the
+    # user message). The old extractor only knew pasted prose and dropped short
+    # resume lines (<120 chars), so grounded credentials looked unsupported and got
+    # stripped. These lock in that the file's content now becomes grounding source.
+    owui_msg = [{"role": "user", "content": (
+        "Write a cover letter for this posting.\n\n"
+        '<source id="1" name="Resume.docx">\n'
+        "Jane Doe - Backend Engineer\n"
+        "Acme Corp | Payments platform, 2M req/day\n"
+        "Globex | Search relevance across 13 services\n"
+        "Initech | cut infra spend ~$1.5M/year\n"
+        "</source>"
+    )}]
+    owui_src = agent._user_source(owui_msg)
+    check("source: OWUI <source> file block captured", "Acme Corp" in owui_src)
+    check("source: short resume lines survive (no >=120 drop)", "Globex | Search relevance across 13 services" in owui_src)
+    check("source: <source> wrapper tags stripped", "<source" not in owui_src and "</source>" not in owui_src)
+    sys_inject = [
+        {"role": "system", "content": '<source id="2" name="r.docx">Initech | fraud savings ~$100K/year</source>'},
+        {"role": "user", "content": "Draft it."},
+    ]
+    check("source: <source> in system role also captured", "Initech | fraud savings" in agent._user_source(sys_inject))
+    check("source: casual chat is not grounding source",
+          agent._user_source([{"role": "user", "content": "what's my name?"}]) == "")
 
     fireworks.chat = _fake_chat
     fireworks.stream_chat = _fake_stream_chat
@@ -304,6 +332,8 @@ async def _run_tests():
     ev = await _collect([{"role": "user", "content": "Write a one-line professional bio emphasizing my leadership and revenue impact."}])
     check("honesty: fabrication refined out (original claim not shown)",
           "10 years" not in _content(ev) and _content(ev) == "Corrected final answer.")
+    check("honesty: first correction is SURGICAL (minimal edit, not a rewrite)",
+          _calls["refine_prompts"] and "SMALLEST edit" in _calls["refine_prompts"][0])
 
     _reset()
     _saved_repair = config.GROUNDING_REPAIR_STEPS
@@ -311,7 +341,9 @@ async def _run_tests():
     _chat_queue.append(_chat_content("I led a 50-person team for 12 years."))
     _gate_queue.append(True)  # gate flags claims about the user -> audit runs
     _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})
-    _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})  # persists
+    # persists through BOTH the surgical patch recheck and the rewrite-with-feedback recheck
+    _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})
+    _honesty_queue.append({"unsupported": ["50-person team for 12 years"], "verdict": "FABRICATION"})
     ev = await _collect([{"role": "user", "content": "Write a one-line bio about my management track record."}])
     check("honesty: persistent fabrication is BLOCKED, not shown",
           "can't present those claims" in _content(ev).lower())
@@ -414,6 +446,28 @@ async def _run_tests():
     check("export: final text returned", _content(ev).startswith("Exported draft.md."))
     check("export: download link surfaced", "/api/v1/files/abc123/content/draft.md" in _content(ev))
     check("export: file built from the deliverable, deferred to the final answer", _calls["post"][0][1]["markdown"] == "# Draft")
+
+    # No double-dump: when a file carries the deliverable, the chat shows a link + a
+    # short note — NOT a second copy of the document body (file = deliverable,
+    # chat = pointer). And the file is built from the VERIFIED final text.
+    _reset()
+    report = ("# Quarterly Report\n\n"
+              + "Revenue grew steadily across all regions this quarter. " * 12
+              + "\n\nOperational costs held flat while headcount rose modestly.")
+    _post_queue.append([
+        {"status": "success", "filename": "report.docx",
+         "download_url": "/api/v1/files/r1/content/report.docx"},
+    ])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": report, "filename": "report"})),
+        _chat_content(report),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Turn my notes into a quarterly report and export as docx."}])
+    body = _content(ev)
+    check("nodupe: deliverable body is NOT repeated in chat", "Revenue grew steadily" not in body)
+    check("nodupe: chat shows the download link", "/api/v1/files/r1/content/report.docx" in body)
+    check("nodupe: file is built from the verified deliverable", _calls["post"][0][1]["markdown"] == report)
 
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()
