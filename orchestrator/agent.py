@@ -416,6 +416,19 @@ def _export_download(name: str, result):
     return None
 
 
+def _pending_prose_deliverable(pending) -> str:
+    """The markdown of the largest pending prose export (docx/pdf/md). The model
+    typically writes the actual document in the export ARGUMENT and only a summary as
+    its chat message, so this — not the chat content — is the real deliverable to
+    verify, polish, and file."""
+    docs = [
+        str(e.get("markdown") or "")
+        for e in pending
+        if e.get("tool") in ("export_docx", "export_pdf", "export_markdown")
+    ]
+    return max(docs, key=len) if docs else ""
+
+
 async def _export_final(pending, final_text, prose, messages, source, *, headers=None, session=None):
     """Build the deferred export files. When the verified chat deliverable IS this
     document (same text the honesty gate approved), the file carries that verified
@@ -687,11 +700,18 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 def _same_doc(a: str, b: str) -> bool:
-    """True when two texts are clearly the same document (high word overlap) — used to
-    tell 'the chat body IS the exported deliverable' (so the file should carry the
-    verified version and the chat shouldn't repeat it) from 'the chat is a short
-    confirmation and the document lives only in the export argument'."""
-    wa, wb = set(_WORD_RE.findall((a or "").lower())), set(_WORD_RE.findall((b or "").lower()))
+    """True when two texts are clearly the same document — used to tell 'the chat body
+    IS the exported deliverable' from 'the chat is a short summary/confirmation while
+    the document lives in the export argument'. Requires BOTH similar length and high
+    word overlap: a summary OF a document shares its vocabulary but is far shorter, so
+    the length gate stops it from being mistaken for the document itself."""
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return False
+    lo, hi = sorted((len(a), len(b)))
+    if lo / hi < 0.6:  # very different lengths -> one is a summary/note, not the doc
+        return False
+    wa, wb = set(_WORD_RE.findall(a.lower())), set(_WORD_RE.findall(b.lower()))
     if not wa or not wb:
         return False
     return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
@@ -1293,6 +1313,16 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # if regen is empty (API failure or non-Fireworks model), keep agent draft
         elif is_user_model and is_clar:
             pass  # keep clarification as-is
+
+        # If the model produced a prose FILE, the export ARGUMENT is the real
+        # deliverable — the model often writes the document in the export call and only
+        # a summary as its chat message. Make THAT the thing we polish, verify, and
+        # file, so the file carries the verified document (not the summary) and the
+        # chat is just a note. This also routes the document through the honesty gate.
+        if not is_user_model and not is_clar:
+            doc = _pending_prose_deliverable(pending_exports)
+            if doc and len(doc) >= config.POLISH_MIN_CHARS:
+                candidate = doc
 
         # Polish the final answer only when the agent asked for it (polish tool),
         # it isn't a clarifying question, AND it is substantial prose. A short
