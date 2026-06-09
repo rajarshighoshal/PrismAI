@@ -11,6 +11,7 @@ except ImportError:
     aiohttp = None
 
 from . import config
+from . import perf as _perf
 
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -33,7 +34,7 @@ def available() -> bool:
     return bool(config.GOOGLE_API_KEY) and config.ENABLE_GEMINI_PROSE
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None) -> str:
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, label="") -> str:
     """Non-streaming completion. Returns the final answer text."""
     result = await chat(
         messages,
@@ -41,6 +42,7 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
         max_tokens=max_tokens,
         temperature=temperature,
         session=session,
+        label=label,
     )
     return (result.get("message", {}).get("content") or "").strip()
 
@@ -52,6 +54,7 @@ async def chat(
     max_tokens,
     temperature=None,
     session=None,
+    label="",
 ) -> dict:
     """Non-streaming chat completion.
 
@@ -68,6 +71,7 @@ async def chat(
             "max_tokens": max_tokens,
             "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
         }
+        t0 = _perf.now()
         async with session.post(
             f"{GEMINI_BASE_URL}/chat/completions",
             headers=_headers(),
@@ -76,6 +80,8 @@ async def chat(
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
+        _u = data.get("usage", {})
+        _perf.trace(label, model, t0=t0, in_tok=_u.get("prompt_tokens"), out_tok=_u.get("completion_tokens"))
         choice = data["choices"][0]
         return {
             "message": choice.get("message") or {},
@@ -86,7 +92,7 @@ async def chat(
             await session.close()
 
 
-async def stream(messages, model, *, max_tokens, temperature=None, session=None):
+async def stream(messages, model, *, max_tokens, temperature=None, session=None, label=""):
     """Streaming completion. Yields (kind, text) where kind is 'content'."""
     own = session is None
     if own:
@@ -99,8 +105,12 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
             "max_tokens": max_tokens,
             "temperature": config.WRITER_TEMPERATURE if temperature is None else temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
+        t0 = _perf.now()
+        ttft = None
+        usage = None
         async with session.post(
             f"{GEMINI_BASE_URL}/chat/completions",
             headers=_headers(),
@@ -119,13 +129,20 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None)
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
+                if ttft is None:
+                    ttft = _perf.now()
                 delta = choices[0].get("delta") or {}
                 c = delta.get("content")
                 if c:
                     yield ("content", c)
+        _u = usage or {}
+        _perf.trace(label, model, t0=t0, ttft=ttft,
+                    in_tok=_u.get("prompt_tokens"), out_tok=_u.get("completion_tokens"))
     finally:
         if own:
             await session.close()

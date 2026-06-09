@@ -58,7 +58,7 @@ async def _fake_chat(messages, model, *, max_tokens, temperature=None, session=N
     return _chat_queue.pop(0)
 
 
-async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, session=None, tools=None, tool_choice=None):
+async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, session=None, tools=None, tool_choice=None, label=""):
     _calls["chat_models"].append(model)
     _calls["chat_messages"].append(messages)
     item = _chat_queue.pop(0) if _chat_queue else _chat_content("")
@@ -70,7 +70,7 @@ async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, se
                      "finish_reason": item.get("finish_reason")})
 
 
-async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None):
+async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None, label=""):
     _calls["complete_models"].append(model)
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
@@ -95,7 +95,7 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     return "completion"
 
 
-async def _fake_stream(messages, model, *, max_tokens, temperature=None, session=None):
+async def _fake_stream(messages, model, *, max_tokens, temperature=None, session=None, label=""):
     _calls["chat_models"].append(model)
     for chunk in (_stream_out or ["streamed answer"]):
         yield ("content", chunk)
@@ -362,7 +362,7 @@ async def _run_tests():
     import orchestrator.openai_client as _oc
     _oc_avail, _oc_complete = _oc.available, _oc.complete
     _oc.available = lambda: True
-    async def _fake_prose(messages, model, *, max_tokens, temperature=None, session=None):
+    async def _fake_prose(messages, model, *, max_tokens, temperature=None, session=None, label=""):
         _calls.setdefault("prose", []).append(model)
         return "POLISHED FINAL LETTER."
     _oc.complete = _fake_prose

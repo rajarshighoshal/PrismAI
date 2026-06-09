@@ -92,6 +92,7 @@ async def _describe_images_for_agent(messages, *, session=None):
                 max_tokens=config.VISION_MAX_TOKENS,
                 temperature=0.0,
                 session=session,
+                label="vision",
             )
         except Exception as e:
             log.warning(f"[vision] image description failed: {e}")
@@ -390,6 +391,7 @@ async def _tool_allowed(name: str, args: dict, messages, source: str, *, session
             max_tokens=120,
             temperature=0.0,
             session=session,
+            label="gate:tool",
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
@@ -454,6 +456,7 @@ async def _export_final(pending, final_text, prose, messages, source, *, headers
                         _prose_polish_messages(messages, md, source), pmodel,
                         max_tokens=config.DRAFT_MAX_TOKENS,
                         temperature=config.WRITER_TEMPERATURE, session=session,
+                        label="polish:export",
                     )
                     if polished and polished.strip():
                         md = polished.strip()
@@ -522,6 +525,7 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
             max_tokens=120,
             temperature=0.0,
             session=session,
+            label="gate:verify",
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
@@ -541,6 +545,7 @@ async def _request_needs_work(messages, *, session=None) -> bool:
             [{"role": "system", "content": SYSTEM_REQUEST_GATE},
              {"role": "user", "content": q}],
             config.GROUNDING_GATE_MODEL, max_tokens=60, temperature=0.0, session=session,
+            label="gate:work",
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         return bool(json.loads(match.group(0) if match else raw).get("needs_work", True))
@@ -559,11 +564,13 @@ async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) 
             return await client.complete(
                 msgs, model, max_tokens=config.DRAFT_MAX_TOKENS,
                 temperature=config.WRITER_TEMPERATURE, session=session,
+                label="refine",
             )
         return await fireworks.complete(
             msgs, config.REFINE_MODEL,
             max_tokens=config.DRAFT_MAX_TOKENS,
             temperature=config.WRITER_TEMPERATURE, session=session,
+            label="refine",
         )
     except Exception:
         return ""
@@ -637,7 +644,8 @@ async def _voice_pass(candidate, register, *, session=None):
         out = await anthropic_client.complete(
             [{"role": "system", "content": sys}, {"role": "user", "content": f"DRAFT:\n{candidate}"}],
             config.ANTHROPIC_STANDARD_MODEL,
-            max_tokens=config.AGENT_MAX_TOKENS, temperature=config.WRITER_TEMPERATURE, session=session)
+            max_tokens=config.AGENT_MAX_TOKENS, temperature=config.WRITER_TEMPERATURE, session=session,
+            label="voice")
         return out.strip() if (out and out.strip()) else candidate
     except Exception as e:
         log.warning(f"[voice_pass] {register} failed, keeping draft: {e}")
@@ -741,6 +749,7 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
             max_tokens=900,
             temperature=0.0,
             session=session,
+            label="audit",
         )
         match = re.search(r"\{.*\}", raw, flags=re.S)
         data = json.loads(match.group(0) if match else raw)
@@ -792,6 +801,7 @@ async def _summarize_correction(before: str, after: str, *, session=None) -> str
             [{"role": "system", "content": SYSTEM_CHANGE_SUMMARY},
              {"role": "user", "content": f"BEFORE:\n{before[:8000]}\n\nAFTER:\n{after[:8000]}"}],
             config.HONESTY_MODEL, max_tokens=200, temperature=0.0, session=session,
+            label="summarize",
         )
         return (raw or "").strip()
     except Exception:
@@ -985,6 +995,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             scratch, config.AGENT_MODEL,
             max_tokens=config.AGENT_MAX_TOKENS,
             temperature=config.WRITER_TEMPERATURE, session=session,
+            label="chat",
         ):
             if kind == "content":
                 streamed.append(tok)
@@ -1006,6 +1017,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 [{"role": "system", "content": SYSTEM_PREAMBLE},
                  {"role": "user", "content": _last_user_text(messages)[:1500]}],
                 config.GROUNDING_GATE_MODEL, max_tokens=80, temperature=0.3, session=session,
+                label="preamble",
             ):
                 if kind == "content":
                     yield ("reasoning", tok)
@@ -1055,6 +1067,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         async for kind, data in fireworks.stream_chat(
             scratch, model, max_tokens=config.AGENT_MAX_TOKENS, temperature=step_temp,
             session=session, tools=tools, tool_choice="auto" if tools is not None else None,
+            label="agent",
         ):
             if kind == "reasoning":
                 if config.SHOW_WORK:
@@ -1220,6 +1233,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     async for k, t in prose_client.stream(
                         pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
                         temperature=config.WRITER_TEMPERATURE, session=session,
+                        label="polish",
                     ):
                         if k == "content":
                             pparts.append(t)
@@ -1231,6 +1245,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     polish = await prose_client.complete(
                         pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
                         temperature=config.WRITER_TEMPERATURE, session=session,
+                        label="polish",
                     )
                     if polish and polish.strip():
                         candidate = polish.strip()
