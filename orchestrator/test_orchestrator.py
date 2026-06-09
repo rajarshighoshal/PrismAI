@@ -730,6 +730,18 @@ async def _run_tests():
           "REVISION TASK" not in json.dumps(_calls["chat_messages"])
           and _content(ev) == "Here is a fresh recommendation letter.")
 
+    # BACKSTOP: a flaky 'new' from the classifier must NOT cause a reconstruction when the
+    # user plainly asked to change the doc ("update the doc" -> edit, even if the LLM said new).
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee,\n\nI am currently completing my MS.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "new"})  # classifier flakes to 'new'
+    _chat_queue.append(_chat_content("Dear Committee,\n\nI completed my MS in May 2026."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "can you update the doc — I finished my MS"}],
+                        request_headers={"x-openwebui-chat-id": "edit5"})
+    check("edit/backstop: a flaky 'new' is overridden to edit when the user clearly asks to change the doc",
+          "REVISION TASK" in json.dumps(_calls["chat_messages"]))
+
     # Streaming guard: a mid-stream crash becomes a graceful message, never a broken
     # chunked response (which OWUI surfaces as a raw TransferEncodingError).
     async def _boom(messages, **kw):

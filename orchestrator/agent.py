@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
@@ -230,36 +231,48 @@ async def _deliverable_get(chat_id: str):
     return None
 
 
+_EDIT_VERB = re.compile(
+    r"\b(updat|chang|fix|correct|revis|edit|reword|re-?writ|re-?do|shorten|lengthen|"
+    r"expand|tweak|amend|adjust|replac|remov|delet|rename|rephras|polish|trim|redo)\w*", re.I)
+_DOC_REF = re.compile(
+    r"\b(doc|document|letter|file|cover\s?letter|resume|cv|essay|report|bio|it|this|that)\b", re.I)
+
+
 async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
-    """Classify a follow-up against the chat's last delivered document. Cheap flash call;
-    returns {action: rename|reformat|edit|new, filename, format}. Defaults to 'new'
-    (normal flow) on any doubt or failure — so it never hijacks an unrelated request."""
-    if not (last_user.strip() and prior and prior.get("content")):
+    """Classify a follow-up against the chat's last delivered document: rename|reformat|
+    edit|new. Returns {action, filename, format}. A deterministic backstop overrides a
+    flaky 'new' when the message plainly asks to change THIS document — missing an edit
+    (and reconstructing a DIFFERENT document) is the worse failure here."""
+    last_user = (last_user or "").strip()
+    if not (last_user and prior and prior.get("content")):
         return {"action": "new"}
     payload = {
         "latest_user": last_user[:1500],
         "current_filename": prior.get("filename") or "document",
         "current_format": prior.get("fmt") or "docx",
-        "document_preview": (prior.get("content") or "")[:600],
     }
+    action, filename, fmt = "new", "", ""
     try:
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_EDIT_INTENT},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
-            config.GROUNDING_GATE_MODEL, max_tokens=120, temperature=0.0,
-            session=session, label="gate:edit",
+            config.GROUNDING_GATE_MODEL, max_tokens=160, temperature=0.0,
+            reasoning_effort="low", session=session, label="gate:edit",
         )
         data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
-        action = str(data.get("action", "new")).lower()
-        if action not in ("rename", "reformat", "edit"):
-            return {"action": "new"}
-        return {
-            "action": action,
-            "filename": (data.get("filename") or "").strip(),
-            "format": (data.get("format") or "").strip().lower(),
-        }
+        a = str(data.get("action", "new")).lower()
+        if a in ("rename", "reformat", "edit"):
+            action = a
+            filename = (data.get("filename") or "").strip()
+            fmt = (data.get("format") or "").strip().lower()
     except Exception:
-        return {"action": "new"}
+        pass
+    # Backstop: never fall back to reconstructing when the user plainly asked to change
+    # THIS document (an edit verb + a reference to the doc), even if the classifier flaked.
+    if action == "new" and _EDIT_VERB.search(last_user) and _DOC_REF.search(last_user):
+        action = "edit"
+    log.info(f"[edit-intent] action={action} msg={last_user[:80]!r}")
+    return {"action": action, "filename": filename, "format": fmt}
 
 
 async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_id="", headers=None, session=None) -> str:
@@ -376,8 +389,16 @@ def _consolidated_user_memory(messages) -> str:
     return _clip_memory_part(last_user, 3000)
 
 
+def _now_line() -> str:
+    """Tell the model what 'today' is — otherwise it has no idea and burns tokens
+    debating whether a date (e.g. 'finished my MS in May 2026') is past or future."""
+    now = datetime.now(timezone.utc)
+    return ("The current date is " + now.strftime("%A, %d %B %Y") + " (UTC). Treat this as "
+            "'today'/'now' when reasoning about whether any date is in the past or future.")
+
+
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
-    system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY
+    system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY + "\n\n" + _now_line()
     if profile:
         system += (
             "\n\nUser voice profile. Use this only for style, tone, rhythm, and "

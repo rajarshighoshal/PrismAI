@@ -198,18 +198,22 @@ SYSTEM_GATE = (
 )
 
 SYSTEM_EDIT_INTENT = (
-    "A user already received a finished document earlier in THIS chat. Decide what they "
-    "want now, relative to that document. Return JSON only: {\"action\": "
-    "\"rename\"|\"reformat\"|\"edit\"|\"new\", \"filename\": string, \"format\": "
-    "\"docx\"|\"pdf\"|\"md\"}.\n"
-    "- rename: keep the content EXACTLY; change only the file's name -> put the new name "
-    "(no extension) in filename.\n"
-    "- reformat: keep the content EXACTLY; change only the file TYPE -> put the target in "
-    "format.\n"
-    "- edit: change the document's CONTENT (fix a line, shorten, add or remove text).\n"
-    "- new: a different request, not a revision of that document.\n"
-    "Choose rename/reformat/edit ONLY when the user clearly refers to the existing "
-    "document; otherwise 'new'. filename and format are \"\" unless the user gives them."
+    "A user already received a finished document (a file) earlier in THIS chat. Their new "
+    "message is below. Decide what they want now, relative to that document. Return JSON "
+    "only: {\"action\": \"rename\"|\"reformat\"|\"edit\"|\"new\", \"filename\": string, "
+    "\"format\": \"docx\"|\"pdf\"|\"md\"}.\n"
+    "- edit: ANY request to change the document's CONTENT — update it, fix or correct a "
+    "line, change a fact or date, add or remove text, shorten, expand, reword. Examples: "
+    "'update the doc', 'I actually finished my MS in May — fix that', 'make it shorter', "
+    "'change the date to 2026'.\n"
+    "- rename: keep the content identical, change only the file NAME -> put it in filename.\n"
+    "- reformat: keep the content identical, change only the file TYPE -> put it in format.\n"
+    "- new: a genuinely different, unrelated document or task (e.g. 'now write a "
+    "recommendation letter').\n"
+    "If the message refers to 'the doc / document / letter / file / it / this' OR asks to "
+    "revise, update, fix, or correct anything, it is NOT 'new'. Default to 'edit' when the "
+    "user clearly wants to change the existing document. filename and format are \"\" "
+    "unless the user states them."
 )
 
 SYSTEM_REQUEST_GATE = (
