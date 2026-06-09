@@ -1103,7 +1103,10 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     # exact bug that 'corrected out' the user's real geometric-probes research). The
     # honesty guarantee still holds: the MODEL can't invent anything the user didn't give.
     _user_said = _all_user_text(messages)
-    grounding_source = "\n\n".join(p for p in (source, _rc, _user_said) if p and p.strip())
+    # Today's date joins the SOURCE (not just the request): the audit prompt tells the
+    # auditor facts live in SOURCE MATERIAL, and in-source the verbatim backstop protects
+    # a dated letterhead mechanically (flash at low reasoning flaked on it otherwise).
+    grounding_source = "\n\n".join(p for p in (_now_line(), source, _rc, _user_said) if p and p.strip())
 
     # Verify only a FACTUAL DELIVERABLE — the cheap classifier decides, and an exported
     # file always counts (a document the user will rely on). The mere PRESENCE of a
@@ -1568,15 +1571,16 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if prose is not None:
             prose_client, prose_model = prose
             if config.SHOW_WORK:
-                yield ("reasoning", "✨ Polishing…\n")
+                yield ("reasoning", f"✨ Polishing the document ({prose_model.split('/')[-1]})…\n")
             # messages_for_verify (= the kept tail in overflow) bounds the premium
-            # polish prompt. Stream the polished deliverable live — but if a file will
-            # carry it, stream into the thinking panel (progress) instead of the chat,
-            # so the document lands in the file, not duplicated in the conversation.
+            # polish prompt. Stream the polished deliverable live ONLY when the chat
+            # carries it. When a FILE carries it, the body goes nowhere near the thinking
+            # panel — thinking is the model's reasoning + a clean stage log, never a
+            # scratch dump of the whole letter scrolling by.
             pmsgs = _prose_polish_messages(messages_for_verify, candidate, source)
             to_chat = not pending_exports
             try:
-                if config.STREAM_ANSWER:
+                if config.STREAM_ANSWER and to_chat:
                     pparts = []
                     async for k, t in prose_client.stream(
                         pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
@@ -1585,10 +1589,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                     ):
                         if k == "content":
                             pparts.append(t)
-                            yield ("content" if to_chat else "reasoning", t)
+                            yield ("content", t)
                     if "".join(pparts).strip():
                         candidate = "".join(pparts).strip()
-                        streamed_live = to_chat
+                        streamed_live = True
                 else:
                     polish = await prose_client.complete(
                         pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
