@@ -88,7 +88,7 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
         if _honesty_queue:
             return json.dumps(_honesty_queue.pop(0))
         return json.dumps({"unsupported": [], "verdict": "CLEAN"})
-    if "calibrated application-writing claim auditor" in sys:
+    if "FABRICATED FACTS" in sys:  # application-writing claim auditor
         if _app_audit_queue:
             return json.dumps(_app_audit_queue.pop(0))
         return json.dumps({
@@ -538,6 +538,24 @@ async def _run_tests():
         "Candidate facts: 3 years SQL, Tableau dashboards, A/B testing."
     )}])
     check("application audit: strips fake candidate/motivation claims", _content(ev) == "Corrected final answer.")
+
+    # The KTH over-block: motivation/fit/enthusiasm ALONE (no fabricated facts) must
+    # NOT block or rewrite the letter — that voice is the point of a cover letter.
+    _reset()
+    motiv = ("Dear Committee, I am deeply drawn to your lab's work and eager to develop "
+             "Bayesian methods for this project. The mission resonates with my goals.")
+    _chat_queue.append(_chat_content(motiv))
+    _app_audit_queue.append({
+        "unsupported_candidate_claims": [],
+        "unsupported_company_claims": [],
+        "fake_motivation_or_fit": ["deeply drawn to your lab's work", "eager to develop", "mission resonates with my goals"],
+        "acceptable_framing": [],
+        "verdict": "UNSUPPORTED",  # even if the auditor over-tags the verdict...
+    })
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Write a short cover letter for the PhD. Candidate facts: ML applicant."}])
+    check("application audit: motivation/fit alone does NOT block the letter",
+          "deeply drawn to your lab" in _content(ev) and "could not safely finalize" not in _content(ev).lower())
 
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the

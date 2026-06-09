@@ -796,12 +796,15 @@ async def _application_claim_audit(full_request: str, candidate: str, source: st
 
 
 def _application_audit_issues(audit: dict) -> list[str]:
+    """Only FACTUAL fabrications block or refine an application draft — credentials,
+    metrics, employers, invented history. Motivation, fit, and enthusiasm are the
+    expected voice of a cover letter and are left alone, so fake_motivation_or_fit is
+    deliberately NOT collected here (it can't be a 'lie')."""
     if not audit:
         return []
     fields = (
         "unsupported_candidate_claims",
         "unsupported_company_claims",
-        "fake_motivation_or_fit",
     )
     out = []
     for field in fields:
@@ -917,8 +920,10 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
                 return "unsupported_self_claims", _honesty_block_msg(unsupported)
     elif config.ENABLE_APPLICATION_CLAIM_AUDIT and is_app:
         app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
-        if app_audit and str(app_audit.get("verdict", "")).upper().startswith("UNSUPPORTED"):
-            def _unsup(r): return r and str(r.get("verdict", "")).upper().startswith("UNSUPPORTED")
+        # Fire ONLY on factual fabrications (credentials/metrics/history) — never on
+        # motivation/fit/enthusiasm, which is the expected voice of a cover letter.
+        if _application_audit_issues(app_audit):
+            def _unsup(r): return bool(_application_audit_issues(r))
             refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, prose=prose, session=session)
             recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
             if not (refined and not _unsup(recheck)):  # surgical patch didn't clear it — redo with feedback
