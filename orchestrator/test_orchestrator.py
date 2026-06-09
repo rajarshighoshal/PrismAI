@@ -195,6 +195,28 @@ async def _run_tests():
     )}]
     owui_src = agent._user_source(owui_msg)
     check("source: OWUI <source> file block captured", "Acme Corp" in owui_src)
+
+    # --- unit: unwrapping OWUI's RAG template (applied even with bypass on) ---
+    # Shape 1 (newer default): the real query is inside <user_query> tags.
+    wrapped_uq = [{"role": "user", "content": (
+        "### Task:\nRespond to the user query using the provided context.\n"
+        '<context>\n<source id="1">resume text</source>\n</context>\n'
+        "<user_query>\nupdate the doc, I finished my MS\n</user_query>"
+    )}]
+    check("unwrap: <user_query> shape yields the real message",
+          agent._last_user_text(wrapped_uq) == "update the doc, I finished my MS")
+    # Shape 2 (templates without a {{QUERY}} placeholder, like this instance's saved
+    # default): OWUI PREPENDS the rendered template, so the real text follows </context>.
+    wrapped_prepend = [{"role": "user", "content": (
+        "### Task:\nRespond to the user query using the provided context, incorporating "
+        "inline citations.\n### Output:\n...\n"
+        '<context>\n<source id="1">resume text</source>\n</context>\n\n'
+        "cna you add my geometric probes work to the letter?"
+    )}]
+    check("unwrap: prepended-template shape yields the text after </context>",
+          agent._last_user_text(wrapped_prepend) == "cna you add my geometric probes work to the letter?")
+    check("unwrap: a plain message passes through unchanged",
+          agent._last_user_text([{"role": "user", "content": "hello there"}]) == "hello there")
     check("source: short resume lines survive (no >=120 drop)", "Globex | Search relevance across 13 services" in owui_src)
     check("source: <source> wrapper tags stripped", "<source" not in owui_src and "</source>" not in owui_src)
     sys_inject = [
@@ -669,6 +691,10 @@ async def _run_tests():
     )}])
     check("grounding: a fact the USER stated in chat is grounded, not stripped",
           "geometric probes for AI safety" in _content(ev) and not _calls["refine_prompts"])
+    # The auditor must also know today's date — the writer is told it (system prompt), so
+    # a dated letterhead is established context, not a fabrication to strip into "[Date]".
+    check("grounding: the auditor is told the current date",
+          _calls["fact_audit"] and "current date" in _calls["fact_audit"][0].lower())
 
     # SELECTIVE VERIFICATION: a casual turn that merely HAS an attachment (assessing it,
     # asking about it) is not a deliverable. The gate says no and there is no export, so
@@ -741,6 +767,38 @@ async def _run_tests():
     sysmsgs = json.dumps(_calls["chat_messages"])
     check("edit/content: the writer runs on the REAL prior document (surgical revision)",
           bool(_calls["chat_models"]) and "REVISION TASK" in sysmsgs and "I finish my MS in May 2026" in sysmsgs)
+
+    # A surgical edit must NOT re-polish / re-voice the whole document: v1 was already
+    # polished and voiced; re-running both wastes ~40s and rewrites text the user didn't
+    # ask to change. (A NEW export still polishes — the auto-polish test above.)
+    _reset()
+    import orchestrator.openai_client as _oc2
+    _oc2_avail, _oc2_complete = _oc2.available, _oc2.complete
+    _oc2.available = lambda: True
+    async def _fake_prose2(messages, model, *, max_tokens, temperature=None, session=None, label=""):
+        _calls.setdefault("prose", []).append(model)
+        return "[re-polished] should not happen"
+    _oc2.complete = _fake_prose2
+    config.ENABLE_OPENAI_PROSE = True
+    prior_letter = ("Dear Committee, I am applying for the doctoral role. My work spans ML "
+                    "engineering and parallel algorithms across industry and research. " * 4)
+    _deliverable_holder[:] = [{"content": prior_letter, "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    edited_letter = prior_letter.replace("doctoral role", "doctoral position")
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/e/content/letter.docx"}])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": edited_letter, "filename": "letter"})),
+        _chat_content("Updated — file ready."),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "change 'doctoral role' to 'doctoral position' in the letter"}],
+                        request_headers={"x-openwebui-chat-id": "edit6"})
+    check("edit/no-repolish: a surgical edit is NOT re-polished or re-voiced",
+          not _calls.get("prose"))
+    check("edit/no-repolish: the edited file still ships",
+          _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
+    _oc2.available, _oc2.complete = _oc2_avail, _oc2_complete
+    config.ENABLE_OPENAI_PROSE = False
 
     # NEW: an unrelated follow-up must NOT be hijacked into a revision.
     _reset()

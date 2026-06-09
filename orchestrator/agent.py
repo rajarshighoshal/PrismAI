@@ -35,11 +35,15 @@ def _text_of(content) -> str:
     return ""
 
 
-# OWUI's RAG mode wraps the real message in <user_query>…</user_query> inside a
-# "### Task: Respond to the user query using the provided context…" template — and it does
-# so EVEN with "Bypass Embedding and Retrieval" enabled (open-webui issues #19281, #17720,
-# #17992). So we cannot rely on the OWUI setting; pull the user's actual words out here so
-# the edit classifier, the gates, and the verifier see what the USER said, not boilerplate.
+# OWUI's RAG path wraps its template around the user's real message EVEN with "Bypass
+# Embedding and Retrieval" enabled (open-webui issues #19281, #17720). Verified against
+# this instance's OWUI code (utils/middleware.py + utils/task.py rag_template):
+#   - newer default templates embed the query in <user_query>…</user_query> tags;
+#   - a template WITHOUT a {{QUERY}} placeholder (this instance's saved default) is
+#     PREPENDED to the original message (add_or_update_user_message append=False), so the
+#     user's real text is everything AFTER the last </context>.
+# These are machine-generated structural delimiters from OWUI's renderer — parse them so
+# the edit classifier, gates, and verifier see what the USER said, not boilerplate.
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
 
 
@@ -47,7 +51,13 @@ def _unwrap_owui(text: str) -> str:
     if not text:
         return ""
     m = _USER_QUERY_RE.search(text)
-    return m.group(1).strip() if m else text
+    if m:
+        return m.group(1).strip()
+    if "<context>" in text and "</context>" in text:
+        tail = text.rsplit("</context>", 1)[1].strip()
+        if tail:
+            return tail
+    return text
 
 
 def _last_user_text(messages) -> str:
@@ -1086,7 +1096,10 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
     if not needs:
         return "ok", candidate
 
-    full_request = _all_user_text(messages) + _recall_extra
+    # The auditor and refiner must know today's date too — the writer is TOLD the current
+    # date (system prompt), so a dated letterhead is established context, not a fabrication
+    # to strip (the bug that "corrected" a real date into a [Date] placeholder).
+    full_request = _now_line() + "\n\n" + _all_user_text(messages) + _recall_extra
 
     if config.ENABLE_HONESTY_AUDIT:
         # Hand the auditor the FULL source (relevance-fitted inside _fact_audit), the
@@ -1502,17 +1515,18 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             doc = _pending_prose_deliverable(pending_exports)
             if doc and len(doc) >= config.POLISH_MIN_CHARS:
                 candidate = doc
-                # Auto-polish any exported document. The model no longer asks for this
-                # (the old polish tool returned a bare "Acknowledged" and the model
-                # spiralled into redrafting the letter 2-3 times). It just writes; we
-                # polish the deliverable behind the scenes.
-                polish_voice = polish_voice or config.AUTO_POLISH_MODEL
-                # ...and give important documents a voice pass at the register that
-                # fits them (cover letter -> formal, email -> warm, code -> none),
-                # decided from the document rather than always-on or hand-picked.
-                if polish_voice_pass is None:
-                    polish_voice_pass = await _classify_voice_register(
-                        _all_user_text(messages), candidate, session=session)
+                # Auto-polish any NEW exported document — but never a surgical EDIT of an
+                # already-delivered one: v1 was already polished and voiced, and re-running
+                # a full polish + voice pass on the whole doc both wastes ~40s and rewrites
+                # text the user did not ask to change.
+                if not edit_baseline:
+                    polish_voice = polish_voice or config.AUTO_POLISH_MODEL
+                    # ...and give important documents a voice pass at the register that
+                    # fits them (cover letter -> formal, email -> warm, code -> none),
+                    # decided from the document rather than always-on or hand-picked.
+                    if polish_voice_pass is None:
+                        polish_voice_pass = await _classify_voice_register(
+                            _all_user_text(messages), candidate, session=session)
 
         # Polish runs on a substantial deliverable (auto-set above for exports), not a
         # clarifying question and not a user-chosen model.
