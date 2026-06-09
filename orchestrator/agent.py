@@ -14,7 +14,7 @@ import re
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
-    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY,
+    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 
@@ -635,6 +635,23 @@ def _prose_polish_messages(messages, candidate, source):
 
 
 
+async def _classify_voice_register(request, candidate, *, session=None) -> str:
+    """Pick the voice-pass register (warm/formal/none) for an exported deliverable,
+    naturally from the document — this replaces the model-chosen polish-tool argument
+    so important documents still get the right warmth touch without a confusing tool."""
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_VOICE_REGISTER},
+             {"role": "user", "content": f"REQUEST:\n{request[:1500]}\n\nDELIVERABLE (excerpt):\n{candidate[:1500]}"}],
+            config.GROUNDING_GATE_MODEL, max_tokens=30, temperature=0.0,
+            session=session, label="gate:voice")
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        reg = str(json.loads(m.group(0) if m else raw).get("register", "none")).lower()
+        return reg if reg in ("warm", "formal") else "none"
+    except Exception:
+        return "none"
+
+
 async def _voice_pass(candidate, register, *, session=None):
     """Optional sonnet voice-only pass at a register (warm/formal). Never alters facts."""
     if not anthropic_client.available():
@@ -1218,6 +1235,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 # spiralled into redrafting the letter 2-3 times). It just writes; we
                 # polish the deliverable behind the scenes.
                 polish_voice = polish_voice or config.AUTO_POLISH_MODEL
+                # ...and give important documents a voice pass at the register that
+                # fits them (cover letter -> formal, email -> warm, code -> none),
+                # decided from the document rather than always-on or hand-picked.
+                if polish_voice_pass is None:
+                    polish_voice_pass = await _classify_voice_register(
+                        _all_user_text(messages), candidate, session=session)
 
         # Polish runs on a substantial deliverable (auto-set above for exports), not a
         # clarifying question and not a user-chosen model.

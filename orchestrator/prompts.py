@@ -232,6 +232,17 @@ SYSTEM_FACT_AUDIT = (
     "\"FABRICATION\" if any unsupported factual claim exists, else \"CLEAN\"}."
 )
 
+SYSTEM_VOICE_REGISTER = (
+    "Pick the voice register for a finished written deliverable — the touch that makes "
+    "it read like a person wrote it. Return JSON only: "
+    "{\"register\": \"warm\"|\"formal\"|\"none\"}.\n"
+    "- warm: personal writing where a human voice helps — emails, personal statements, "
+    "bios, notes, messages, recommendation or motivation letters.\n"
+    "- formal: academic or professional writing — cover letters, research/project/class "
+    "reports, formal letters, documentation, proposals.\n"
+    "- none: code, data/tables, or short factual answers that need no register pass."
+)
+
 SYSTEM_CHANGE_SUMMARY = (
     "You are shown a BEFORE and AFTER version of a piece of writing that an honesty "
     "verifier corrected. In 1-3 short bullet points, state plainly what was changed "
