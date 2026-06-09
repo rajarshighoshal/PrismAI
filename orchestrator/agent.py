@@ -391,6 +391,36 @@ def _export_download(name: str, result):
     return None
 
 
+async def _export_final(pending, prose, messages, source, *, headers=None, session=None) -> str:
+    """Build the deferred export files from the FINAL deliverable (polished, if a
+    prose pass was chosen) so the downloaded file matches the polished chat answer —
+    not the rough mid-draft. Returns the '📎 Download …' links to append."""
+    out = []
+    for exp in pending:
+        md = exp["markdown"]
+        if prose is not None and len(md) >= config.POLISH_MIN_CHARS:
+            try:
+                client, pmodel = prose
+                polished = await client.complete(
+                    _prose_polish_messages(messages, md, source), pmodel,
+                    max_tokens=config.DRAFT_MAX_TOKENS,
+                    temperature=config.WRITER_TEMPERATURE, session=session,
+                )
+                if polished and polished.strip():
+                    md = polished.strip()
+            except Exception as e:
+                log.warning(f"[export] polish of deliverable failed, exporting draft: {e}")
+        result = await toolserver.post(
+            _tool_path(exp["tool"]),
+            {"markdown": md, "filename": exp["filename"], "title": exp["title"]},
+            session=session, headers=headers,
+        )
+        dl = _export_download(exp["tool"], result)
+        if dl and dl not in out:
+            out.append(dl)
+    return ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
+
+
 def _source_from_tool(name: str, result) -> str:
     if name == "web_search" and isinstance(result, list):
         return search.format_context(_url_backed_results(result))
@@ -946,7 +976,8 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             pass
 
     tool_sources = []
-    export_links = []
+    export_links = []        # immediate exports (csv) — link collected as they run
+    pending_exports = []     # deferred prose exports (docx/pdf/md) — built from the final answer
     repair_steps = 0
     tool_call_count = 0
     web_search_count = 0
@@ -1016,6 +1047,24 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                         "tool_call_id": call.get("id") or name,
                         "name": name,
                         "content": note,
+                    })
+                    continue
+                if name in ("export_docx", "export_pdf", "export_markdown"):
+                    # Defer prose exports to the FINAL answer (built after polish +
+                    # verify below) so the downloaded file matches the polished chat
+                    # answer rather than this rough mid-draft.
+                    pending_exports.append({
+                        "tool": name,
+                        "markdown": str(args.get("markdown") or ""),
+                        "filename": args.get("filename") or "document",
+                        "title": args.get("title") or "",
+                    })
+                    fmt = name.replace("export_", "")
+                    scratch.append({
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or name,
+                        "name": name,
+                        "content": f"Acknowledged: the {fmt} file will be exported from your final, verified answer and delivered to the user. Do not call export again.",
                     })
                     continue
                 tool_call_count += 1
@@ -1154,6 +1203,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
 
         if status == "ok":
+            # Build the deferred prose exports from the FINAL answer now.
+            links += await _export_final(
+                pending_exports, prose, messages_for_verify, source,
+                headers=request_headers, session=session,
+            )
             if streamed_live:
                 # Already shown live. Emit only what's new: an open correction if the
                 # verifier changed the text, plus any download links.

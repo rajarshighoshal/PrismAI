@@ -413,6 +413,7 @@ async def _run_tests():
     check("export: base64 not returned to model", "ZmFrZS1maWxl" not in tool_context)
     check("export: final text returned", _content(ev).startswith("Exported draft.md."))
     check("export: download link surfaced", "/api/v1/files/abc123/content/draft.md" in _content(ev))
+    check("export: file built from the deliverable, deferred to the final answer", _calls["post"][0][1]["markdown"] == "# Draft")
 
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()
