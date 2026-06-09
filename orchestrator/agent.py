@@ -14,7 +14,7 @@ import re
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_PREAMBLE,
-    SYSTEM_HONESTY, SYSTEM_APPLICATION_CLAIM_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY,
+    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 
@@ -590,16 +590,6 @@ def _edit_directive(rewrite: bool) -> str:
     return _REWRITE_DIRECTIVE if rewrite else _SURGICAL_DIRECTIVE
 
 
-async def _refine_to_source(source: str, candidate: str, claims: str, *, rewrite=False, prose=None, session=None) -> str:
-    prompt = (
-        _edit_directive(rewrite) + " "
-        "Make every factual claim supported by SOURCE; remove or qualify unsupported "
-        "claims and preserve the requested format. Output only the revised final answer."
-    )
-    user = f"SOURCE:\n{source}\n\nUNSUPPORTED CLAIMS:\n{claims}\n\nDRAFT:\n{candidate}"
-    return await _refine_complete(prompt, user, prose=prose, session=session)
-
-
 def _prose_provider(voice):
     """Map the agent-chosen polish voice to (client, model), honoring availability
     with graceful fallback. None if no provider is usable (stay on the open draft)."""
@@ -678,24 +668,6 @@ def _all_user_text(messages) -> str:
     )
 
 
-def _is_application_writing(messages) -> bool:
-    text = _all_user_text(messages).lower()
-    needles = (
-        "cover letter",
-        "application letter",
-        "letter of interest",
-        "statement of interest",
-        "personal statement",
-        "statement of purpose",
-        "phd application",
-        "job application",
-        "resume",
-        "résumé",
-        "cv",
-    )
-    return any(n in text for n in needles)
-
-
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -748,40 +720,22 @@ def _fit_audit_source(source: str, draft: str, budget: int) -> str:
     return "\n\n".join(p for _i, p in kept) or source[:budget]
 
 
-async def _honesty_audit(full_request: str, candidate: str, *, session=None):
-    """Flag claims about the USER the user never stated. Returns the auditor dict
-    {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
-    if not candidate.strip():
-        return None
-    user = f"USER REQUEST:\n{full_request}\n\nDRAFT:\n{candidate[:config.AUDIT_DRAFT_BUDGET]}"
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_HONESTY},
-             {"role": "user", "content": user}],
-            config.HONESTY_MODEL,
-            max_tokens=700,
-            temperature=0.0,
-            session=session,
-        )
-        match = re.search(r"\{.*\}", raw, flags=re.S)
-        data = json.loads(match.group(0) if match else raw)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-async def _application_claim_audit(full_request: str, candidate: str, source: str, *, session=None):
+async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None):
+    """The single fact-integrity verifier for ANY written deliverable. Flags only
+    unsupported FACTUAL claims (against the user's stated facts + SOURCE + common
+    knowledge); motivation, opinion, and framing pass. Returns {unsupported:[...],
+    verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
     if not candidate.strip():
         return None
     fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
-        f"SOURCE:\n{fitted if fitted else '(none)'}\n\n"
+        f"SOURCE MATERIAL:\n{fitted if fitted else '(none)'}\n\n"
         f"DRAFT:\n{candidate[:config.AUDIT_DRAFT_BUDGET]}"
     )
     try:
         raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_APPLICATION_CLAIM_AUDIT},
+            [{"role": "system", "content": SYSTEM_FACT_AUDIT},
              {"role": "user", "content": user}],
             config.HONESTY_MODEL,
             max_tokens=900,
@@ -795,65 +749,30 @@ async def _application_claim_audit(full_request: str, candidate: str, source: st
         return None
 
 
-def _application_audit_issues(audit: dict) -> list[str]:
-    """Only FACTUAL fabrications block or refine an application draft — credentials,
-    metrics, employers, invented history. Motivation, fit, and enthusiasm are the
-    expected voice of a cover letter and are left alone, so fake_motivation_or_fit is
-    deliberately NOT collected here (it can't be a 'lie')."""
-    if not audit:
-        return []
-    fields = (
-        "unsupported_candidate_claims",
-        "unsupported_company_claims",
-    )
-    out = []
-    for field in fields:
-        for item in audit.get(field) or []:
-            if item:
-                out.append(str(item))
-    return out
-
-
-async def _refine_application_claims(full_request: str, candidate: str, source: str,
-                                     audit: dict, *, rewrite=False, prose=None, session=None) -> str:
-    issues = "\n".join(f"- {i}" for i in _application_audit_issues(audit)) or "(unspecified)"
+async def _refine_facts(full_request: str, source: str, candidate: str, unsupported,
+                        *, rewrite=False, prose=None, session=None) -> str:
+    """Remove the unsupported FACTS the verifier flagged, keeping everything else —
+    motivation, framing, tone, structure — exactly. Surgical by default; full rewrite
+    only when the draft is too wrong to patch."""
+    listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported factual claims)"
     prompt = (
         _edit_directive(rewrite) + " "
-        "Keep the application-writing humane, personal, persuasive, "
-        "and grounded in reality. Remove or neutralize each unsupported issue. Do "
-        "NOT add new candidate achievements, credentials, metrics, years, revenue, "
-        "leadership, impact, employers, projects, daily routines, work settings, "
-        "specific scenes, emotional history, product-relationship claims, or company-culture "
-        "reputation claims. Keep role/company framing if "
-        "it is generic or supported; make unsupported company specifics generic. "
-        "Keep motivation/fit warm but do not fake personal history or strong feelings "
-        "the user did not provide. Output only the revised deliverable."
+        "Remove or neutrally rephrase each listed claim so the draft asserts no fact "
+        "the user or SOURCE did not support. Do NOT invent replacements. KEEP all "
+        "motivation, interest, framing, tone, and structure exactly — only the "
+        "unsupported FACTS change. If removing a claim leaves the draft thinner, that "
+        "is fine; do not pad with invented detail. Output only the revised deliverable."
     )
     user = (
         f"USER REQUEST:\n{full_request}\n\n"
-        f"SOURCE:\n{source if source.strip() else '(none)'}\n\n"
-        f"ISSUES TO FIX:\n{issues}\n\n"
+        f"SOURCE MATERIAL:\n{source if source.strip() else '(none)'}\n\n"
+        f"UNSUPPORTED CLAIMS TO FIX:\n{listed}\n\n"
         f"DRAFT:\n{candidate}"
     )
     return await _refine_complete(prompt, user, prose=prose, session=session)
 
 
-async def _refine_honesty(full_request: str, candidate: str, unsupported, *, rewrite=False, prose=None, session=None) -> str:
-    """Drop unsupported self-claims WITHOUT inventing replacements — surgically."""
-    listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported self-claims)"
-    prompt = (
-        _edit_directive(rewrite) + " "
-        "The draft must make NO claim about the user that the user did not "
-        "actually state. Remove or neutrally rephrase each listed unsupported claim "
-        "WITHOUT inventing replacements or new facts. Keep the requested format and "
-        "polished prose. If removing claims leaves the draft thin, that is acceptable "
-        "— do not pad with invented detail. Output only the revised final answer."
-    )
-    user = f"USER REQUEST:\n{full_request}\n\nUNSUPPORTED CLAIMS TO REMOVE:\n{listed}\n\nDRAFT:\n{candidate}"
-    return await _refine_complete(prompt, user, prose=prose, session=session)
-
-
-def _honesty_block_msg(unsupported) -> str:
+def _facts_block_msg(unsupported) -> str:
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else ""
     return (
         "I can't present those claims as true from the facts you gave me. These "
@@ -879,107 +798,53 @@ async def _summarize_correction(before: str, after: str, *, session=None) -> str
         return ""
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", is_app=None, prose=None, session=None):
+async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, session=None):
+    """ONE fact-integrity check for any kind of writing — email, resume, letter,
+    report, research, chat. No document-type branching: flag only unsupported FACTS,
+    leave motivation / opinion / framing untouched, surgically correct, escalate to a
+    rewrite if a patch can't clear it, and block only if facts still can't be made
+    truthful."""
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
 
-    # Recalled facts are the user's OWN earlier statements, surfaced only when a
-    # long chat overflowed the context budget (see run()). They are established
-    # context, so every auditor must see them — otherwise the can't-lie layer
-    # flags a correctly-recalled fact as an unsupported fabrication and strips it
-    # (the memory-vs-verifier collision). For normal chats recall_context is "",
-    # so grounding_source/full_request are unchanged and this path is a no-op.
+    # Recalled facts are the user's OWN earlier statements, surfaced only when a long
+    # chat overflowed the context budget (see run()). They are established context, so
+    # the verifier must see them — otherwise a correctly-recalled fact gets flagged as
+    # a fabrication and stripped. For normal chats recall_context is "" (no-op).
     _rc = (recall_context or "").strip()
     _recall_extra = ("\n\nEARLIER IN THIS CONVERSATION (the user already stated):\n" + _rc) if _rc else ""
     grounding_source = (((source + "\n\n" + _rc).strip() if (source or "").strip() else _rc) if _rc else source)
 
-    # One cheap classifier gates the whole chain. SYSTEM_GATE flags both external
-    # facts and claims about the user, so a casual turn — never an application —
-    # that needs neither skips straight through instead of paying for the audits.
-    is_app = _is_application_writing(messages) if is_app is None else is_app
+    # A cheap classifier decides whether this turn asserts facts worth checking at all
+    # — plain chat, opinion, and pure brainstorming skip straight through.
     needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-    if not needs and not is_app:
+    if not needs:
         return "ok", candidate
 
     full_request = _all_user_text(messages) + _recall_extra
 
-    if config.ENABLE_HONESTY_AUDIT and not is_app:
-        honesty = await _honesty_audit(full_request, candidate, session=session)
-        if honesty and str(honesty.get("verdict", "")).upper().startswith("FAB"):
-            unsupported = honesty.get("unsupported") or []
-            def _fab(r): return r and str(r.get("verdict", "")).upper().startswith("FAB")
-            refined = await _refine_honesty(full_request, candidate, unsupported, prose=prose, session=session)
-            recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
+    if config.ENABLE_HONESTY_AUDIT:
+        def _fab(r): return r and str(r.get("verdict", "")).upper().startswith("FAB")
+        audit = await _fact_audit(full_request, grounding_source, candidate, session=session)
+        if _fab(audit):
+            unsupported = audit.get("unsupported") or []
+            refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, session=session)
+            recheck = await _fact_audit(full_request, grounding_source, refined, session=session) if refined else None
             if not (refined and not _fab(recheck)):  # surgical patch didn't clear it — redo with feedback
-                refined = await _refine_honesty(full_request, candidate, unsupported, rewrite=True, prose=prose, session=session)
-                recheck = await _honesty_audit(full_request, refined, session=session) if refined else None
+                refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, session=session)
+                recheck = await _fact_audit(full_request, grounding_source, refined, session=session) if refined else None
             if refined and not _fab(recheck):
                 candidate = refined
-                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
             else:
-                return "unsupported_self_claims", _honesty_block_msg(unsupported)
-    elif config.ENABLE_APPLICATION_CLAIM_AUDIT and is_app:
-        app_audit = await _application_claim_audit(full_request, candidate, grounding_source, session=session)
-        # Fire ONLY on factual fabrications (credentials/metrics/history) — never on
-        # motivation/fit/enthusiasm, which is the expected voice of a cover letter.
-        if _application_audit_issues(app_audit):
-            def _unsup(r): return bool(_application_audit_issues(r))
-            refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, prose=prose, session=session)
-            recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
-            if not (refined and not _unsup(recheck)):  # surgical patch didn't clear it — redo with feedback
-                refined = await _refine_application_claims(full_request, candidate, grounding_source, app_audit, rewrite=True, prose=prose, session=session)
-                recheck = await _application_claim_audit(full_request, refined, grounding_source, session=session) if refined else None
-            if refined and not _unsup(recheck):
-                candidate = refined
-                needs = await _needs_verification(messages, candidate, grounding_source, session=session)
-            else:
-                issues = "\n".join(f"- {i}" for i in _application_audit_issues(app_audit))
-                return (
-                    "unsupported_application_claims",
-                    "I could not safely finalize this application draft without "
-                    "unsupported claims:\n\n" + issues,
-                )
+                return "unsupported_claims", _facts_block_msg(unsupported)
 
+    # Citations must rest on real retrieved sources.
     if not grounding_source.strip() and _has_citation_markers(candidate):
         return (
             "citation_without_source",
             "The previous draft included citations or source labels, but no sources were actually supplied or retrieved.",
         )
-
-    if not needs:
-        return "ok", candidate
-    if not grounding_source.strip():
-        return (
-            "needs_source",
-            "The previous draft made factual claims without source material.",
-        )
-
-    audit = await toolserver.verify_grounding(grounding_source, candidate, session=session)
-    if audit is None:
-        return (
-            "blocked",
-            "I could not reach the verification service, so I am not going to present an unverified factual answer.",
-        )
-    if audit.get("grounded"):
-        return "ok", candidate
-
-    claims = (audit.get("unsupported_claims") or "").strip() or "Unsupported claims were found."
-    refined = await _refine_to_source(grounding_source, candidate, claims, prose=prose, session=session)
-    if refined:
-        second = await toolserver.verify_grounding(grounding_source, refined, session=session)
-        if second is not None and second.get("grounded"):
-            return "ok", refined
-        # surgical patch still ungrounded — redo from scratch with the same feedback
-        refined = await _refine_to_source(grounding_source, candidate, claims, rewrite=True, prose=prose, session=session)
-        if refined:
-            third = await toolserver.verify_grounding(grounding_source, refined, session=session)
-            if third is not None and third.get("grounded"):
-                return "ok", refined
-    return (
-        "unsupported",
-        "I could not safely finalize this without unsupported claims. The verification gate flagged:\n\n"
-        + claims,
-    )
+    return "ok", candidate
 
 
 def _norm_turn(content) -> str:
@@ -1113,7 +978,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # source, or verification. No verifier runs — there is nothing to ground or
     # audit. Anything uncertain falls through to the buffered loop below.
     if (config.STREAM_SIMPLE_CHAT and not is_user_model and not had_images
-            and not user_source and not _is_application_writing(messages)
+            and not user_source
             and not await _request_needs_work(messages, session=session)):
         streamed = []
         async for kind, tok in fireworks.stream(
@@ -1384,7 +1249,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             candidate,
             source,
             recall_context=recall_context,
-            is_app=_is_application_writing(messages),
             prose=prose,
             session=session,
         )

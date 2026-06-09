@@ -113,7 +113,6 @@ ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
 # — and stays CLEAN on the user's real stated facts. Set HONESTY_MODEL=...-pro to
 # revert to the heavier auditor.
 ENABLE_HONESTY_AUDIT = _flag("ENABLE_HONESTY_AUDIT", "true")
-ENABLE_APPLICATION_CLAIM_AUDIT = _flag("ENABLE_APPLICATION_CLAIM_AUDIT", "true")
 HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
 AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
