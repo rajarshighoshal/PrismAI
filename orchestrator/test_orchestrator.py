@@ -489,7 +489,7 @@ async def _run_tests():
           "Dear Admissions Committee" not in body and "applying for the doctoral position" not in body)
     check("export-arg: chat shows the download link", "/api/v1/files/L1/content/letter.docx" in body)
 
-    # A model that calls export twice for the same format must yield ONE file + ONE link.
+    # A model that double-calls export with IDENTICAL args yields ONE file + ONE link.
     _reset()
     rep = "# Report\n\n" + "Quarterly numbers held steady across all regions. " * 12
     _post_queue.append([
@@ -503,8 +503,27 @@ async def _run_tests():
     _gate_queue.append(False)
     ev = await _collect([{"role": "user", "content": "Write a report and export as docx."}])
     body = _content(ev)
-    check("export dedup: double export_docx renders one file", len(_calls["post"]) == 1)
+    check("export dedup: identical double export renders one file", len(_calls["post"]) == 1)
     check("export dedup: one download link", body.count("/api/v1/files/d/content/r.docx") == 1)
+
+    # But DISTINCT files in one turn (a resume AND a cover letter) are all kept.
+    _reset()
+    resume = "# Resume\n\n" + "Engineer with a broad systems and ML background. " * 10
+    cover = "# Cover Letter\n\n" + "I am writing to express strong interest in this role. " * 10
+    _post_queue.extend([
+        [{"status": "success", "filename": "resume.docx", "download_url": "/api/v1/files/a/content/resume.docx"}],
+        [{"status": "success", "filename": "cover.docx", "download_url": "/api/v1/files/b/content/cover.docx"}],
+    ])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": resume, "filename": "resume"}),
+                    _tool_call("export_docx", {"markdown": cover, "filename": "cover"}, "call_2")),
+        _chat_content("Both documents are ready."),
+    ])
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "Make a resume and a cover letter, export both as docx."}])
+    body = _content(ev)
+    check("export: distinct files in one turn are all kept", len(_calls["post"]) == 2)
+    check("export: both download links shown", "resume.docx" in body and "cover.docx" in body)
 
     # Vision is transcribed first, then the normal agent loop answers.
     _reset()
