@@ -68,13 +68,14 @@ def _split_content_parts(content):
 
 
 async def _describe_images_for_agent(messages, *, session=None):
-    out = []
-    for m in messages:
+    # Transcribe every image-bearing message CONCURRENTLY — a chat with several image
+    # turns (e.g. figures across a thread) used to caption them one after another, paying
+    # the 9-18s vision latency per image in series. gather preserves order.
+    async def _describe(m):
         content = m.get("content")
         text_parts, image_parts = _split_content_parts(content)
         if not image_parts:
-            out.append(dict(m))
-            continue
+            return dict(m)
         user_text = "\n".join(t.strip() for t in text_parts if t.strip())
         prompt = (
             "The user attached image(s) to this message. Preserve the visual evidence "
@@ -104,8 +105,9 @@ async def _describe_images_for_agent(messages, *, session=None):
             ) + "Image transcription/description:\n" + description.strip()
         new_m = dict(m)
         new_m["content"] = combined or "Image was attached, but no text was available."
-        out.append(new_m)
-    return out
+        return new_m
+
+    return list(await asyncio.gather(*(_describe(m) for m in messages)))
 
 
 def _with_system(messages, system_text):
@@ -260,9 +262,8 @@ def _consolidated_user_memory(messages) -> str:
     return _clip_memory_part(last_user, 3000)
 
 
-def _initial_messages(messages, user_id: str):
+def _initial_messages(messages, user_id: str, profile: str = ""):
     system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY
-    profile = style.get_style_profile(user_id)
     if profile:
         system += (
             "\n\nUser voice profile. Use this only for style, tone, rhythm, and "
@@ -968,6 +969,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     is_user_model = bool(user_final_model)
 
     had_images = _has_images(messages)
+    # Read the style profile off-thread, overlapped with image description — both are
+    # startup I/O, no reason to run them in series (and the sqlite read must not block
+    # the event loop). Awaited just before it is first needed below.
+    style_task = asyncio.ensure_future(style.get_style_profile(user_id))
     if had_images:
         if config.SHOW_WORK:
             yield ("reasoning", "🖼️ Reading image context…\n")
@@ -975,6 +980,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
 
     req_headers = request_headers or {}
     chat_id = req_headers.get("x-openwebui-chat-id", "")
+    style_profile = await style_task
 
     # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
     # conversation history every turn, so for normal-length chats the model (and
@@ -1012,7 +1018,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 seen.add(c)
                 (user_lines if role == "user" else asst_lines).append(c)
         if user_lines or asst_lines:
-            scratch = _initial_messages(recent, user_id)
+            scratch = _initial_messages(recent, user_id, style_profile)
             messages_for_verify = recent
             recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
             blocks = []
@@ -1036,9 +1042,9 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             # failure). Don't trim blind: ~140k chars is still well within the
             # model window, so keep the full conversation rather than silently
             # dropping the older head with no replacement.
-            scratch = _initial_messages(messages, user_id)
+            scratch = _initial_messages(messages, user_id, style_profile)
     else:
-        scratch = _initial_messages(messages, user_id)
+        scratch = _initial_messages(messages, user_id, style_profile)
 
     # Grounding source = the user's pasted/quoted material across the WHOLE
     # conversation. verify_grounding takes the source independently of the model's
