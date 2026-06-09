@@ -306,7 +306,10 @@ _PROSE_POLISH_SYS = (
     "the draft or the SOURCE; do not invent. Do NOT inflate, strengthen, or reframe "
     "what the writer has done or claimed: keep the draft's level of confidence and "
     "every hedge, and never imply more was accomplished or solved than the draft "
-    "states. Keep the requested format and length. No preamble, no sign-off "
+    "states. Keep the requested format and length. NEVER insert template placeholders "
+    "([Date], [Company Name], [Your Name], [Address], …): if the real value is in the "
+    "draft or known to you, write it; otherwise drop that line entirely — a finished "
+    "document never ships with blanks for the user to fill. No preamble, no sign-off "
     "commentary — output ONLY the rewritten deliverable."
 )
 

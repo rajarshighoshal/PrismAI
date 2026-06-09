@@ -509,8 +509,10 @@ def _prose_polish_messages(messages, candidate, source):
     if source.strip():
         parts.append(prompt_security.wrap_untrusted("gathered source material", source[:12000]))
     parts.append(f"DRAFT TO POLISH:\n{candidate}")
+    # The polisher gets today's date too — without it, gpt-5.5 letterheads a formal
+    # document with a "[Date]" placeholder (it can't know the date, so it blanks it).
     return [
-        {"role": "system", "content": _PROSE_POLISH_SYS},
+        {"role": "system", "content": _PROSE_POLISH_SYS + "\n\n" + _now_line()},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
 
