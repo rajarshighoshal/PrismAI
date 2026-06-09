@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 
-from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver
+from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver, verifier
 
 _calls = {
     "chat_models": [],
@@ -879,7 +879,7 @@ async def _run_tests():
     # verifier, a correctly recalled fact looks invented and gets stripped, so the
     # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
     _SENTINELS = ["Helios", "March 3rd", "$5 million", "$9,000"]
-    _orig_fact, _orig_recall = agent._fact_audit, agent._memory_recall
+    _orig_fact, _orig_recall = verifier._fact_audit, agent._memory_recall
     _orig_store = agent._memory_store
     _audit_inputs = []  # every request+source the unified verifier actually receives
 
@@ -898,7 +898,7 @@ async def _run_tests():
     async def _noop_store(chat_id, role, content, session=None):
         return True
 
-    agent._fact_audit = _realistic_fact
+    verifier._fact_audit = _realistic_fact
     agent._memory_recall = _fake_recall
     agent._memory_store = _noop_store
 
@@ -985,7 +985,7 @@ async def _run_tests():
     )
     check("memory/normal: no recall on a short chat (native history used)", _recall_calls == [])
 
-    agent._fact_audit, agent._memory_recall = _orig_fact, _orig_recall
+    verifier._fact_audit, agent._memory_recall = _orig_fact, _orig_recall
     agent._memory_store = _orig_store
 
     # ---- Request de-duplication (idempotency on retries) -----------------------
