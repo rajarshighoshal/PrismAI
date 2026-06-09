@@ -130,34 +130,6 @@ TOOL_SCHEMAS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "polish",
-            "description": (
-                "Polish a final written deliverable when writing quality matters (not for "
-                "plain chat, quick answers, or code). Two stages, NEITHER may change or inflate facts.\n"
-                "'model' — writer for the substance rewrite; pick by what THIS piece must DO, "
-                "not by a static cost tier: "
-                "gpt-5.5 is the default for calibrated academic/formal substance (research prose, "
-                "PhD statements, academic cover letters, source-sensitive writing). Opus is the "
-                "default for corporate/job-market persuasion (resume/CV bullets, recruiter-facing "
-                "cover letters, pitches, bios) and when the user wants a bolder/high-visibility "
-                "style. Sonnet is best as a voice-only warmth pass. The reality audit still applies "
-                "after every polish.\n"
-                "'voice_pass' — optional final voice-only register pass: 'warm' (personal writing), "
-                "'formal' (academic/professional), or 'none'."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "model": {"type": "string", "enum": ["gpt-5.5", "sonnet", "opus"]},
-                    "voice_pass": {"type": "string", "enum": ["none", "warm", "formal"]},
-                },
-                "required": ["model"],
-            },
-        },
-    },
 ]
 
 SYSTEM_AGENT = (
@@ -174,10 +146,9 @@ SYSTEM_AGENT = (
     "search definitions. When you DO need to search, issue ALL the queries you need "
     "in ONE step (they run in parallel and return together) — never search once, read "
     "it, then search again; that multiplies the wait.\n"
-    "- polish: before writing a deliverable whose quality matters (cover letter, "
-    "statement, application/research prose, important email). Pick the writer model "
-    "by what this piece must do, using the model map in the tool description.\n"
-    "- export tools: only when the user asks for a file.\n"
+    "- export tools: only when the user asks for a file. Write your COMPLETE deliverable "
+    "as the export argument; it is automatically polished and quality-checked before "
+    "delivery — you never need to draft it twice or 'polish' it yourself.\n"
     "- Prefer answering from what the user gave you; reach for tools only when the "
     "task genuinely needs facts you don't have. Then synthesize and stop.\n"
     "\n"
