@@ -289,6 +289,22 @@ async def _run_tests():
     check("security: tool output wrapped as untrusted",
           any("UNTRUSTED SOURCE DATA" in (m.get("content") or "") for m in _tool_msgs))
 
+    # Parallel tools: several searches fired in ONE response run concurrently and all
+    # results come back in a single round, not N sequential trips.
+    _reset()
+    _chat_queue.extend([
+        _chat_tools(_tool_call("web_search", {"query": "alpha facts"}),
+                    _tool_call("web_search", {"query": "beta facts"}, "call_2")),
+        _chat_content("Combined answer [1]."),
+    ])
+    _tool_gate_queue.extend([True, True])   # guard allows both
+    _gate_queue.append(True)
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
+    ev = await _collect([{"role": "user", "content": "research alpha and beta with sources"}])
+    queries = sorted(q for q, _ in _calls["search"])
+    check("parallel tools: both searches ran in one round", queries == ["alpha facts", "beta facts"])
+    check("parallel tools: answer returned after the batch", _content(ev) == "Combined answer [1].")
+
     # Search summaries without URLs are useful hints but not citable evidence.
     _reset()
     async def _fake_search_with_summary(query, *, max_results=None, session=None):
