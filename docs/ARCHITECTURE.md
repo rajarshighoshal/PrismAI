@@ -65,7 +65,10 @@ chunked response.
 |---|---|
 | `orchestrator/app.py` | FastAPI shell, OpenAI-compatible endpoints |
 | `orchestrator/pipeline.py` | entry + streaming crash guard |
-| `orchestrator/agent.py` | everything in the lifecycle above |
+| `orchestrator/agent.py` | the lifecycle above: edit engine, agent loop, verification, delivery |
+| `orchestrator/owui.py` | parsing what OWUI sends (unwrap, `<source>` blocks, user source) |
+| `orchestrator/memory_client.py` | tool-server HTTP: chat memory, deliverables, last-active |
+| `orchestrator/timectx.py` | current-time line + resume-after-gap note |
 | `orchestrator/prompts.py` | every system prompt + tool schemas |
 | `orchestrator/config.py` | env-tunable knobs (models, budgets, timezone) |
 | `orchestrator/fireworks.py` / `openai_client.py` / `anthropic_client.py` / `gemini.py` | model clients, all traced (`[trace] label=… ttft=… ttlt=…`) |

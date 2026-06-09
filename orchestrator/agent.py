@@ -8,27 +8,33 @@ The full turn lifecycle (unwrap → startup I/O → vision → edit engine → g
 agent loop → polish/voice → verify → deliver → persist), the model routing table,
 and the standing invariants live in docs/ARCHITECTURE.md — read that first.
 
-Map of this file (in lifecycle order):
-  OWUI parsing      _unwrap_owui, _last_user_text, _owui_source_blocks, _user_source
-  startup I/O       style profile (style.py), _deliverable_get, _last_active, _gap_note
-  vision            _describe_images_for_agent
-  edit engine       _classify_edit, _repackage_deliverable, _edit_inject
-  memory client     _memory_recall, _memory_store (tool-server HTTP)
-  agent loop        run() + tool execution, budgets, SYSTEM_TOOL_GUARD
-  polish & voice    _prose_provider, _classify_voice_register, _voice_pass
-  verification      _verified_or_blocked, _fact_audit, _refine_facts,
-                    _claim_verbatim_in_source (the verbatim backstop)
-  delivery          _export_final, _same_doc, _summarize_correction
+Module map (in lifecycle order):
+  owui.py           parsing what OWUI sends: _unwrap_owui, _user_source, source blocks
+  timectx.py        _now_line (what 'now' is), _gap_note (resume-after-gap)
+  memory_client.py  tool-server HTTP: chat memory, deliverable store, last-active
+  style.py          per-user voice profile (read-only, off-thread)
+  THIS FILE         vision (_describe_images_for_agent); the edit engine
+                    (_classify_edit → directed pipeline / _repackage_deliverable);
+                    the agent loop (run(), tool execution, budgets, SYSTEM_TOOL_GUARD);
+                    polish & voice (_prose_provider, _voice_pass); verification
+                    (_verified_or_blocked, _fact_audit, _refine_facts, the verbatim
+                    backstop); delivery (_export_final, _same_doc).
 """
 
-import aiohttp
 import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timezone, timedelta
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
+from .owui import (
+    _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
+    _same_message_source, _SOURCE_BLOCK_RE, _owui_source_blocks, _user_source, _all_user_text,
+)
+from .memory_client import (
+    _memory_recall, _memory_store, _deliverable_store, _deliverable_get, _last_active,
+)
+from .timectx import _now_line, _gap_note
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
@@ -36,77 +42,6 @@ from .prompts import (
 )
 
 log = logging.getLogger(__name__)
-
-
-
-def _text_of(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(
-            p.get("text", "")
-            for p in content
-            if isinstance(p, dict) and p.get("type") == "text"
-        )
-    return ""
-
-
-# OWUI's RAG path wraps its template around the user's real message EVEN with "Bypass
-# Embedding and Retrieval" enabled (open-webui issues #19281, #17720). Verified against
-# this instance's OWUI code (utils/middleware.py + utils/task.py rag_template):
-#   - newer default templates embed the query in <user_query>…</user_query> tags;
-#   - a template WITHOUT a {{QUERY}} placeholder (this instance's saved default) is
-#     PREPENDED to the original message (add_or_update_user_message append=False), so the
-#     user's real text is everything AFTER the last </context>.
-# These are machine-generated structural delimiters from OWUI's renderer — parse them so
-# the edit classifier, gates, and verifier see what the USER said, not boilerplate.
-_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
-
-
-def _unwrap_owui(text: str) -> str:
-    if not text:
-        return ""
-    m = _USER_QUERY_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    if "<context>" in text and "</context>" in text:
-        tail = text.rsplit("</context>", 1)[1].strip()
-        if tail:
-            return tail
-    return text
-
-
-def _last_user_text(messages) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            return _unwrap_owui(_text_of(m.get("content")).strip())
-    return ""
-
-
-def _has_images(messages) -> bool:
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and p.get("type") == "image_url":
-                    return True
-    return False
-
-
-def _split_content_parts(content):
-    if not isinstance(content, list):
-        return [], []
-    text_parts = [
-        p.get("text", "")
-        for p in content
-        if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
-    ]
-    image_parts = [
-        p
-        for p in content
-        if isinstance(p, dict) and p.get("type") == "image_url"
-    ]
-    return text_parts, image_parts
 
 
 async def _describe_images_for_agent(messages, *, session=None):
@@ -164,152 +99,6 @@ def _with_system(messages, system_text):
             m["content"] = (base + "\n\n" + system_text).strip() if base else system_text
             return out
     return [{"role": "system", "content": system_text}] + out
-
-
-def _same_message_source(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    parts = []
-    for match in re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.S):
-        parts.append(match.strip())
-    for match in re.findall(r"(?m)((?:^>.*(?:\n|$))+)", text):
-        parts.append(re.sub(r"(?m)^>\s?", "", match).strip())
-    for match in re.findall(
-        r"(?is)(?:^|\n)\s*(?:sources?|notes?|context|references?|resume|job posting)\s*[:\-]\s*(.+?)(?:\n\s*\n|$)",
-        text,
-    ):
-        parts.append(match.strip())
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    for paragraph in paragraphs[1:]:
-        if len(paragraph) >= 120:
-            parts.append(paragraph)
-    seen = set()
-    out = []
-    for part in parts:
-        if part and part not in seen:
-            seen.add(part)
-            out.append(part)
-    return "\n\n".join(out).strip()
-
-
-async def _memory_recall(chat_id: str, query: str, session=None) -> list[tuple[str, str]]:
-    """Call tool-server memory recall. Uses its own session for independence."""
-    if not chat_id:
-        return []
-    try:
-        async with aiohttp.ClientSession() as own_session:
-            async with own_session.post(
-                f"{config.TOOL_SERVER_URL}/memory/recall",
-                json={"chat_id": chat_id, "query": query, "top_k": 6},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return [(t["role"], t["content"]) for t in data.get("turns", [])]
-    except Exception:
-        pass
-    return []
-
-
-async def _memory_store(chat_id: str, role: str, content: str, session=None) -> bool:
-    """Call tool-server memory store. Uses its own session to survive caller's session closure."""
-    if not chat_id:
-        return False
-    try:
-        async with aiohttp.ClientSession() as own_session:
-            async with own_session.post(
-                f"{config.TOOL_SERVER_URL}/memory/store",
-                json={"chat_id": chat_id, "role": role, "content": content},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("stored", False)
-    except Exception:
-        pass
-    return False
-
-
-async def _deliverable_store(chat_id: str, content: str, filename: str = "", fmt: str = "") -> bool:
-    """Persist a delivered document so a LATER turn can edit the real artifact instead
-    of rebuilding it from scratch. Fire-and-forget; failure just means no edit memory."""
-    if not (chat_id and (content or "").strip()):
-        return False
-    try:
-        async with aiohttp.ClientSession() as own_session:
-            async with own_session.post(
-                f"{config.TOOL_SERVER_URL}/deliverable/store",
-                json={"chat_id": chat_id, "content": content, "filename": filename, "fmt": fmt},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    return (await resp.json()).get("stored", False)
-    except Exception:
-        pass
-    return False
-
-
-async def _deliverable_get(chat_id: str):
-    """Fetch the latest delivered document for this chat (what a follow-up edits), or None."""
-    if not chat_id:
-        return None
-    try:
-        async with aiohttp.ClientSession() as own_session:
-            async with own_session.post(
-                f"{config.TOOL_SERVER_URL}/deliverable/get",
-                json={"chat_id": chat_id},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    return (await resp.json()).get("deliverable")
-    except Exception:
-        pass
-    return None
-
-
-async def _last_active(chat_id: str):
-    """Unix time of the chat's previous stored turn (for resume-after-a-gap awareness), or None."""
-    if not chat_id:
-        return None
-    try:
-        async with aiohttp.ClientSession() as own_session:
-            async with own_session.post(
-                f"{config.TOOL_SERVER_URL}/memory/last_active",
-                json={"chat_id": chat_id},
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
-            ) as resp:
-                if resp.status == 200:
-                    return (await resp.json()).get("last_active")
-    except Exception:
-        pass
-    return None
-
-
-def _gap_note(last_active) -> str:
-    """One line telling the model the user is RESUMING after a gap — but only when the
-    previous message was a prior calendar day or more (in local time). Same-day follow-ups
-    get nothing, so a continuous session stays clean. Fixes 'replies days later, acts like
-    no time passed' without timestamping every turn."""
-    if not last_active:
-        return ""
-    try:
-        tz = timezone(timedelta(minutes=config.LOCAL_TZ_OFFSET_MINUTES))
-        prev = datetime.fromtimestamp(float(last_active), tz)
-        days = (datetime.now(tz).date() - prev.date()).days
-    except Exception:
-        return ""
-    if days < 1:
-        return ""
-    when = "yesterday" if days == 1 else f"{days} days ago"
-    return (f"NOTE: the user is resuming this conversation after a gap — their previous "
-            f"message was {when} ({prev:%A, %d %B %Y}), not today. Earlier turns are older; "
-            f"don't treat the conversation as one continuous sitting.")
 
 
 async def _classify_edit(last_user: str, prior: dict, *, session=None) -> dict:
@@ -396,49 +185,6 @@ def _track_task(task):
     return task
 
 
-_SOURCE_BLOCK_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S | re.I)
-
-
-def _owui_source_blocks(text: str) -> list[str]:
-    """OpenWebUI injects an attached file's text (paperclip upload) into the chat
-    as <source id=.. name=..>..</source> blocks — by default appended to the final
-    user message, or to the system message when RAG_SYSTEM_CONTEXT is set. The whole
-    injected document lives here verbatim, so this is the authoritative grounding
-    source. Parsing it is what makes file attachments ground correctly WITHOUT the
-    user touching the RAG / full-context toggle — the file's own content, not a
-    fragile ≥120-char paragraph guess that drops short résumé lines."""
-    return [m.strip() for m in _SOURCE_BLOCK_RE.findall(text or "") if m.strip()]
-
-
-def _user_source(messages) -> str:
-    # Grounding "source" has two origins, in priority order:
-    #   1. Files the user ATTACHED — OWUI delivers these as <source> blocks (any
-    #      role). The full document is authoritative; take it whole.
-    #   2. Source-like material the user PASTED inline (quotes, code blocks, labeled
-    #      sources/notes/resume, long paragraphs) in their own turns.
-    # NOT ordinary conversational text — grounding casual follow-ups ("what's my
-    # name?") was slow and leaked "the provided source" into answers. The full
-    # conversation is still available to the model and auditors via `messages`.
-    parts = []
-    for m in messages:
-        text = _text_of(m.get("content"))
-        blocks = _owui_source_blocks(text)
-        parts.extend(blocks)
-        if m.get("role") == "user":
-            # Strip the <source> blocks first so the paragraph heuristic neither
-            # double-counts them nor pulls in their XML wrappers as noise.
-            remainder = _SOURCE_BLOCK_RE.sub("", text) if blocks else text
-            src = _same_message_source(remainder)
-            if src:
-                parts.append(src)
-    seen, out = set(), []
-    for part in parts:
-        if part and part not in seen:
-            seen.add(part)
-            out.append(part)
-    return "\n\n".join(out).strip()
-
-
 def _clip_memory_part(text: str, limit: int) -> str:
     text = (text or "").strip()
     if len(text) <= limit:
@@ -457,21 +203,6 @@ def _consolidated_user_memory(messages) -> str:
         "",
     )
     return _clip_memory_part(last_user, 3000)
-
-
-def _now_line() -> str:
-    """Tell the model what 'today' is, in the USER's local time — otherwise it has no idea
-    and burns tokens debating whether a date (e.g. 'finished my MS in May 2026') is past or
-    future. The OpenAI-style request OWUI sends carries no timezone, so we format in a
-    configured local offset (LOCAL_TZ_OFFSET_MINUTES) rather than the server's UTC clock."""
-    tz = timezone(timedelta(minutes=config.LOCAL_TZ_OFFSET_MINUTES))
-    now = datetime.now(tz)
-    # Both date orders, so a letterhead in either style ("10 June 2026" / "June 10, 2026")
-    # is a contiguous verbatim span of the grounding source — the backstop then protects a
-    # dated letterhead mechanically regardless of which format the writer picks.
-    return (f"The current date and time is {now:%A, %d %B %Y} ({now:%B %d, %Y}), "
-            f"{now:%H:%M} {config.LOCAL_TZ_LABEL}. Treat this as 'now' when reasoning "
-            "about whether any date or time is in the past or future.")
 
 
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
@@ -836,8 +567,6 @@ def _prose_provider(voice):
     return None
 
 
-
-
 def _prose_polish_messages(messages, candidate, source):
     """Build the polish request: the user's ask + (optional) source as untrusted
     reference + the open model's draft to rewrite. No tool-role messages /
@@ -851,8 +580,6 @@ def _prose_polish_messages(messages, candidate, source):
         {"role": "system", "content": _PROSE_POLISH_SYS},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
-
-
 
 
 async def _classify_voice_register(request, candidate, *, session=None) -> str:
@@ -900,17 +627,6 @@ def _is_clarification(text: str) -> bool:
     cues = ("i need to know", "before i write", "could you clarify", "a few questions",
             "to write this", "which of", "can you tell me", "what is the", "let me know")
     return len(t) < 1200 and (t.count("?") >= 2 or any(c in t for c in cues))
-
-
-def _all_user_text(messages) -> str:
-    """Every user turn joined — facts AND instructions. The honesty auditor needs
-    the instructions too, so it can tell 'emphasize my 8 years' (an instruction)
-    apart from a stated fact."""
-    return "\n\n".join(
-        _unwrap_owui(_text_of(m.get("content")).strip())
-        for m in messages
-        if m.get("role") == "user" and _text_of(m.get("content")).strip()
-    )
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -1068,12 +784,20 @@ async def _refine_facts(full_request: str, source: str, candidate: str, unsuppor
 
 
 def _facts_block_msg(unsupported) -> str:
+    """Refuse AND help — a bare refusal is honest but useless (the A/B lost honesty-trap
+    cases on helpfulness, not honesty). Name what's blocked, why, and the concrete ways
+    forward, so the user can act immediately."""
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else ""
     return (
-        "I can't present those claims as true from the facts you gave me. These "
-        "details are unsupported:\n\n" + listed
-        + "\n\nI can still write a truthful version using the facts you provided, "
-        "or you can give me the real details and I'll include them accurately."
+        "I can't present those claims as true — they aren't in your sources or anything "
+        "you've told me, and inventing them could genuinely hurt you if challenged:\n\n"
+        + listed
+        + "\n\nThree ways forward, pick any:\n"
+        "1. **Give me the real details** for the points above and I'll include them accurately.\n"
+        "2. **I write the strongest truthful version now**, using only what you've given me — "
+        "often the honest framing reads better than the inflated one.\n"
+        "3. **Point me at a source** (a file, a link, or just tell me the facts) and I'll "
+        "verify and work it in."
     )
 
 
