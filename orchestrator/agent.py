@@ -697,10 +697,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
             # Sanity: the revision must still BE the document (not an ack/refusal). If it
             # isn't, fall through to the normal loop with the injected-doc directive.
-            # The writer may ask instead of guess (the user prefers collaboration): a
-            # short question-shaped response ships straight to the user, and their reply
-            # next turn re-enters this same edit path with the document still stored.
-            if revised and not _same_doc(revised, baseline) and _is_clarification(revised):
+            # The writer may ask instead of guess (the user prefers collaboration). Its
+            # instructed contract is structural — output the document OR a short question —
+            # so a short, question-marked, non-document response IS the question; ship it
+            # straight to the user. Their reply re-enters this path, document still stored.
+            if (revised and not _same_doc(revised, baseline)
+                    and "?" in revised and len(revised) < 1200):
                 yield ("content", revised)
                 return
             if revised and _same_doc(revised, baseline):
