@@ -835,10 +835,25 @@ class LastActiveRequest(BaseModel):
     chat_id: str = Field(..., description="OWUI chat ID")
 
 
+USAGE_SWEEP_MINUTES = int(os.getenv("USAGE_SWEEP_MINUTES", "30"))
+_bg_tasks: set = set()
+
+
 @app.on_event("startup")
 async def startup_init_memory():
     """Pre-init the memory DB on startup so first request is fast."""
     await memory.get_conn()
+
+    async def _sweep_loop():
+        # Pull DIRECT OWUI model usage into the ledger periodically, so the spend
+        # panel covers everything — not just PrismAI's own calls.
+        while True:
+            await memory.sweep_owui_usage()
+            await asyncio.sleep(USAGE_SWEEP_MINUTES * 60)
+
+    t = asyncio.create_task(_sweep_loop())
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
 
 
 @app.post(
@@ -911,7 +926,11 @@ async def deliverable_get(req: DeliverableGetRequest) -> dict:
 USAGE_PRICES: dict = {
     "deepseek-v4-pro": (0.90, 0.90), "deepseek-v4-flash": (0.10, 0.40),
     "kimi-k2p6": (1.00, 3.00), "gpt-5.5": (1.25, 10.00),
-    "claude-sonnet-4-6": (3.00, 15.00), "qwen3-embedding": (0.02, 0.0),
+    "claude-sonnet-4-6": (3.00, 15.00), "qwen3-embedding": (0.02, 0.0), "glm-5p1": (0.80, 2.00), "glm-5": (0.80, 2.00),
+    "kimi-k2p5": (0.60, 2.50), "kimi-k2-thinking": (0.60, 2.50),
+    "deepseek-v3p1": (0.30, 1.20), "deepseek-v3p2": (0.30, 1.20),
+    "gpt-oss-120b": (0.15, 0.60), "mixtral-8x22b-instruct": (0.90, 0.90),
+    "cogito-671b-v2-p1": (0.90, 0.90), "v4-research-writing": (0.90, 0.90),
 }
 try:
     USAGE_PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()})
@@ -957,6 +976,7 @@ async def usage_page(month: str = ""):
     from fastapi.responses import HTMLResponse
     import datetime as _dt
     month = month or _dt.datetime.utcnow().strftime("%Y-%m")
+    await memory.sweep_owui_usage()
     s = await usage_summary_api(month)
 
     def table(title, bucket, price_by_model=False):

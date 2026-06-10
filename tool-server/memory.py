@@ -11,6 +11,7 @@ import concurrent.futures
 import hashlib
 import logging
 import math
+import json
 import os
 import pathlib
 import re
@@ -205,6 +206,14 @@ async def get_conn() -> Optional[sqlite3.Connection]:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
+            try:
+                conn.execute("ALTER TABLE usage ADD COLUMN source_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            # Dedup for swept rows (OWUI chat messages re-seen across sweeps).
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_src "
+                         "ON usage(source_id) WHERE source_id IS NOT NULL")
+            conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
 
             # FTS5 for hybrid retrieval
             conn.execute(
@@ -457,6 +466,62 @@ async def log_usage(model: str, label: str, in_tok: int, out_tok: int) -> bool:
     except Exception as e:
         logger.warning(f"usage log failed: {e}")
         return False
+
+
+OWUI_DB_PATH = os.getenv("OWUI_DB_PATH", "/app/backend/data/webui.db")
+
+
+async def sweep_owui_usage() -> int:
+    """Pull token usage for DIRECT OWUI model chats (deepseek/glm/kimi/… used outside
+    PrismAI) from webui.db into the ledger. OWUI persists usage on every assistant
+    message; PrismAI's own turns are skipped (already ledgered at call time). Dedup via
+    source_id, so re-sweeping is free. Returns rows added."""
+    conn = await get_conn()
+    if not conn:
+        return 0
+    try:
+        def _sweep():
+            wm_row = conn.execute("SELECT v FROM kv WHERE k='usage_sweep_watermark'").fetchone()
+            wm = float(wm_row[0]) if wm_row else 0.0
+            src = sqlite3.connect(f"file:{OWUI_DB_PATH}?mode=ro", uri=True)
+            added, new_wm = 0, wm
+            try:
+                for cid, blob, upd in src.execute(
+                        "SELECT id, chat, updated_at FROM chat WHERE updated_at > ?",
+                        (wm - 3600,)):  # 1h overlap; dedup absorbs the rescan
+                    new_wm = max(new_wm, float(upd or 0))
+                    try:
+                        msgs = (json.loads(blob).get("history") or {}).get("messages") or {}
+                    except Exception:
+                        continue
+                    for mid, m in msgs.items():
+                        u = m.get("usage") or {}
+                        model = str(m.get("model") or "")
+                        if (m.get("role") != "assistant" or not u
+                                or model.startswith("PrismAI") or not model):
+                            continue
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO usage (ts, model, label, in_tok, out_tok, source_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (float(m.get("timestamp") or upd or time.time()),
+                             model.split("/")[-1], "owui-chat",
+                             int(u.get("prompt_tokens") or u.get("input_tokens") or 0),
+                             int(u.get("completion_tokens") or u.get("output_tokens") or 0),
+                             f"{cid}:{mid}"))
+                        added += cur.rowcount
+            finally:
+                src.close()
+            conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('usage_sweep_watermark', ?)",
+                         (str(new_wm),))
+            conn.commit()
+            return added
+        added = await _db(_sweep)
+        if added:
+            logger.info(f"usage sweep: +{added} rows from OWUI chats")
+        return added
+    except Exception as e:
+        logger.warning(f"usage sweep failed: {e}")
+        return 0
 
 
 async def usage_summary(month: str) -> dict:

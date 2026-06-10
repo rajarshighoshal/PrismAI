@@ -121,6 +121,27 @@ async def main():
     check("deliverable: the latest version survives the cap",
           (await memory.get_deliverable("dcap"))["version"] == memory.DELIVERABLES_MAX_PER_CHAT + 5)
 
+    # Usage sweep: direct-OWUI-chat tokens land in the ledger; PrismAI rows are
+    # skipped (already ledgered at call time); re-sweep dedups via source_id.
+    await _fresh_db()
+    import sqlite3 as _sq, json as _json, time as _time
+    owui = os.path.join(tempfile.mkdtemp(), "webui.db")
+    src = _sq.connect(owui)
+    src.execute("CREATE TABLE chat (id TEXT, chat TEXT, updated_at REAL)")
+    msgs = {"m1": {"role": "assistant", "model": "accounts/fireworks/models/glm-5p1",
+                   "usage": {"prompt_tokens": 100, "completion_tokens": 50}},
+            "m2": {"role": "assistant", "model": "PrismAI", "usage": {"prompt_tokens": 9, "completion_tokens": 9}}}
+    src.execute("INSERT INTO chat VALUES (?, ?, ?)",
+                ("c-x", _json.dumps({"history": {"messages": msgs}}), _time.time()))
+    src.commit(); src.close()
+    memory.OWUI_DB_PATH = owui
+    added = await memory.sweep_owui_usage()
+    check("sweep: direct-chat usage row added (PrismAI skipped)", added == 1)
+    check("sweep: re-sweep dedups", await memory.sweep_owui_usage() == 0)
+    conn = await memory.get_conn()
+    row = conn.execute("SELECT model, in_tok, out_tok, label FROM usage WHERE source_id IS NOT NULL").fetchone()
+    check("sweep: tokens + label recorded", row == ("glm-5p1", 100, 50, "owui-chat"))
+
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0
 
