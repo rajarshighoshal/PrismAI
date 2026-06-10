@@ -680,7 +680,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             return
         if intent["action"] == "edit":
             if config.SHOW_WORK:
-                yield ("reasoning", "✏️ Revising the document…\n")
+                yield ("content", "✏️ Revising the document…\n\n")
             baseline = (prior_deliverable.get("content") or "").strip()
             revised = ""
             try:
@@ -707,7 +707,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 return
             if revised and _same_doc(revised, baseline):
                 if config.SHOW_WORK:
-                    yield ("reasoning", "✍️ Verifying the revision…\n")
+                    yield ("content", "🛡️ Verifying facts…\n\n")
                 src = ((_user_source(messages) + "\n\n" + baseline).strip()
                        if _user_source(messages).strip() else baseline)
                 status, text = await _verified_or_blocked(
@@ -1092,7 +1092,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if prose is not None:
             prose_client, prose_model = prose
             if config.SHOW_WORK:
-                yield ("reasoning", f"✨ Polishing the document ({prose_model.split('/')[-1]})…\n")
+                yield ("content" if pending_exports else "reasoning", f"✨ Polishing the document ({prose_model.split('/')[-1]})…\n\n")
             # messages_for_verify (= the kept tail in overflow) bounds the premium
             # polish prompt. Stream the polished deliverable live ONLY when the chat
             # carries it. When a FILE carries it, the body goes nowhere near the thinking
