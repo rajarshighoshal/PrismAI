@@ -801,6 +801,22 @@ async def _run_tests():
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
 
+    # TEXTUAL TOOL CALL: the model writes "<tool_calls>…" as plain text (DeepSeek leak —
+    # live report: raw markup shipped as the answer, nothing executed). The harness
+    # nudges once; the model re-issues it properly and the real search runs.
+    _reset()
+    _chat_queue.extend([
+        _chat_content('<tool_calls> <tool_call name="web_search"> {"queries": ["fable 5 benchmarks"]} </tool_call> </tool_calls>'),
+        _chat_tools(_tool_call("web_search", {"query": "fable 5 benchmarks"})),
+        _chat_content("Fable 5 scores ~80% on Magenta Code [1]."),
+    ])
+    _tool_gate_queue.append(True)
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "pull the benchmark details"}])
+    body = _content(ev)
+    check("textual-tool: leaked text call is nudged into a REAL call and the answer ships",
+          _calls["search"] and "Magenta Code" in body and "<tool_call" not in body)
+
     # DOUBLE-VOTE: a flaky 'new' verdict must win twice — the second vote rescues an
     # edit (live smoke caught the classifier flaking ~1 in 4 on typo-heavy edit messages,
     # silently dropping the document). First vote new, second edit -> directed pipeline.

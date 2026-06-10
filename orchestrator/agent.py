@@ -45,6 +45,13 @@ from .prompts import (
 
 log = logging.getLogger(__name__)
 
+# A tool call leaked into the CONTENT channel as text (DeepSeek DSML / <tool_calls>
+# markup, incl. the fullwidth-pipe variant) — it never executed; detect and recover.
+_TEXTUAL_TOOL_CALL_RE = re.compile(r"<\s*[｜|]?\s*(?:tool_calls?|invoke|DSML)\b", re.I)
+_TEXTUAL_TOOL_BLOCK_RE = re.compile(
+    r"<\s*[｜|]?\s*(?:tool_calls?|invoke|DSML)\b.*?(?:</\s*[｜|]?\s*(?:tool_calls?|invoke|DSML)\s*>|$)",
+    re.I | re.S)
+
 
 async def _describe_images_for_agent(messages, *, session=None):
     # Transcribe every image-bearing message CONCURRENTLY — a chat with several image
@@ -843,6 +850,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     web_search_count = 0
     budget_note_added = False
     edit_nudged = False
+    textual_tool_nudged = False
     polish_voice = None
     polish_voice_pass = None
 
@@ -973,6 +981,27 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             continue
 
         candidate = (message.get("content") or "").strip()
+
+        # DeepSeek sometimes writes its tool call as PLAIN TEXT ("<tool_calls>…") instead
+        # of the function-calling channel — nothing executes and the user would see raw
+        # markup as the answer (live report). Same defense the tool-server has for
+        # exports: nudge once so the model re-issues it properly; strip as last resort.
+        if _TEXTUAL_TOOL_CALL_RE.search(candidate):
+            if not textual_tool_nudged:
+                textual_tool_nudged = True
+                scratch.append({"role": "assistant", "content": candidate})
+                scratch.append({
+                    "role": "system",
+                    "content": (
+                        "Internal harness note: you wrote a tool call as plain text — it "
+                        "did NOT execute and the user would see raw markup. Issue it "
+                        "through the function-calling interface, or answer directly "
+                        "without the tool."
+                    ),
+                })
+                continue
+            candidate = _TEXTUAL_TOOL_BLOCK_RE.sub("", candidate).strip()
+
         if not candidate:
             scratch.append(
                 {
