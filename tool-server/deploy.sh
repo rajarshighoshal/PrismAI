@@ -15,6 +15,15 @@ if [ -f "$ENV_FILE" ]; then
     ENV_ARGS=(--env-file "$ENV_FILE")
 fi
 
+# OWUI's data dir (read-only) so the usage sweeper can read webui.db chat usage.
+OWUI_DATA=$(docker inspect open-webui \
+    --format '{{range .Mounts}}{{if eq .Destination "/app/backend/data"}}{{.Source}}{{end}}{{end}}' \
+    2>/dev/null || true)
+OWUI_ARGS=()
+if [ -n "$OWUI_DATA" ]; then
+    OWUI_ARGS=(-v "${OWUI_DATA}:/owui:ro" -e OWUI_DB_PATH=/owui/webui.db)
+fi
+
 # Discover the network the existing open-webui container lives on.
 NETWORK=$(docker inspect open-webui \
     --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' \
@@ -44,7 +53,7 @@ if ! docker run -d \
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
-        -v owui-tool-server-data:/app/backend/data \
+        -v owui-tool-server-data:/app/backend/data "${OWUI_ARGS[@]}" \
         "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$IMAGE"; then
@@ -54,7 +63,7 @@ if ! docker run -d \
             --name "$CONTAINER" \
             --network "$NETWORK" \
             --restart unless-stopped \
-            -v owui-tool-server-data:/app/backend/data \
+            -v owui-tool-server-data:/app/backend/data "${OWUI_ARGS[@]}" \
             "${ENV_ARGS[@]}" \
             -p "127.0.0.1:${HOST_PORT}:8001" \
             "$BACKUP_IMAGE" >/dev/null
@@ -84,7 +93,7 @@ if docker image inspect "$BACKUP_IMAGE" >/dev/null 2>&1; then
         --name "$CONTAINER" \
         --network "$NETWORK" \
         --restart unless-stopped \
-        -v owui-tool-server-data:/app/backend/data \
+        -v owui-tool-server-data:/app/backend/data "${OWUI_ARGS[@]}" \
         "${ENV_ARGS[@]}" \
         -p "127.0.0.1:${HOST_PORT}:8001" \
         "$BACKUP_IMAGE" >/dev/null
