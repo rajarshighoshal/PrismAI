@@ -72,13 +72,9 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     now = int(time.time())
-    # The description shows on OWUI's model card — keep the spend panel discoverable.
-    desc = f"💰 Monthly spend: {config.USAGE_PANEL_URL}"
     data = [
-        {"id": config.ADVERTISED_CHAT_ID, "object": "model", "created": now, "owned_by": "orchestrator",
-         "info": {"meta": {"description": desc}}},
-        {"id": config.ADVERTISED_VISION_ID, "object": "model", "created": now, "owned_by": "orchestrator",
-         "info": {"meta": {"description": desc}}},
+        {"id": config.ADVERTISED_CHAT_ID, "object": "model", "created": now, "owned_by": "orchestrator"},
+        {"id": config.ADVERTISED_VISION_ID, "object": "model", "created": now, "owned_by": "orchestrator"},
     ]
     return {"object": "list", "data": data}
 
