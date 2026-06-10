@@ -198,10 +198,14 @@ def _edit_inject(prior: dict) -> str:
         "chat. Here is that document, verbatim:\n\n"
         "--- CURRENT DOCUMENT ---\n" + (prior.get("content") or "").strip()
         + "\n--- END CURRENT DOCUMENT ---\n\n"
-        "Make ONLY the change the user now asks for. Keep every other word, sentence, "
-        "heading, and the overall structure byte-for-byte identical — do not rewrite, "
-        "re-order, or 'improve' anything else. Then export the revised document with the "
-        "same export tool and filename as before, unless the user asks to rename it."
+        "Make the change the user asks for — their INTENT, not a literal find-and-replace "
+        "of their words. A 'fix this line' touches one line; a 'review and make X "
+        "consistent' means reading the whole document and rewording every passage the "
+        "intent genuinely covers, with judgment. Leave everything the request does not "
+        "cover exactly as it is — never rewrite, re-order, or 'improve' beyond the ask. "
+        "If the instruction is ambiguous or you are unsure what they want, output ONLY a "
+        "short clarifying question (no document) — the user explicitly prefers being "
+        "asked over being guessed at, and their answer comes straight back to you."
     )
 
 
@@ -693,6 +697,12 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                 log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
             # Sanity: the revision must still BE the document (not an ack/refusal). If it
             # isn't, fall through to the normal loop with the injected-doc directive.
+            # The writer may ask instead of guess (the user prefers collaboration): a
+            # short question-shaped response ships straight to the user, and their reply
+            # next turn re-enters this same edit path with the document still stored.
+            if revised and not _same_doc(revised, baseline) and _is_clarification(revised):
+                yield ("content", revised)
+                return
             if revised and _same_doc(revised, baseline):
                 if config.SHOW_WORK:
                     yield ("reasoning", "✍️ Verifying the revision…\n")

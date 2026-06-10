@@ -801,6 +801,18 @@ async def _run_tests():
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
 
+    # COLLABORATE: on an ambiguous edit the writer may ASK instead of guess — the
+    # question ships straight to the user (no export, no reconstruction), and the chat
+    # keeps the document stored for their answer.
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee, I have built ML systems for years.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _edit_write_queue.append("Do you want 'data science' replaced everywhere, or only in the experience section?")
+    ev = await _collect([{"role": "user", "content": "make the wording consistent with the thing I said"}],
+                        request_headers={"x-openwebui-chat-id": "edit9"})
+    check("edit/collab: an ambiguous edit yields a clarifying question, not a guess",
+          "replaced everywhere" in _content(ev) and not _calls["post"])
+
     # TEXTUAL TOOL CALL: the model writes "<tool_calls>…" as plain text (DeepSeek leak —
     # live report: raw markup shipped as the answer, nothing executed). The harness
     # nudges once; the model re-issues it properly and the real search runs.
