@@ -906,6 +906,81 @@ async def deliverable_get(req: DeliverableGetRequest) -> dict:
     return {"chat_id": req.chat_id, "deliverable": d}
 
 
+# $/Mtok (input, output) — ESTIMATES, edit via USAGE_PRICES env (JSON) when providers
+# change pricing; applied at query time so corrections re-price history.
+USAGE_PRICES: dict = {
+    "deepseek-v4-pro": (0.90, 0.90), "deepseek-v4-flash": (0.10, 0.40),
+    "kimi-k2p6": (1.00, 3.00), "gpt-5.5": (1.25, 10.00),
+    "claude-sonnet-4-6": (3.00, 15.00), "qwen3-embedding": (0.02, 0.0),
+}
+try:
+    USAGE_PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()})
+except Exception:
+    pass
+
+
+def _usage_cost(model: str, in_tok: int, out_tok: int) -> float:
+    m = (model or "").split("/")[-1]
+    for key, (pi, po) in USAGE_PRICES.items():
+        if key in m:
+            return (in_tok * pi + out_tok * po) / 1_000_000
+    return 0.0
+
+
+class UsageLogRequest(BaseModel):
+    model: str
+    label: str = ""
+    in_tok: int = 0
+    out_tok: int = 0
+
+
+@app.post("/usage/log", operation_id="usage_log")
+async def usage_log(req: UsageLogRequest) -> dict:
+    return {"ok": await memory.log_usage(req.model, req.label, req.in_tok, req.out_tok)}
+
+
+@app.get("/usage/summary", operation_id="usage_summary")
+async def usage_summary_api(month: str = "") -> dict:
+    import datetime as _dt
+    month = month or _dt.datetime.utcnow().strftime("%Y-%m")
+    s = await memory.usage_summary(month)
+    for bucket in ("by_model", "by_label", "by_day"):
+        for key, b in (s.get(bucket) or {}).items():
+            b["usd"] = round(_usage_cost(key if bucket == "by_model" else "", b["in"], b["out"]), 4)
+    if s.get("by_model"):
+        s["total_usd"] = round(sum(b["usd"] for b in s["by_model"].values()), 2)
+    return s
+
+
+@app.get("/usage")
+async def usage_page(month: str = ""):
+    from fastapi.responses import HTMLResponse
+    import datetime as _dt
+    month = month or _dt.datetime.utcnow().strftime("%Y-%m")
+    s = await usage_summary_api(month)
+
+    def table(title, bucket, price_by_model=False):
+        rows = sorted((s.get(bucket) or {}).items(),
+                      key=lambda kv: -(kv[1]["in"] + kv[1]["out"]))
+        body = "".join(
+            f"<tr><td>{k}</td><td>{b['calls']}</td><td>{b['in']:,}</td>"
+            f"<td>{b['out']:,}</td><td>{'$%.3f' % b['usd'] if price_by_model else '—'}</td></tr>"
+            for k, b in rows)
+        return (f"<h3>{title}</h3><table><tr><th></th><th>calls</th><th>in tok</th>"
+                f"<th>out tok</th><th>$</th></tr>{body}</table>")
+
+    html_page = f"""<!doctype html><meta charset=utf-8><title>PrismAI spend</title>
+<style>body{{font:14px system-ui;margin:2rem;max-width:760px}}table{{border-collapse:collapse;width:100%;margin:0 0 1.5rem}}
+td,th{{border:1px solid #ddd;padding:6px 10px;text-align:right}}td:first-child,th:first-child{{text-align:left}}
+h1 small{{color:#888;font-weight:400}}</style>
+<h1>💰 {month}: <b>${s.get('total_usd', 0)}</b> <small>{s.get('calls', 0)} model calls — prices are config estimates (USAGE_PRICES)</small></h1>
+<form>month <input name=month value="{month}" size=8> <button>go</button></form>
+{table('By model', 'by_model', price_by_model=True)}
+{table('By job', 'by_label')}
+{table('By day', 'by_day')}"""
+    return HTMLResponse(html_page)
+
+
 @app.post(
     "/memory/last_active",
     summary="When this chat last had a stored turn (for resume-after-gap awareness)",

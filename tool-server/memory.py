@@ -193,6 +193,19 @@ async def get_conn() -> Optional[sqlite3.Connection]:
                 "ON deliverables(chat_id, version)"
             )
 
+            # Per-model-call usage (tokens; $ computed at query time from prices).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    model TEXT NOT NULL,
+                    label TEXT,
+                    in_tok INTEGER DEFAULT 0,
+                    out_tok INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
+
             # FTS5 for hybrid retrieval
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chat_turns_fts "
@@ -423,6 +436,54 @@ async def get_deliverable(chat_id: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"Deliverable get failed: {e}")
         return None
+
+
+async def log_usage(model: str, label: str, in_tok: int, out_tok: int) -> bool:
+    """One row per model call (fire-and-forget from the orchestrator's tracer).
+    Tokens only — $ is computed at query time from a price table, so price
+    corrections re-price history."""
+    conn = await get_conn()
+    if not conn or not model:
+        return False
+    try:
+        def _write():
+            conn.execute(
+                "INSERT INTO usage (ts, model, label, in_tok, out_tok) VALUES (?, ?, ?, ?, ?)",
+                (time.time(), model, label or "?", int(in_tok or 0), int(out_tok or 0)),
+            )
+            conn.commit()
+        await _db(_write)
+        return True
+    except Exception as e:
+        logger.warning(f"usage log failed: {e}")
+        return False
+
+
+async def usage_summary(month: str) -> dict:
+    """Aggregate tokens for a YYYY-MM month: by model, by label, by day."""
+    conn = await get_conn()
+    if not conn:
+        return {}
+    try:
+        def _read():
+            rows = conn.execute(
+                "SELECT ts, model, label, in_tok, out_tok FROM usage "
+                "WHERE strftime('%Y-%m', ts, 'unixepoch') = ?", (month,)
+            ).fetchall()
+            return rows
+        rows = await _db(_read)
+        by_model, by_label, by_day = {}, {}, {}
+        for ts, model, label, i, o in rows:
+            import datetime as _dt
+            day = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            for bucket, key in ((by_model, model), (by_label, label), (by_day, day)):
+                b = bucket.setdefault(key, {"in": 0, "out": 0, "calls": 0})
+                b["in"] += i; b["out"] += o; b["calls"] += 1
+        return {"month": month, "calls": len(rows),
+                "by_model": by_model, "by_label": by_label, "by_day": by_day}
+    except Exception as e:
+        logger.warning(f"usage summary failed: {e}")
+        return {}
 
 
 async def last_active(chat_id: str) -> Optional[float]:

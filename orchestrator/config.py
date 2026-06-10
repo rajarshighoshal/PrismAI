@@ -249,3 +249,7 @@ QUERY_MAX_CHARS = int(os.getenv("QUERY_MAX_CHARS", "400"))
 # Also audit GROUNDED answers against retrieved snippets (extra call). Default off
 # to keep GROUNDED cheap; verification is reserved for deliverables.
 ENABLE_GROUNDED_VERIFY = _flag("ENABLE_GROUNDED_VERIFY", "false")
+
+# Where the spend panel lives (the tool-server's /usage page). Set the real
+# browser-reachable URL in orchestrator.env; shows on the OWUI model card.
+USAGE_PANEL_URL = os.getenv("USAGE_PANEL_URL", "http://localhost:8001/usage")
