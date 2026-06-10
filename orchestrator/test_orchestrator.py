@@ -292,8 +292,8 @@ async def _run_tests():
     _gate_queue.append(False)
     ev = await _collect([{"role": "user", "content": "write something for me"}])
     reasoning = "".join(t for k, t in ev if k == "reasoning")
-    check("preamble: instant status shown as reasoning before the answer", "Planning the response" in reasoning)
-    check("preamble: answer still produced", _content(ev) == "Plain answer.")
+    check("preamble: instant status is VISIBLE chat content, not thinking", "Working on it" in _content(ev))
+    check("preamble: answer still produced", _content(ev).endswith("Plain answer."))
     config.STREAM_PREAMBLE = False
 
     # Optimistic streaming: the open-model answer streams live; a clean turn shows

@@ -635,9 +635,6 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # Instant feedback: a heavy turn (uploaded doc, big paste) spends a few seconds
     # on the first generation before any other breadcrumb — show something now so
     # the user isn't staring at a blank.
-    if config.SHOW_WORK:
-        yield ("reasoning", "🧠 Reading your request…\n")
-
     user_final_model = (user_model or "").strip()
     is_user_model = bool(user_final_model)
 
@@ -651,7 +648,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     active_task = asyncio.ensure_future(_last_active(chat_id)) if chat_id else None
     if had_images:
         if config.SHOW_WORK:
-            yield ("reasoning", "🖼️ Reading image context…\n")
+            yield ("content", "🖼️ Reading the image…\n\n")
         messages = await _describe_images_for_agent(messages, session=session)
 
     style_profile = await style_task
@@ -852,7 +849,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # generation to emit filler added latency and cost and cluttered the thinking panel
     # with non-model text. (feat/progress-ux will make these stages user-visible.)
     if config.SHOW_WORK and config.STREAM_PREAMBLE:
-        yield ("reasoning", "🧭 Planning the response…\n")
+        yield ("content", "🧭 Working on it…\n\n")
 
     tool_sources = []
     export_links = []        # immediate exports (csv) — link collected as they run
