@@ -127,20 +127,34 @@ async def main():
     import sqlite3 as _sq, json as _json, time as _time
     owui = os.path.join(tempfile.mkdtemp(), "webui.db")
     src = _sq.connect(owui)
-    src.execute("CREATE TABLE chat (id TEXT, chat TEXT, updated_at REAL)")
+    src.execute("CREATE TABLE chat (id TEXT, user_id TEXT, chat TEXT, updated_at REAL)")
+    src.execute("CREATE TABLE user (id TEXT, name TEXT, email TEXT)")
+    src.execute("INSERT INTO user VALUES ('u-1', 'Rajarshi', 'r@x.com')")
     msgs = {"m1": {"role": "assistant", "model": "accounts/fireworks/models/glm-5p1",
                    "usage": {"prompt_tokens": 100, "completion_tokens": 50}},
             "m2": {"role": "assistant", "model": "PrismAI", "usage": {"prompt_tokens": 9, "completion_tokens": 9}}}
-    src.execute("INSERT INTO chat VALUES (?, ?, ?)",
-                ("c-x", _json.dumps({"history": {"messages": msgs}}), _time.time()))
+    src.execute("INSERT INTO chat VALUES (?, ?, ?, ?)",
+                ("c-x", "u-1", _json.dumps({"history": {"messages": msgs}}), _time.time()))
     src.commit(); src.close()
     memory.OWUI_DB_PATH = owui
     added = await memory.sweep_owui_usage()
     check("sweep: direct-chat usage row added (PrismAI skipped)", added == 1)
     check("sweep: re-sweep dedups", await memory.sweep_owui_usage() == 0)
     conn = await memory.get_conn()
-    row = conn.execute("SELECT model, in_tok, out_tok, label FROM usage WHERE source_id IS NOT NULL").fetchone()
-    check("sweep: tokens + label recorded", row == ("glm-5p1", 100, 50, "owui-chat"))
+    row = conn.execute("SELECT model, in_tok, out_tok, label, user_id FROM usage WHERE source_id IS NOT NULL").fetchone()
+    check("sweep: tokens + label + owner recorded", row == ("glm-5p1", 100, 50, "owui-chat", "u-1"))
+
+    # Per-user, per-row-priced summary: two users, two models, $ correct per bucket.
+    await _fresh_db()
+    memory.OWUI_DB_PATH = "/nonexistent"  # no name map -> raw ids; isolate this case
+    await memory.log_usage("deepseek-v4-pro", "agent", 1_000_000, 0, user_id="u-alice")
+    await memory.log_usage("gpt-5.5", "polish", 0, 1_000_000, user_id="u-bob")
+    cost = lambda m, i, o: (i * (1.0 if "deepseek" in m else 2.0) + o * (0.0 if "deepseek" in m else 10.0)) / 1_000_000
+    s = await memory.usage_summary(__import__("datetime").datetime.utcnow().strftime("%Y-%m"), cost_fn=cost)
+    check("summary: per-user buckets present", set(s["by_user"]) == {"u-alice", "u-bob"})
+    check("summary: per-user $ priced per row", round(s["by_user"]["u-alice"]["usd"], 2) == 1.0
+          and round(s["by_user"]["u-bob"]["usd"], 2) == 10.0)
+    check("summary: total $ sums all rows", s["total_usd"] == 11.0)
 
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0

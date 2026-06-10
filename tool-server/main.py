@@ -951,54 +951,116 @@ class UsageLogRequest(BaseModel):
     label: str = ""
     in_tok: int = 0
     out_tok: int = 0
+    user_id: str = ""
 
 
 @app.post("/usage/log", operation_id="usage_log")
 async def usage_log(req: UsageLogRequest) -> dict:
-    return {"ok": await memory.log_usage(req.model, req.label, req.in_tok, req.out_tok)}
+    # Called only on the internal docker network by the orchestrator (not proxied out).
+    return {"ok": await memory.log_usage(req.model, req.label, req.in_tok, req.out_tok, req.user_id)}
+
+
+_admin_cache: dict = {}  # token -> (expiry_ts, user) — avoid hammering OWUI per request
+
+
+async def _owui_admin(token: str) -> Optional[dict]:
+    """Validate an OWUI session token and REQUIRE admin role (the panel is admin-only).
+    Verified against OWUI's own /api/v1/auths/ — no separate password, the browser's
+    existing OWUI session is the credential."""
+    import time as _t
+    token = (token or "").strip()
+    if not token:
+        return None
+    hit = _admin_cache.get(token)
+    if hit and hit[0] > _t.monotonic():
+        return hit[1]
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{OPENWEBUI_BASE_URL}/api/v1/auths/",
+                                  headers={"Authorization": f"Bearer {token}"})
+        user = r.json() if r.status_code == 200 else {}
+        admin = user if user.get("role") == "admin" else None
+        _admin_cache[token] = (_t.monotonic() + 60, admin)
+        return admin
+    except Exception:
+        return None
+
+
+def _bearer(request: Request) -> str:
+    return (request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+            or request.query_params.get("token", ""))
 
 
 @app.get("/usage/summary", operation_id="usage_summary")
-async def usage_summary_api(month: str = "") -> dict:
+async def usage_summary_api(request: Request, month: str = "") -> dict:
+    if not await _owui_admin(_bearer(request)):
+        raise HTTPException(status_code=403, detail="admin only")
     import datetime as _dt
     month = month or _dt.datetime.utcnow().strftime("%Y-%m")
-    s = await memory.usage_summary(month)
-    for bucket in ("by_model", "by_label", "by_day"):
-        for key, b in (s.get(bucket) or {}).items():
-            b["usd"] = round(_usage_cost(key if bucket == "by_model" else "", b["in"], b["out"]), 4)
-    if s.get("by_model"):
-        s["total_usd"] = round(sum(b["usd"] for b in s["by_model"].values()), 2)
-    return s
+    await memory.sweep_owui_usage()  # fold in direct-chat usage before reporting
+    return await memory.usage_summary(month, cost_fn=_usage_cost)
 
 
 @app.get("/usage")
-async def usage_page(month: str = ""):
+async def usage_page():
+    """Client-rendered, admin-only. Served same-origin as OWUI, so its JS reads the
+    existing OWUI session token from localStorage — the user is never asked to log in
+    again. All aggregation/$ comes from /usage/summary (which enforces admin)."""
     from fastapi.responses import HTMLResponse
-    import datetime as _dt
-    month = month or _dt.datetime.utcnow().strftime("%Y-%m")
-    await memory.sweep_owui_usage()
-    s = await usage_summary_api(month)
+    return HTMLResponse(_USAGE_HTML)
 
-    def table(title, bucket, price_by_model=False):
-        rows = sorted((s.get(bucket) or {}).items(),
-                      key=lambda kv: -(kv[1]["in"] + kv[1]["out"]))
-        body = "".join(
-            f"<tr><td>{k}</td><td>{b['calls']}</td><td>{b['in']:,}</td>"
-            f"<td>{b['out']:,}</td><td>{'$%.3f' % b['usd'] if price_by_model else '—'}</td></tr>"
-            for k, b in rows)
-        return (f"<h3>{title}</h3><table><tr><th></th><th>calls</th><th>in tok</th>"
-                f"<th>out tok</th><th>$</th></tr>{body}</table>")
 
-    html_page = f"""<!doctype html><meta charset=utf-8><title>PrismAI spend</title>
-<style>body{{font:14px system-ui;margin:2rem;max-width:760px}}table{{border-collapse:collapse;width:100%;margin:0 0 1.5rem}}
-td,th{{border:1px solid #ddd;padding:6px 10px;text-align:right}}td:first-child,th:first-child{{text-align:left}}
-h1 small{{color:#888;font-weight:400}}</style>
-<h1>💰 {month}: <b>${s.get('total_usd', 0)}</b> <small>{s.get('calls', 0)} model calls — prices are config estimates (USAGE_PRICES)</small></h1>
-<form>month <input name=month value="{month}" size=8> <button>go</button></form>
-{table('By model', 'by_model', price_by_model=True)}
-{table('By job', 'by_label')}
-{table('By day', 'by_day')}"""
-    return HTMLResponse(html_page)
+_USAGE_HTML = r"""<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>PrismAI · spend</title>
+<style>
+:root{color-scheme:light dark}
+body{font:14px/1.5 system-ui,-apple-system,sans-serif;margin:0;padding:2rem;max-width:820px;margin:auto}
+h1{font-size:1.5rem;margin:.2rem 0 .1rem}
+.sub{color:#888;margin-bottom:1.3rem}
+.bar{display:flex;gap:.6rem;align-items:center;margin-bottom:1.4rem}
+input,button{font:inherit;padding:.35rem .6rem;border:1px solid #8884;border-radius:8px;background:transparent;color:inherit}
+button{cursor:pointer}
+h3{margin:1.4rem 0 .4rem;font-size:.95rem;text-transform:uppercase;letter-spacing:.04em;color:#888}
+table{border-collapse:collapse;width:100%}
+td,th{padding:.45rem .7rem;text-align:right;border-bottom:1px solid #8882}
+td:first-child,th:first-child{text-align:left}
+th{font-weight:600;color:#888;font-size:.8rem}
+.usd{font-variant-numeric:tabular-nums;font-weight:600}
+.tot{font-size:2rem;font-weight:700}
+.err{padding:2rem;text-align:center;color:#c33}
+</style></head><body>
+<div id=app><p class=sub>Loading…</p></div>
+<script>
+const $=h=>{const d=document.createElement('div');d.innerHTML=h;return d.firstChild};
+const token=localStorage.getItem('token');
+function fmt(n){return n.toLocaleString()}
+function tbl(title,obj,money){
+  const rows=Object.entries(obj||{}).sort((a,b)=>b[1].usd-a[1].usd);
+  if(!rows.length)return '';
+  let h=`<h3>${title}</h3><table><tr><th></th><th>calls</th><th>in</th><th>out</th><th>$</th></tr>`;
+  for(const [k,b] of rows)
+    h+=`<tr><td>${k}</td><td>${fmt(b.calls)}</td><td>${fmt(b.in)}</td><td>${fmt(b.out)}</td><td class=usd>$${b.usd.toFixed(3)}</td></tr>`;
+  return h+'</table>';
+}
+async function load(month){
+  const app=document.getElementById('app');
+  if(!token){app.innerHTML='<div class=err>Open this from inside PrismAI (no session token found).</div>';return;}
+  const r=await fetch('/usage/summary'+(month?('?month='+month):''),{headers:{Authorization:'Bearer '+token}});
+  if(r.status===403){app.innerHTML='<div class=err>🔒 Admins only.</div>';return;}
+  if(!r.ok){app.innerHTML='<div class=err>Error '+r.status+'</div>';return;}
+  const s=await r.json();
+  app.innerHTML='';
+  app.append($(`<h1>💰 $${(s.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">in ${s.month}</span></h1>`));
+  app.append($(`<div class=sub>${fmt(s.calls||0)} model calls · prices are configurable estimates</div>`));
+  const bar=$('<div class=bar></div>');
+  const inp=$(`<input value="${s.month}" size=8>`);
+  const go=$('<button>View</button>'); go.onclick=()=>load(inp.value.trim());
+  bar.append('Month ',inp,go); app.append(bar);
+  app.append($('<div>'+tbl('By user',s.by_user)+tbl('By model',s.by_model)+tbl('By job',s.by_label)+tbl('By day',s.by_day)+'</div>'));
+}
+load('');
+</script></body></html>"""
 
 
 @app.post(

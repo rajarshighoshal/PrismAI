@@ -206,10 +206,11 @@ async def get_conn() -> Optional[sqlite3.Connection]:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage(ts)")
-            try:
-                conn.execute("ALTER TABLE usage ADD COLUMN source_id TEXT")
-            except sqlite3.OperationalError:
-                pass
+            for col in ("source_id TEXT", "user_id TEXT"):
+                try:
+                    conn.execute(f"ALTER TABLE usage ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass
             # Dedup for swept rows (OWUI chat messages re-seen across sweeps).
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_src "
                          "ON usage(source_id) WHERE source_id IS NOT NULL")
@@ -447,18 +448,20 @@ async def get_deliverable(chat_id: str) -> Optional[dict]:
         return None
 
 
-async def log_usage(model: str, label: str, in_tok: int, out_tok: int) -> bool:
+async def log_usage(model: str, label: str, in_tok: int, out_tok: int, user_id: str = "") -> bool:
     """One row per model call (fire-and-forget from the orchestrator's tracer).
     Tokens only — $ is computed at query time from a price table, so price
-    corrections re-price history."""
+    corrections re-price history. user_id is the OWUI user this call served."""
     conn = await get_conn()
     if not conn or not model:
         return False
     try:
         def _write():
             conn.execute(
-                "INSERT INTO usage (ts, model, label, in_tok, out_tok) VALUES (?, ?, ?, ?, ?)",
-                (time.time(), model, label or "?", int(in_tok or 0), int(out_tok or 0)),
+                "INSERT INTO usage (ts, model, label, in_tok, out_tok, user_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (time.time(), model, label or "?", int(in_tok or 0), int(out_tok or 0),
+                 user_id or None),
             )
             conn.commit()
         await _db(_write)
@@ -486,8 +489,8 @@ async def sweep_owui_usage() -> int:
             src = sqlite3.connect(f"file:{OWUI_DB_PATH}?mode=ro", uri=True)
             added, new_wm = 0, wm
             try:
-                for cid, blob, upd in src.execute(
-                        "SELECT id, chat, updated_at FROM chat WHERE updated_at > ?",
+                for cid, owner, blob, upd in src.execute(
+                        "SELECT id, user_id, chat, updated_at FROM chat WHERE updated_at > ?",
                         (wm - 3600,)):  # 1h overlap; dedup absorbs the rescan
                     new_wm = max(new_wm, float(upd or 0))
                     try:
@@ -501,13 +504,13 @@ async def sweep_owui_usage() -> int:
                                 or model.startswith("PrismAI") or not model):
                             continue
                         cur = conn.execute(
-                            "INSERT OR IGNORE INTO usage (ts, model, label, in_tok, out_tok, source_id) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT OR IGNORE INTO usage (ts, model, label, in_tok, out_tok, source_id, user_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (float(m.get("timestamp") or upd or time.time()),
                              model.split("/")[-1], "owui-chat",
                              int(u.get("prompt_tokens") or u.get("input_tokens") or 0),
                              int(u.get("completion_tokens") or u.get("output_tokens") or 0),
-                             f"{cid}:{mid}"))
+                             f"{cid}:{mid}", owner or None))
                         added += cur.rowcount
             finally:
                 src.close()
@@ -524,28 +527,53 @@ async def sweep_owui_usage() -> int:
         return 0
 
 
-async def usage_summary(month: str) -> dict:
-    """Aggregate tokens for a YYYY-MM month: by model, by label, by day."""
+def _owui_user_names() -> dict:
+    """Map OWUI user_id -> display name/email, read straight from webui.db (best effort)."""
+    try:
+        src = sqlite3.connect(f"file:{OWUI_DB_PATH}?mode=ro", uri=True)
+        try:
+            return {uid: (name or email or uid)
+                    for uid, name, email in src.execute("SELECT id, name, email FROM user")}
+        finally:
+            src.close()
+    except Exception:
+        return {}
+
+
+async def usage_summary(month: str, cost_fn=None) -> dict:
+    """Aggregate a YYYY-MM month by model, job, day, and USER. cost_fn(model, in, out)->$
+    is applied PER ROW (so by-user/by-job dollars are correct even when a bucket mixes
+    models), then summed into each bucket."""
     conn = await get_conn()
     if not conn:
         return {}
+    cost_fn = cost_fn or (lambda m, i, o: 0.0)
     try:
         def _read():
-            rows = conn.execute(
-                "SELECT ts, model, label, in_tok, out_tok FROM usage "
+            return conn.execute(
+                "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage "
                 "WHERE strftime('%Y-%m', ts, 'unixepoch') = ?", (month,)
             ).fetchall()
-            return rows
         rows = await _db(_read)
-        by_model, by_label, by_day = {}, {}, {}
-        for ts, model, label, i, o in rows:
-            import datetime as _dt
+        names = _owui_user_names()
+        import datetime as _dt
+        by_model, by_label, by_day, by_user = {}, {}, {}, {}
+        total = 0.0
+        for ts, model, label, i, o, uid in rows:
+            usd = cost_fn(model, i or 0, o or 0)
+            total += usd
             day = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-            for bucket, key in ((by_model, model), (by_label, label), (by_day, day)):
-                b = bucket.setdefault(key, {"in": 0, "out": 0, "calls": 0})
-                b["in"] += i; b["out"] += o; b["calls"] += 1
-        return {"month": month, "calls": len(rows),
-                "by_model": by_model, "by_label": by_label, "by_day": by_day}
+            user = names.get(uid, uid) if uid else "PrismAI internal"
+            for bucket, key in ((by_model, model), (by_label, label),
+                                (by_day, day), (by_user, user)):
+                b = bucket.setdefault(key, {"in": 0, "out": 0, "calls": 0, "usd": 0.0})
+                b["in"] += i; b["out"] += o; b["calls"] += 1; b["usd"] += usd
+        for bucket in (by_model, by_label, by_day, by_user):
+            for b in bucket.values():
+                b["usd"] = round(b["usd"], 4)
+        return {"month": month, "calls": len(rows), "total_usd": round(total, 2),
+                "by_model": by_model, "by_label": by_label,
+                "by_day": by_day, "by_user": by_user}
     except Exception as e:
         logger.warning(f"usage summary failed: {e}")
         return {}

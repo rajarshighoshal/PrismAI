@@ -8,6 +8,7 @@ with real token counts and latency. TTFT==TTLT for non-streaming calls (the whol
 response arrives at once).
 """
 import asyncio
+import contextvars
 import logging
 import time
 
@@ -21,9 +22,17 @@ from . import config
 log = logging.getLogger("perf")
 
 _BG: set = set()  # strong refs: fire-and-forget tasks must not be GC'd mid-flight
+# The OWUI user this turn serves — set once per request, read by every model call's
+# tracer without threading user_id through dozens of call signatures. ContextVars
+# propagate through asyncio tasks, so each concurrent request keeps its own value.
+_current_user: "contextvars.ContextVar[str]" = contextvars.ContextVar("current_user", default="")
 
 
-async def _post_usage(model, label, in_tok, out_tok):
+def set_user(user_id: str) -> None:
+    _current_user.set(user_id or "")
+
+
+async def _post_usage(model, label, in_tok, out_tok, user_id):
     """Persist the call's tokens to the tool-server usage ledger (the spend panel).
     Fails soft — accounting must never break a turn."""
     try:
@@ -31,7 +40,8 @@ async def _post_usage(model, label, in_tok, out_tok):
             await s.post(
                 f"{config.TOOL_SERVER_URL}/usage/log",
                 json={"model": str(model).split("/")[-1], "label": str(label or "?"),
-                      "in_tok": int(in_tok or 0), "out_tok": int(out_tok or 0)},
+                      "in_tok": int(in_tok or 0), "out_tok": int(out_tok or 0),
+                      "user_id": user_id or ""},
                 timeout=aiohttp.ClientTimeout(total=5),
             )
     except Exception:
@@ -53,7 +63,8 @@ def trace(label, model, *, t0, ttft=None, in_tok=None, out_tok=None):
     )
     if aiohttp is not None and (in_tok or out_tok):
         try:
-            t = asyncio.get_running_loop().create_task(_post_usage(model, label, in_tok, out_tok))
+            t = asyncio.get_running_loop().create_task(
+                _post_usage(model, label, in_tok, out_tok, _current_user.get()))
             _BG.add(t)
             t.add_done_callback(_BG.discard)
         except RuntimeError:

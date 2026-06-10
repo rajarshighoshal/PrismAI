@@ -2,6 +2,7 @@
 
 import logging
 import os
+from . import perf
 from .agent import run as _agent_run
 
 log = logging.getLogger(__name__)
@@ -12,6 +13,7 @@ _INTERNAL_NAMES = frozenset(
 
 
 async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
+    perf.set_user(user_id)  # tag every model call this turn with the requesting user
     user_model = (user_model or "").strip()
     forward = user_model if (user_model and user_model not in _INTERNAL_NAMES) else ""
     started = False
