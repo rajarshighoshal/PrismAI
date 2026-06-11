@@ -567,7 +567,7 @@ async def usage_summary(month: str, cost_fn=None) -> dict:
             usd = cost_fn(model, i or 0, o or 0)
             total += usd
             day = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-            user = names.get(uid, uid) if uid else "PrismAI internal"
+            user = names.get(uid, uid) if uid else "(unattributed)"
             for bucket, key in ((by_model, model), (by_label, label),
                                 (by_day, day), (by_user, user)):
                 b = bucket.setdefault(key, {"in": 0, "out": 0, "calls": 0, "usd": 0.0})
