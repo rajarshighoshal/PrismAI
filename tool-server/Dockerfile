@@ -15,7 +15,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py memory.py ./
+COPY main.py memory.py usage.py ./
+COPY static/ ./static/
 
 EXPOSE 8001
 
