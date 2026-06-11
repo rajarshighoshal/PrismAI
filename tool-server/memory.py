@@ -540,45 +540,47 @@ def _owui_user_names() -> dict:
         return {}
 
 
-async def usage_summary(month: str, cost_fn=None) -> dict:
-    """Aggregate a YYYY-MM month by model, job, day, and USER. cost_fn(model, in, out)->$
-    is applied PER ROW (so by-user/by-job dollars are correct even when a bucket mixes
-    models), then summed into each bucket."""
+async def usage_summary(cost_fn=None, since=None, until=None) -> dict:
+    """Aggregate the usage ledger by user, model, job, month, and day over an optional
+    [since, until) unix-time window (both None = all time). cost_fn(model, in, out)->$ is
+    applied PER ROW, so by-user/by-job dollars stay correct even when a bucket mixes
+    models. The API layer maps a period (a month / last-3 / all) to the time window."""
     conn = await get_conn()
     if not conn:
         return {}
     cost_fn = cost_fn or (lambda m, i, o: 0.0)
-    all_time = (not month) or month == "all"
     try:
         def _read():
-            if all_time:
-                return conn.execute(
-                    "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage").fetchall()
-            return conn.execute(
-                "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage "
-                "WHERE strftime('%Y-%m', ts, 'unixepoch') = ?", (month,)
-            ).fetchall()
+            q = "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage"
+            cond, args = [], []
+            if since is not None:
+                cond.append("ts >= ?"); args.append(since)
+            if until is not None:
+                cond.append("ts < ?"); args.append(until)
+            if cond:
+                q += " WHERE " + " AND ".join(cond)
+            return conn.execute(q, args).fetchall()
         rows = await _db(_read)
         names = _owui_user_names()
         import datetime as _dt
-        by_model, by_label, by_day, by_user = {}, {}, {}, {}
+        by_model, by_label, by_day, by_user, by_month = {}, {}, {}, {}, {}
         total = 0.0
         for ts, model, label, i, o, uid in rows:
             usd = cost_fn(model, i or 0, o or 0)
             total += usd
-            day = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            when = _dt.datetime.utcfromtimestamp(ts)
             user = names.get(uid, uid) if uid else "(unattributed)"
             for bucket, key in ((by_model, model), (by_label, label),
-                                (by_day, day), (by_user, user)):
+                                (by_day, when.strftime("%Y-%m-%d")),
+                                (by_month, when.strftime("%Y-%m")), (by_user, user)):
                 b = bucket.setdefault(key, {"in": 0, "out": 0, "calls": 0, "usd": 0.0})
                 b["in"] += i; b["out"] += o; b["calls"] += 1; b["usd"] += usd
-        for bucket in (by_model, by_label, by_day, by_user):
+        for bucket in (by_model, by_label, by_day, by_user, by_month):
             for b in bucket.values():
                 b["usd"] = round(b["usd"], 4)
-        return {"month": "all time" if all_time else month,
-                "calls": len(rows), "total_usd": round(total, 2),
-                "by_model": by_model, "by_label": by_label,
-                "by_day": by_day, "by_user": by_user}
+        return {"calls": len(rows), "total_usd": round(total, 2),
+                "by_model": by_model, "by_label": by_label, "by_day": by_day,
+                "by_month": by_month, "by_user": by_user}
     except Exception as e:
         logger.warning(f"usage summary failed: {e}")
         return {}

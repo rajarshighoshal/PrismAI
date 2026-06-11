@@ -150,11 +150,15 @@ async def main():
     await memory.log_usage("deepseek-v4-pro", "agent", 1_000_000, 0, user_id="u-alice")
     await memory.log_usage("gpt-5.5", "polish", 0, 1_000_000, user_id="u-bob")
     cost = lambda m, i, o: (i * (1.0 if "deepseek" in m else 2.0) + o * (0.0 if "deepseek" in m else 10.0)) / 1_000_000
-    s = await memory.usage_summary(__import__("datetime").datetime.utcnow().strftime("%Y-%m"), cost_fn=cost)
+    s = await memory.usage_summary(cost_fn=cost)  # all time
     check("summary: per-user buckets present", set(s["by_user"]) == {"u-alice", "u-bob"})
     check("summary: per-user $ priced per row", round(s["by_user"]["u-alice"]["usd"], 2) == 1.0
           and round(s["by_user"]["u-bob"]["usd"], 2) == 10.0)
     check("summary: total $ sums all rows", s["total_usd"] == 11.0)
+    check("summary: by_month bucket present", len(s["by_month"]) >= 1)
+    # since/until window filters rows out
+    empty = await memory.usage_summary(cost_fn=cost, since=1.0, until=2.0)
+    check("summary: out-of-window range is empty", empty["calls"] == 0 and empty["total_usd"] == 0)
 
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0

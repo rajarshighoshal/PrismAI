@@ -991,13 +991,39 @@ def _bearer(request: Request) -> str:
             or request.query_params.get("token", ""))
 
 
+def _period_window(period: str):
+    """Map a dropdown period to a [since, until) unix window + a label.
+    '' / 'all' -> all time; 'last3' -> last 3 calendar months; 'YYYY-MM' -> that month."""
+    import datetime as _dt
+    p = (period or "").strip()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    if not p or p == "all":
+        return None, None, "all time"
+    if p == "last3":
+        y, m = now.year, now.month - 2
+        y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
+        start = _dt.datetime(y, m, 1, tzinfo=_dt.timezone.utc)
+        return start.timestamp(), None, "last 3 months"
+    try:
+        y, m = (int(x) for x in p.split("-"))
+        start = _dt.datetime(y, m, 1, tzinfo=_dt.timezone.utc)
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        nxt = _dt.datetime(ny, nm, 1, tzinfo=_dt.timezone.utc)
+        return start.timestamp(), nxt.timestamp(), p
+    except Exception:
+        return None, None, "all time"
+
+
 @app.get("/usage/summary", operation_id="usage_summary")
-async def usage_summary_api(request: Request, month: str = "") -> dict:
+async def usage_summary_api(request: Request, period: str = "") -> dict:
     if not await _owui_admin(_bearer(request)):
         raise HTTPException(status_code=403, detail="admin only")
     await memory.sweep_owui_usage()  # fold in direct-chat usage before reporting
-    # Empty month = ALL TIME (so every user + the true total show without picking a month).
-    return await memory.usage_summary(month, cost_fn=_usage_cost)
+    since, until, label = _period_window(period)
+    s = await memory.usage_summary(cost_fn=_usage_cost, since=since, until=until)
+    s["period"] = label
+    s["multi_month"] = until is None or label == "last 3 months"
+    return s
 
 
 @app.get("/usage-button.js")
@@ -1095,24 +1121,36 @@ function tbl(title,obj,money){
     h+=`<tr><td>${k}</td><td>${fmt(b.calls)}</td><td>${fmt(b.in)}</td><td>${fmt(b.out)}</td><td class=usd>$${b.usd.toFixed(3)}</td></tr>`;
   return h+'</table>';
 }
-async function load(month){
+function periodOptions(){
+  var d=new Date(), o=[];
+  for(var i=0;i<3;i++){var m=new Date(d.getFullYear(),d.getMonth()-i,1);
+    o.push({v:m.getFullYear()+'-'+String(m.getMonth()+1).padStart(2,'0'),
+            t:m.toLocaleString(undefined,{month:'long',year:'numeric'})});}
+  o.push({v:'last3',t:'Last 3 months'}); o.push({v:'all',t:'All time'});
+  return o;
+}
+function buildBar(cur){
+  var bar=$('<div class=bar></div>'), sel=document.createElement('select');
+  periodOptions().forEach(function(o){var e=document.createElement('option');e.value=o.v;e.textContent=o.t;if(o.v===cur)e.selected=true;sel.appendChild(e);});
+  sel.onchange=function(){load(sel.value);};
+  bar.append('Period ',sel); return bar;
+}
+async function load(period){
   const app=document.getElementById('app');
   if(!token){app.innerHTML='<div class=err>Open this from inside PrismAI (no session token found).</div>';return;}
-  const r=await fetch('/usage/summary'+(month?('?month='+month):''),{headers:{Authorization:'Bearer '+token}});
+  const r=await fetch('/usage/summary?period='+encodeURIComponent(period||''),{headers:{Authorization:'Bearer '+token}});
   if(r.status===403){app.innerHTML='<div class=err>🔒 Admins only.</div>';return;}
   if(!r.ok){app.innerHTML='<div class=err>Error '+r.status+'</div>';return;}
   const s=await r.json();
   app.innerHTML='';
-  app.append($(`<h1>💰 $${(s.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">· ${s.month}</span></h1>`));
+  app.append($(`<h1>💰 $${(s.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">· ${s.period}</span></h1>`));
   app.append($(`<div class=sub>${fmt(s.calls||0)} model calls · prices are configurable estimates</div>`));
-  const bar=$('<div class=bar></div>');
-  const inp=$(`<input placeholder="all time" size=10 value="${month||''}">`);
-  const go=$('<button>Filter</button>'); go.onclick=()=>load(inp.value.trim());
-  const all=$('<button>All time</button>'); all.onclick=()=>{inp.value='';load('');};
-  bar.append('Month (YYYY-MM) ',inp,go,all); app.append(bar);
-  app.append($('<div>'+tbl('By user',s.by_user)+tbl('By model',s.by_model)+tbl('By job',s.by_label)+tbl('By day',s.by_day)+'</div>'));
+  app.append(buildBar(period||CUR));
+  const timeTbl = s.multi_month ? tbl('By month',s.by_month) : tbl('By day',s.by_day);
+  app.append($('<div>'+tbl('By user',s.by_user)+tbl('By model',s.by_model)+tbl('By job',s.by_label)+timeTbl+'</div>'));
 }
-load('');
+var CUR=periodOptions()[0].v;
+load(CUR);
 </script></body></html>"""
 
 
