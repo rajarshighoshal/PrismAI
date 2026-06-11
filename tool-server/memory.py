@@ -548,8 +548,12 @@ async def usage_summary(month: str, cost_fn=None) -> dict:
     if not conn:
         return {}
     cost_fn = cost_fn or (lambda m, i, o: 0.0)
+    all_time = (not month) or month == "all"
     try:
         def _read():
+            if all_time:
+                return conn.execute(
+                    "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage").fetchall()
             return conn.execute(
                 "SELECT ts, model, label, in_tok, out_tok, user_id FROM usage "
                 "WHERE strftime('%Y-%m', ts, 'unixepoch') = ?", (month,)
@@ -571,7 +575,8 @@ async def usage_summary(month: str, cost_fn=None) -> dict:
         for bucket in (by_model, by_label, by_day, by_user):
             for b in bucket.values():
                 b["usd"] = round(b["usd"], 4)
-        return {"month": month, "calls": len(rows), "total_usd": round(total, 2),
+        return {"month": "all time" if all_time else month,
+                "calls": len(rows), "total_usd": round(total, 2),
                 "by_model": by_model, "by_label": by_label,
                 "by_day": by_day, "by_user": by_user}
     except Exception as e:

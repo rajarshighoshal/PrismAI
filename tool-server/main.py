@@ -995,9 +995,8 @@ def _bearer(request: Request) -> str:
 async def usage_summary_api(request: Request, month: str = "") -> dict:
     if not await _owui_admin(_bearer(request)):
         raise HTTPException(status_code=403, detail="admin only")
-    import datetime as _dt
-    month = month or _dt.datetime.utcnow().strftime("%Y-%m")
     await memory.sweep_owui_usage()  # fold in direct-chat usage before reporting
+    # Empty month = ALL TIME (so every user + the true total show without picking a month).
     return await memory.usage_summary(month, cost_fn=_usage_cost)
 
 
@@ -1060,7 +1059,7 @@ async def usage_page():
     existing OWUI session token from localStorage — the user is never asked to log in
     again. All aggregation/$ comes from /usage/summary (which enforces admin)."""
     from fastapi.responses import HTMLResponse
-    return HTMLResponse(_USAGE_HTML)
+    return HTMLResponse(_USAGE_HTML, headers={"Cache-Control": "no-store"})
 
 
 _USAGE_HTML = r"""<!doctype html><html><head><meta charset=utf-8>
@@ -1104,12 +1103,13 @@ async function load(month){
   if(!r.ok){app.innerHTML='<div class=err>Error '+r.status+'</div>';return;}
   const s=await r.json();
   app.innerHTML='';
-  app.append($(`<h1>💰 $${(s.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">in ${s.month}</span></h1>`));
+  app.append($(`<h1>💰 $${(s.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">· ${s.month}</span></h1>`));
   app.append($(`<div class=sub>${fmt(s.calls||0)} model calls · prices are configurable estimates</div>`));
   const bar=$('<div class=bar></div>');
-  const inp=$(`<input value="${s.month}" size=8>`);
-  const go=$('<button>View</button>'); go.onclick=()=>load(inp.value.trim());
-  bar.append('Month ',inp,go); app.append(bar);
+  const inp=$(`<input placeholder="all time" size=10 value="${month||''}">`);
+  const go=$('<button>Filter</button>'); go.onclick=()=>load(inp.value.trim());
+  const all=$('<button>All time</button>'); all.onclick=()=>{inp.value='';load('');};
+  bar.append('Month (YYYY-MM) ',inp,go,all); app.append(bar);
   app.append($('<div>'+tbl('By user',s.by_user)+tbl('By model',s.by_model)+tbl('By job',s.by_label)+tbl('By day',s.by_day)+'</div>'));
 }
 load('');
