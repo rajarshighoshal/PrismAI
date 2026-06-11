@@ -770,10 +770,11 @@ async def verify_grounding(req: VerifyGroundingRequest) -> dict:
         {"role": "user", "content": f"SOURCE:\n{req.source}\n\nDRAFT:\n{req.draft}\n\nUnsupported claims:"},
     ]
     try:
-        # DeepSeek-direct primary, Fireworks fallback. Flash = auditor, no chain-of-thought.
+        # DeepSeek-direct primary, Fireworks fallback. Grounding is the core honesty check —
+        # substantive, so MAX reasoning (internal thinking; the output stays a clean list).
         content = await llm.chat(
             VERIFY_MODEL, messages, max_tokens=1500, temperature=0.0,
-            reasoning_effort=("none" if "flash" in VERIFY_MODEL else None))
+            reasoning_effort="max")
     except Exception as e:
         logger.exception("verify_grounding failed")
         raise HTTPException(status_code=502, detail=f"auditor call failed: {e}")

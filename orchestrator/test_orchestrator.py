@@ -1140,6 +1140,36 @@ async def _run_tests():
     check("provider: non-deepseek model -> Fireworks only even with a DeepSeek key",
           [p[3] for p in fireworks._providers("accounts/fireworks/models/kimi-k2p6")] == [False])
 
+    # ── Reasoning policy: MAX for substantive roles, fast for classifiers (label-based) ──
+    _saved_re = config.REASONING_EFFORT
+    config.REASONING_EFFORT = "max"
+    try:
+        check("effort: substantive label -> config max", fireworks._effort_for("agent", None) == "max")
+        check("effort: gate:* classifier -> none", fireworks._effort_for("gate:tool", None) == "none")
+        check("effort: summarize classifier -> none", fireworks._effort_for("summarize", None) == "none")
+        check("effort: explicit value always wins", fireworks._effort_for("gate:tool", "low") == "low")
+
+        def _pay(model, effort, is_ds):
+            return fireworks._chat_payload(model, messages=[], max_tokens=8, temperature=0.0,
+                                           session_id="s", effort=effort, is_ds=is_ds)
+        # DeepSeek-direct: substantive -> thinking enabled + reasoning_effort; classifier -> disabled.
+        _dp = _pay("deepseek-v4-pro", "max", True)
+        check("payload: DeepSeek-direct pro max -> thinking enabled + max",
+              _dp.get("reasoning_effort") == "max" and _dp.get("thinking") == {"type": "enabled"})
+        _df = _pay("deepseek-v4-flash", "none", True)
+        check("payload: DeepSeek-direct classifier -> thinking disabled, no reasoning_effort",
+              _df.get("thinking") == {"type": "disabled"} and "reasoning_effort" not in _df)
+        # Fireworks fallback: flash max -> high (its top); none stays none; pro left at default.
+        _ff = _pay("accounts/fireworks/models/deepseek-v4-flash", "max", False)
+        check("payload: Fireworks flash fallback max -> high", _ff.get("reasoning_effort") == "high")
+        _fn = _pay("accounts/fireworks/models/deepseek-v4-flash", "none", False)
+        check("payload: Fireworks flash fallback none -> none", _fn.get("reasoning_effort") == "none")
+        _fp = _pay("accounts/fireworks/models/deepseek-v4-pro", "max", False)
+        check("payload: Fireworks pro fallback -> provider default (no reasoning params)",
+              "reasoning_effort" not in _fp and "thinking" not in _fp)
+    finally:
+        config.REASONING_EFFORT = _saved_re
+
     # e2e fallback driving the REAL chat/stream with a fake HTTP session.
     _fakes = (fireworks.complete, fireworks.chat, fireworks.stream)
     fireworks.complete, fireworks.chat, fireworks.stream = _REAL_FW_COMPLETE, _REAL_FW_CHAT, _REAL_FW_STREAM

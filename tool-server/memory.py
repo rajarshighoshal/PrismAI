@@ -313,9 +313,10 @@ async def summarize_turns(turns: list[tuple[str, str]]) -> str:
         "MEMORY SUMMARY:"
     )
     try:
-        # DeepSeek-direct primary, Fireworks fallback (via llm chain).
+        # DeepSeek-direct primary, Fireworks fallback (via llm chain). Compression is a cheap
+        # high-volume classifier loop -> pin fast ("none"), else DeepSeek-direct defaults to "high".
         text = await llm.chat(COMPRESSION_MODEL, [{"role": "user", "content": prompt}],
-                              max_tokens=500, temperature=0.0)
+                              max_tokens=500, temperature=0.0, reasoning_effort="none")
         return THINKING_RE.sub("", text).strip()
     except Exception as e:
         logger.warning(f"Memory compression LLM failed: {e}")

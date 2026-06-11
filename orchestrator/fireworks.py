@@ -78,8 +78,20 @@ def _providers(model: str):
     return [fw]
 
 
+def _effort_for(label: str, explicit) -> str:
+    """Resolve reasoning effort by ROLE (user policy: MAX everywhere except classifiers).
+    An explicit value wins; otherwise classifier labels (gate:*, summarize) -> 'none' (fast),
+    everything substantive -> config.REASONING_EFFORT ('max')."""
+    if explicit is not None:
+        return explicit
+    lbl = label or ""
+    if lbl.startswith("gate:") or lbl == "summarize":
+        return "none"
+    return config.REASONING_EFFORT
+
+
 def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_id,
-                  tools=None, tool_choice=None, stream=False, reasoning_effort=None, is_ds=False):
+                  tools=None, tool_choice=None, stream=False, effort=None, is_ds=False):
     p = {
         "model": provider_model,
         "messages": messages,
@@ -94,18 +106,20 @@ def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_
         p["tools"] = tools
     if tool_choice is not None:
         p["tool_choice"] = tool_choice
-    # Flash reasoning differs by provider. Fireworks: reasoning_effort, where "none"
-    # disables chain-of-thought (fast classifier). DeepSeek-direct: "none" is NOT a valid
-    # value (it's a Fireworks extension) — omit it for the fast default, and ENABLE thinking
-    # (thinking:enabled + reasoning_effort) only when a real effort level is requested.
-    if "deepseek-v4-flash" in (provider_model or ""):
-        eff = reasoning_effort or "none"
+    # Reasoning pinned by the resolved effort. DeepSeek-direct: thinking:enabled +
+    # reasoning_effort (max/high/…) for substantive work; thinking:disabled to pin a
+    # classifier fast (it ignores Fireworks' "none" and would otherwise default to "high").
+    # Fireworks flash (fallback path): reasoning_effort directly, with "max" -> "high"
+    # (its top); Fireworks pro keeps its own default on that rare path.
+    if "deepseek" in (provider_model or "") and effort:
         if is_ds:
-            if eff and eff != "none":
-                p["reasoning_effort"] = eff
+            if effort == "none":
+                p["thinking"] = {"type": "disabled"}
+            else:
+                p["reasoning_effort"] = effort
                 p["thinking"] = {"type": "enabled"}
-        else:
-            p.setdefault("reasoning_effort", eff)
+        elif "deepseek-v4-flash" in provider_model:
+            p.setdefault("reasoning_effort", "high" if effort == "max" else effort)
     return p
 
 
@@ -148,13 +162,14 @@ async def chat(
         session = aiohttp.ClientSession()
     try:
         session_id = compute_session_id(messages, user_id or "")
+        effort = _effort_for(label, reasoning_effort)
         providers = _providers(model)
         last_exc = None
         for idx, (base, key, pmodel, is_ds) in enumerate(providers):
             payload = _chat_payload(
                 pmodel, messages=messages, max_tokens=max_tokens, temperature=temperature,
                 session_id=session_id, tools=tools, tool_choice=tool_choice,
-                reasoning_effort=reasoning_effort, is_ds=is_ds)
+                effort=effort, is_ds=is_ds)
             t0 = time.perf_counter()
             try:
                 async with session.post(
@@ -194,12 +209,14 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
         session = aiohttp.ClientSession()
     try:
         session_id = compute_session_id(messages, user_id or "")
+        effort = _effort_for(label, None)
         providers = _providers(model)
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         last_exc = None
         for idx, (base, key, pmodel, is_ds) in enumerate(providers):
             payload = _chat_payload(pmodel, messages=messages, max_tokens=max_tokens,
-                                    temperature=temperature, session_id=session_id, stream=True, is_ds=is_ds)
+                                    temperature=temperature, session_id=session_id, stream=True,
+                                    effort=effort, is_ds=is_ds)
             t0 = time.perf_counter()
             ttft = None
             usage = None
@@ -270,13 +287,15 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
         session = aiohttp.ClientSession()
     try:
         session_id = compute_session_id(messages, user_id or "")
+        effort = _effort_for(label, None)
         providers = _providers(model)
         timeout = aiohttp.ClientTimeout(total=None, sock_read=config.STREAM_IDLE_TIMEOUT)
         last_exc = None
         for idx, (base, key, pmodel, is_ds) in enumerate(providers):
             payload = _chat_payload(pmodel, messages=messages, max_tokens=max_tokens,
                                     temperature=temperature, session_id=session_id,
-                                    tools=tools, tool_choice=tool_choice, stream=True, is_ds=is_ds)
+                                    tools=tools, tool_choice=tool_choice, stream=True,
+                                    effort=effort, is_ds=is_ds)
             content_parts, calls, finish = [], {}, None
             t0 = time.perf_counter()
             ttft = None

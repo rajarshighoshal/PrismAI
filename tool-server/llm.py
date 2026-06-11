@@ -40,16 +40,20 @@ async def chat(model, messages, *, max_tokens=1500, temperature=0.0,
         is_ds = base == DEEPSEEK_BASE
         payload = {"model": pmodel, "messages": messages,
                    "max_tokens": max_tokens, "temperature": temperature}
-        # Flash reasoning differs by provider: Fireworks takes reasoning_effort ("none"
-        # disables CoT); DeepSeek-direct rejects "none" — omit it (fast default) and enable
-        # thinking only for a real effort level.
-        if reasoning_effort and "deepseek-v4-flash" in pmodel:
+        # Reasoning pinned by reasoning_effort (user policy: MAX for substantive work, "none"
+        # for classifiers). DeepSeek-direct: thinking:enabled + reasoning_effort for real
+        # effort, thinking:disabled to pin fast (it ignores Fireworks' "none" and defaults to
+        # "high"). Fireworks flash (fallback): reasoning_effort directly, "max" -> "high"
+        # (its top); Fireworks pro keeps its default on that rare path.
+        if reasoning_effort and "deepseek" in pmodel:
             if is_ds:
-                if reasoning_effort != "none":
+                if reasoning_effort == "none":
+                    payload["thinking"] = {"type": "disabled"}
+                else:
                     payload["reasoning_effort"] = reasoning_effort
                     payload["thinking"] = {"type": "enabled"}
-            else:
-                payload["reasoning_effort"] = reasoning_effort
+            elif "deepseek-v4-flash" in pmodel:
+                payload["reasoning_effort"] = "high" if reasoning_effort == "max" else reasoning_effort
         try:
             async with httpx.AsyncClient(timeout=timeout) as cl:
                 r = await cl.post(

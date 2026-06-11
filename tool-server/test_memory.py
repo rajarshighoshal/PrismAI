@@ -160,6 +160,63 @@ async def main():
     empty = await memory.usage_summary(cost_fn=cost, since=1.0, until=2.0)
     check("summary: out-of-window range is empty", empty["calls"] == 0 and empty["total_usd"] == 0)
 
+    # ── llm provider chain: reasoning params per provider (max policy) ──
+    import llm  # noqa: E402
+    llm.DEEPSEEK_API_KEY = "dskey"
+    llm.ENABLE_DEEPSEEK_DIRECT = True
+    _cap = []
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code, self._body = status, body
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+        def json(self):
+            return self._body
+
+    def _make_client(post_fn):
+        class _C:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, url, headers=None, json=None):
+                _cap.append((url, json))
+                return post_fn(url, json)
+        return _C
+
+    _real = llm.httpx.AsyncClient
+    try:
+        # DeepSeek-direct success: substantive -> thinking enabled + max, name prefix stripped.
+        llm.httpx.AsyncClient = _make_client(
+            lambda u, j: _Resp(200, {"choices": [{"message": {"content": "ok"}}]}))
+        _cap.clear()
+        await llm.chat("accounts/fireworks/models/deepseek-v4-pro",
+                       [{"role": "user", "content": "x"}], reasoning_effort="max")
+        _p = _cap[0][1]
+        check("llm: DeepSeek-direct max -> thinking enabled + max, name stripped",
+              "deepseek.com" in _cap[0][0] and _p["model"] == "deepseek-v4-pro"
+              and _p.get("reasoning_effort") == "max" and _p.get("thinking") == {"type": "enabled"})
+        _cap.clear()
+        await llm.chat("accounts/fireworks/models/deepseek-v4-flash",
+                       [{"role": "user", "content": "x"}], reasoning_effort="none")
+        _p = _cap[0][1]
+        check("llm: DeepSeek-direct classifier -> thinking disabled, no reasoning_effort",
+              _p.get("thinking") == {"type": "disabled"} and "reasoning_effort" not in _p)
+
+        # DeepSeek-direct down -> Fireworks fallback, flash max translated to "high".
+        llm.httpx.AsyncClient = _make_client(
+            lambda u, j: _Resp(503, {}) if "deepseek.com" in u
+            else _Resp(200, {"choices": [{"message": {"content": "fw"}}]}))
+        _cap.clear()
+        out = await llm.chat("accounts/fireworks/models/deepseek-v4-flash",
+                             [{"role": "user", "content": "x"}], reasoning_effort="max")
+        _fw = [j for (u, j) in _cap if "fireworks.ai" in u][0]
+        check("llm: Fireworks flash fallback max -> high",
+              out == "fw" and _fw.get("reasoning_effort") == "high")
+    finally:
+        llm.httpx.AsyncClient = _real
+
     print("\n" + ("all memory tests passed" if not fails else f"{len(fails)} FAILED: {fails}"))
     return 1 if fails else 0
 
