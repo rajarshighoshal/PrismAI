@@ -121,6 +121,23 @@ async def main():
     check("deliverable: the latest version survives the cap",
           (await memory.get_deliverable("dcap"))["version"] == memory.DELIVERABLES_MAX_PER_CHAT + 5)
 
+    # Pending plan (chunked-writer outline) round-trips via kv, isolated per chat, cleared on demand.
+    await _fresh_db()
+    check("plan: none pending -> None", await memory.get_plan("p1") is None)
+    sample_plan = {"title": "Sleep & Memory", "sections": [{"heading": "Intro", "intent": "x"}],
+                   "source": "study", "fmt": "docx"}
+    check("plan: store ok", await memory.store_plan("p1", sample_plan) is True)
+    got_plan = await memory.get_plan("p1")
+    check("plan: round-trips (title + sections preserved)",
+          got_plan and got_plan["title"] == "Sleep & Memory" and got_plan["sections"][0]["heading"] == "Intro")
+    check("plan: a different chat is isolated", await memory.get_plan("p2") is None)
+    newer = {"title": "Sleep & Memory v2", "sections": []}
+    await memory.store_plan("p1", newer)
+    check("plan: re-store overwrites (one pending plan per chat)",
+          (await memory.get_plan("p1"))["title"] == "Sleep & Memory v2")
+    await memory.clear_plan("p1")
+    check("plan: cleared -> None again", await memory.get_plan("p1") is None)
+
     # Usage sweep: direct-OWUI-chat tokens land in the ledger; PrismAI rows are
     # skipped (already ledgered at call time); re-sweep dedups via source_id.
     await _fresh_db()

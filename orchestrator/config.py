@@ -173,6 +173,15 @@ GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
 MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10"))
 MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 
+# Chunked section-writer: a long/multi-section document (paper, thesis, report) is
+# OUTLINED -> approved -> written one section at a time -> assembled -> verified -> exported,
+# instead of emitted in one capped shot. Each section is its own focused generation (full
+# attention, no output-cap pressure). OUTLINE is a small structured plan; sections use the
+# generous DRAFT budget. SECTIONS cap bounds runaway section counts on a vague request.
+ENABLE_CHUNKED_WRITER = _flag("ENABLE_CHUNKED_WRITER", "true")
+OUTLINE_MAX_TOKENS = int(os.getenv("OUTLINE_MAX_TOKENS", "4000"))
+CHUNKED_MAX_SECTIONS = int(os.getenv("CHUNKED_MAX_SECTIONS", "20"))
+
 # Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
 SHOW_WORK = _flag("SHOW_WORK", "true")

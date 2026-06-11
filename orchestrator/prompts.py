@@ -361,3 +361,65 @@ _VOICE_PASS_SYS = (
     "number, or hedge; do not add confidence or imply more was accomplished than stated; do not "
     "change meaning or materially change length. Output ONLY the revised text, no preamble."
 )
+
+
+# ── Chunked section-writer (long documents written section-by-section) ──────────
+# A long/multi-section document is NOT emitted in one shot — it is outlined, approved,
+# then written one section at a time (each a focused, bounded call), grounded per section,
+# and assembled into a persistent file. These prompts drive that pipeline.
+
+SYSTEM_LONGDOC_GATE = (
+    "Decide whether the user is asking you to WRITE a long, multi-section DOCUMENT — one "
+    "best produced section-by-section rather than in a single short answer. Return JSON only: "
+    "{\"longdoc\": boolean, \"doc_type\": string}.\n"
+    "true: a research/academic paper, thesis or chapter, literature review, report, essay, "
+    "white-paper, case study, detailed proposal, study guide, or any deliverable the user "
+    "describes as long, in-depth, comprehensive, multi-part, or with named sections.\n"
+    "false: a short message/email/cover-letter/resume/bio, a single-section or one-page piece, "
+    "a quick edit, a question, code, brainstorming, or plain conversation. When the requested "
+    "thing is naturally short or single-section, return false. doc_type is a 1-3 word label "
+    "(e.g. 'research paper', 'literature review', 'report') or \"\" when longdoc is false."
+)
+
+SYSTEM_OUTLINE = (
+    "You are planning a long document the user requested, to be written section-by-section. "
+    "Produce a clear OUTLINE the user can approve or adjust before any prose is written. "
+    "Base the structure ONLY on the user's request and any SOURCE MATERIAL provided — do not "
+    "invent a scope the user did not ask for. Return STRICT JSON only:\n"
+    "{\"title\": string, \"sections\": [{\"heading\": string, \"intent\": string}]}\n"
+    "- title: a concise document title.\n"
+    "- sections: the ordered top-level sections. Each heading is short; each intent is ONE "
+    "sentence on what that section will cover. Use the conventional structure for the "
+    "document type (e.g. a research paper: Abstract, Introduction, … , References) but adapt "
+    "to the user's actual topic and any source. Aim for the natural number of sections (most "
+    "documents need 4-10), not padding. Output ONLY the JSON object."
+)
+
+SYSTEM_PLAN_INTENT = (
+    "The user was shown a proposed OUTLINE (below) for a long document and asked to approve it "
+    "or adjust it. Classify their reply. Return JSON only: {\"action\": "
+    "\"approve\"|\"revise\"|\"abandon\", \"revision\": string}.\n"
+    "- approve: they accept the outline and want you to write it (\"go\", \"yes\", \"looks good\", "
+    "\"build it\", \"perfect\", \"write it\").\n"
+    "- revise: they want to change the outline before writing — add/remove/reorder/rename a "
+    "section, change scope or emphasis. Put their requested change in \"revision\".\n"
+    "- abandon: they no longer want this document, or asked for something clearly unrelated "
+    "to the outlined document.\n"
+    "When unsure between approve and revise, choose revise. \"revision\" is \"\" unless action "
+    "is revise."
+)
+
+SYSTEM_SECTION_WRITER = (
+    "You are writing ONE section of a longer document, in sequence. You are given the document "
+    "TITLE, the FULL OUTLINE (for context and to avoid overlap), the SECTION you must write "
+    "now (its heading + intent), what the PRECEDING sections already covered, and any SOURCE "
+    "MATERIAL. Write ONLY this section's prose:\n"
+    "- Start with the section heading as a Markdown heading, then its content.\n"
+    "- Cover exactly this section's intent — do NOT write other sections or repeat what earlier "
+    "sections covered; pick up naturally from them.\n"
+    "- Assert only facts from the SOURCE MATERIAL, the user's stated facts, or genuine common "
+    "knowledge. Do NOT invent citations, data, study findings, or quotes. If a claim needs a "
+    "source you don't have, write it honestly (hedged) or omit it — never fabricate.\n"
+    "- Match the document's type and a consistent academic/professional register.\n"
+    "- Output ONLY this section's Markdown — no preamble, no commentary, no note to the user."
+)

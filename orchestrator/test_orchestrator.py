@@ -87,6 +87,11 @@ _deliverable_holder = []     # the chat's "prior delivered document" (empty = no
 _last_active_holder = []     # unix time of the chat's previous turn (empty = none)
 _edit_write_queue = []       # directed-edit writer responses (empty/"" = revision fails)
 _patch_queue = []            # SYSTEM_EDIT_PATCH responses (in-place find/replace edits)
+_plan_holder = []            # pending chunked-writer plan from _plan_get (empty = none)
+_longdoc_queue = []          # SYSTEM_LONGDOC_GATE responses (bool: is it a long doc?)
+_outline_queue = []          # SYSTEM_OUTLINE responses (plan dict)
+_plan_intent_queue = []      # SYSTEM_PLAN_INTENT responses ({action, revision})
+_section_queue = []          # SYSTEM_SECTION_WRITER responses (section markdown)
 
 
 async def _fake_deliverable_get(chat_id, session=None):
@@ -99,6 +104,23 @@ async def _fake_last_active(chat_id, session=None):
 
 async def _fake_deliverable_store(chat_id, content, filename="", fmt="", session=None):
     _calls.setdefault("deliverable_store", []).append((chat_id, content, filename, fmt))
+    return True
+
+
+async def _fake_plan_get(chat_id):
+    return _plan_holder[0] if _plan_holder else None
+
+
+async def _fake_plan_store(chat_id, plan):
+    _calls.setdefault("plan_store", []).append((chat_id, plan))
+    _plan_holder.clear()
+    _plan_holder.append(plan)
+    return True
+
+
+async def _fake_plan_clear(chat_id):
+    _calls.setdefault("plan_clear", []).append(chat_id)
+    _plan_holder.clear()
     return True
 
 
@@ -170,6 +192,22 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     if "Make the SMALLEST edit" in sys or "Write it again from" in sys:  # surgical or rewrite refine
         _calls["refine_prompts"].append(sys)
         return "Corrected final answer."
+    if "WRITE a long, multi-section" in sys:  # SYSTEM_LONGDOC_GATE
+        v = _longdoc_queue.pop(0) if _longdoc_queue else False
+        return json.dumps({"longdoc": v, "doc_type": "research paper" if v else ""})
+    if "planning a long document" in sys:  # SYSTEM_OUTLINE
+        plan = _outline_queue.pop(0) if _outline_queue else {
+            "title": "Test Document",
+            "sections": [{"heading": "Introduction", "intent": "set up the topic"},
+                         {"heading": "Body", "intent": "the main argument"}]}
+        return json.dumps(plan)
+    if "proposed OUTLINE" in sys:  # SYSTEM_PLAN_INTENT
+        return json.dumps(_plan_intent_queue.pop(0) if _plan_intent_queue
+                          else {"action": "approve", "revision": ""})
+    if "writing ONE section" in sys:  # SYSTEM_SECTION_WRITER
+        _calls.setdefault("section_writes", []).append(sys)
+        return (_section_queue.pop(0) if _section_queue
+                else "## Section\n\nSection prose grounded in the provided source.")
     return "completion"
 
 
@@ -228,6 +266,11 @@ def _reset():
     _last_active_holder.clear()
     _edit_write_queue.clear()
     _patch_queue.clear()
+    _plan_holder.clear()
+    _longdoc_queue.clear()
+    _outline_queue.clear()
+    _plan_intent_queue.clear()
+    _section_queue.clear()
 
 
 async def _run_tests():
@@ -295,6 +338,9 @@ async def _run_tests():
     agent._deliverable_get = _fake_deliverable_get
     agent._deliverable_store = _fake_deliverable_store
     agent._last_active = _fake_last_active
+    agent._plan_get = _fake_plan_get
+    agent._plan_store = _fake_plan_store
+    agent._plan_clear = _fake_plan_clear
     toolserver.verify_grounding = _fake_verify
     config.ENABLE_VERIFICATION = True
     config.ENABLE_GROUNDING_GATE = True
@@ -1249,6 +1295,106 @@ async def _run_tests():
     check("dedup: expired entry is not returned", dedup.get_cached(ktl) is None)
     config.DEDUP_TTL_SECONDS = _saved_ttl
     dedup._results.clear(); dedup._inflight.clear()
+
+    # ── Chunked section-writer: outline-first long documents ───────────────────────
+    CW_HDRS = {"x-openwebui-chat-id": "chat-cw"}
+
+    # Unit: outline parse + render, plan-intent default.
+    plan0 = await agent._generate_outline("write a research paper on sleep", "")
+    check("chunked: outline parses into title + sections",
+          plan0 and plan0["title"] and len(plan0["sections"]) >= 2)
+    rendered = agent._render_outline(plan0)
+    check("chunked: rendered outline lists the headings + asks to write/adjust",
+          "Introduction" in rendered and "write it" in rendered.lower())
+    check("chunked: longdoc gate defaults False on a plain short ask",
+          (await agent._classify_longdoc([{"role": "user", "content": "hi there"}]))["longdoc"] is False)
+
+    # Hook B — a NEW long-doc request proposes an outline and stores the plan (does NOT build).
+    _reset()
+    _longdoc_queue.append(True)
+    ev = await _collect([{"role": "user", "content": "write me a comprehensive research paper on sleep"}],
+                        request_headers=CW_HDRS)
+    out = _content(ev)
+    check("chunked: long-doc request shows the outline for approval",
+          "Introduction" in out and "Body" in out)
+    check("chunked: the outline is persisted as a pending plan", bool(_calls.get("plan_store")))
+    check("chunked: nothing is written or filed yet (outline turn only)",
+          not _calls.get("section_writes") and not _calls.get("deliverable_store"))
+
+    # Detection gated: a heavy NON-long-doc request never enters the outline flow.
+    _reset()
+    _longdoc_queue.append(False)
+    _chat_queue.append(_chat_content("Here is your cover letter."))
+    ev = await _collect([{"role": "user", "content": "write a cover letter"}], request_headers=CW_HDRS)
+    check("chunked: non-long-doc heavy turn skips the outline flow (no plan stored)",
+          not _calls.get("plan_store") and "cover letter" in _content(ev).lower())
+
+    # Hook A — pending plan + approval BUILDS section-by-section, verifies, exports, clears plan.
+    _reset()
+    _plan_holder.append({
+        "title": "My Paper",
+        "sections": [{"heading": "Intro", "intent": "set up"},
+                     {"heading": "Methods", "intent": "how"}],
+        "source": "The study found X. The data shows Y.",
+        "request": "write a paper", "filename": "my_paper", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "approve", "revision": ""})
+    _section_queue.extend(["## Intro\n\nGrounded intro from source.",
+                           "## Methods\n\nGrounded methods from source."])
+    _post_queue.append([{"filename": "my_paper.docx", "download_url": "/files/my_paper.docx"}])
+    ev = await _collect([{"role": "user", "content": "looks good, write it"}], request_headers=CW_HDRS)
+    out = _content(ev)
+    if agent._BG_TASKS:  # the deliverable/memory stores are fire-and-forget create_tasks
+        await asyncio.gather(*list(agent._BG_TASKS), return_exceptions=True)
+    check("chunked: approval writes EVERY section (one focused call each)",
+          len(_calls.get("section_writes") or []) == 2)
+    check("chunked: built doc is exported + delivered with a download link",
+          "ready" in out.lower() and "Download" in out)
+    stored = _calls.get("deliverable_store") or []
+    check("chunked: assembled doc (all sections) persisted as the deliverable",
+          bool(stored) and "Grounded intro" in stored[-1][1] and "Grounded methods" in stored[-1][1])
+    check("chunked: pending plan is cleared after a successful build", bool(_calls.get("plan_clear")))
+
+    # Hook A — a blocked honesty check on the assembly does NOT ship + KEEPS the plan.
+    _reset()
+    _plan_holder.append({"title": "P", "sections": [{"heading": "S", "intent": "i"}],
+                         "source": "Real source.", "request": "r", "filename": "p", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "approve", "revision": ""})
+    _section_queue.append("## S\n\nClaims not in the source.")
+    # The auditor is consulted up to 3x (initial -> after surgical refine -> after rewrite);
+    # all must stay FABRICATION for the assembly to hard-block.
+    for _ in range(3):
+        _honesty_queue.append({"unsupported": ["fabricated metric"], "verdict": "FABRICATION"})
+    ev = await _collect([{"role": "user", "content": "go"}], request_headers=CW_HDRS)
+    if agent._BG_TASKS:
+        await asyncio.gather(*list(agent._BG_TASKS), return_exceptions=True)
+    check("chunked: a blocked assembly is not exported and the plan is kept",
+          not _calls.get("deliverable_store") and not _calls.get("plan_clear"))
+
+    # Hook A — 'revise' re-outlines (stores a new plan) without building.
+    _reset()
+    _plan_holder.append({"title": "Doc", "sections": [{"heading": "A", "intent": "a"}],
+                         "source": "", "request": "write a doc", "filename": "doc", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "revise", "revision": "add a Conclusion"})
+    _outline_queue.append({"title": "Doc", "sections": [
+        {"heading": "A", "intent": "a"}, {"heading": "Conclusion", "intent": "wrap up"}]})
+    ev = await _collect([{"role": "user", "content": "add a conclusion section"}], request_headers=CW_HDRS)
+    check("chunked: 'revise' re-shows an updated outline, no build",
+          "Conclusion" in _content(ev) and bool(_calls.get("plan_store"))
+          and not _calls.get("section_writes"))
+
+    # Hook A — 'abandon' clears the plan and falls through to the normal flow.
+    _reset()
+    _plan_holder.append({"title": "Old", "sections": [{"heading": "A", "intent": "a"}],
+                         "source": "", "request": "r", "filename": "old", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "abandon", "revision": ""})
+    # STREAM_SIMPLE_CHAT is off in this suite, so the post-abandon turn runs the heavy loop.
+    _longdoc_queue.append(False)             # not a new long doc either
+    _chat_queue.append(_chat_content("Sure, hello!"))
+    _gate_queue.append(False)                # no fact-grounding needed
+    ev = await _collect([{"role": "user", "content": "never mind, just say hi"}], request_headers=CW_HDRS)
+    check("chunked: 'abandon' clears the plan and answers normally",
+          bool(_calls.get("plan_clear")) and "hello" in _content(ev).lower()
+          and not _calls.get("section_writes"))
 
     print()
     if fails:

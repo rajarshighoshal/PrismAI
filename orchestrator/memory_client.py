@@ -105,3 +105,60 @@ async def _last_active(chat_id: str):
     except Exception:
         pass
     return None
+
+
+async def _plan_store(chat_id: str, plan: dict) -> bool:
+    """Persist a pending outline awaiting approval (chunked writer). Fire-and-forget."""
+    if not (chat_id and isinstance(plan, dict)):
+        return False
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/plan/store",
+                json={"chat_id": chat_id, "plan": plan},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("stored", False)
+    except Exception:
+        pass
+    return False
+
+
+async def _plan_get(chat_id: str):
+    """Fetch the pending outline awaiting approval for this chat, or None."""
+    if not chat_id:
+        return None
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/plan/get",
+                json={"chat_id": chat_id},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("plan")
+    except Exception:
+        pass
+    return None
+
+
+async def _plan_clear(chat_id: str) -> bool:
+    """Drop the pending plan once built or abandoned."""
+    if not chat_id:
+        return False
+    try:
+        async with aiohttp.ClientSession() as own_session:
+            async with own_session.post(
+                f"{config.TOOL_SERVER_URL}/plan/clear",
+                json={"chat_id": chat_id},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=config.MEMORY_TIMEOUT),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json()).get("cleared", False)
+    except Exception:
+        pass
+    return False

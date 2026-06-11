@@ -440,6 +440,63 @@ async def get_deliverable(chat_id: str) -> Optional[dict]:
         return None
 
 
+# ── Pending plan (chunked-writer outline awaiting approval) ──────────────────────
+# A long-doc request produces an OUTLINE the user approves before sections are written.
+# That outline is transient turn-to-turn state — not a delivered artifact — so it lives
+# in the kv table (key plan:<chat_id>), kept OUT of the deliverables table so it can never
+# be mistaken for the chat's latest deliverable (which the edit path reads).
+def _plan_key(chat_id: str) -> str:
+    return f"plan:{chat_id}"
+
+
+async def store_plan(chat_id: str, plan: dict) -> bool:
+    """Persist the pending outline/plan for this chat (overwrites any prior pending plan)."""
+    conn = await get_conn()
+    if not conn or not (chat_id and isinstance(plan, dict)):
+        return False
+    try:
+        blob = json.dumps(plan, ensure_ascii=False)
+
+        def _write():
+            conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (_plan_key(chat_id), blob))
+            conn.commit()
+            return True
+        return await _db(_write)
+    except Exception as e:
+        logger.warning(f"Plan store failed: {e}")
+        return False
+
+
+async def get_plan(chat_id: str) -> Optional[dict]:
+    """Return the pending plan for this chat, or None when nothing is awaiting approval."""
+    conn = await get_conn()
+    if not conn or not chat_id:
+        return None
+    try:
+        row = await _db(lambda: conn.execute(
+            "SELECT v FROM kv WHERE k=?", (_plan_key(chat_id),)).fetchone())
+        return json.loads(row[0]) if row and row[0] else None
+    except Exception as e:
+        logger.warning(f"Plan get failed: {e}")
+        return None
+
+
+async def clear_plan(chat_id: str) -> bool:
+    """Drop the pending plan (after the doc is built, or the user abandons it)."""
+    conn = await get_conn()
+    if not conn or not chat_id:
+        return False
+    try:
+        def _write():
+            conn.execute("DELETE FROM kv WHERE k=?", (_plan_key(chat_id),))
+            conn.commit()
+            return True
+        return await _db(_write)
+    except Exception as e:
+        logger.warning(f"Plan clear failed: {e}")
+        return False
+
+
 async def log_usage(model: str, label: str, in_tok: int, out_tok: int, user_id: str = "") -> bool:
     """One row per model call (fire-and-forget from the orchestrator's tracer).
     Tokens only — $ is computed at query time from a price table, so price

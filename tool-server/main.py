@@ -835,6 +835,15 @@ class LastActiveRequest(BaseModel):
     chat_id: str = Field(..., description="OWUI chat ID")
 
 
+class PlanStoreRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+    plan: dict = Field(..., description="Pending outline/plan (request, outline[], filename, fmt, source)")
+
+
+class PlanChatRequest(BaseModel):
+    chat_id: str = Field(..., description="OWUI chat ID")
+
+
 USAGE_SWEEP_MINUTES = int(os.getenv("USAGE_SWEEP_MINUTES", "30"))
 _bg_tasks: set = set()
 
@@ -919,6 +928,37 @@ async def deliverable_get(req: DeliverableGetRequest) -> dict:
     """Return the latest stored deliverable for this chat, or null."""
     d = await memory.get_deliverable(req.chat_id)
     return {"chat_id": req.chat_id, "deliverable": d}
+
+
+@app.post(
+    "/plan/store",
+    summary="Persist a pending outline/plan awaiting user approval (chunked writer)",
+    operation_id="plan_store",
+)
+async def plan_store(req: PlanStoreRequest) -> dict:
+    """Store the pending outline so the next turn can build it once the user approves."""
+    ok = await memory.store_plan(req.chat_id, req.plan)
+    return {"stored": ok, "chat_id": req.chat_id}
+
+
+@app.post(
+    "/plan/get",
+    summary="Fetch the pending outline/plan for a chat (or null)",
+    operation_id="plan_get",
+)
+async def plan_get(req: PlanChatRequest) -> dict:
+    """Return the plan awaiting approval for this chat, or null."""
+    return {"chat_id": req.chat_id, "plan": await memory.get_plan(req.chat_id)}
+
+
+@app.post(
+    "/plan/clear",
+    summary="Drop the pending outline/plan (built or abandoned)",
+    operation_id="plan_clear",
+)
+async def plan_clear(req: PlanChatRequest) -> dict:
+    """Clear the pending plan after the document is built or the user abandons it."""
+    return {"cleared": await memory.clear_plan(req.chat_id), "chat_id": req.chat_id}
 
 
 @app.post(
