@@ -38,7 +38,7 @@ from .memory_client import (
 from .timectx import _now_line, _gap_note
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
@@ -207,6 +207,40 @@ def _edit_inject(prior: dict) -> str:
         "short clarifying question (no document) — the user explicitly prefers being "
         "asked over being guessed at, and their answer comes straight back to you."
     )
+
+
+async def _try_patch_edit(baseline: str, instruction: str, *, session=None):
+    """In-place edit, the Canvas/Artifact way: ask the model for targeted find→replace
+    changes and apply them to the stored document, leaving everything else byte-for-byte
+    identical. Returns the patched text, or None when the change is too broad for clean
+    patches or a 'find' doesn't match exactly once — the caller then falls back to a full
+    re-emit (exactly how Claude/ChatGPT choose targeted-edit vs rewrite). The model emits
+    only the change (~1/40th the tokens of regenerating the whole document), and untouched
+    text cannot drift because the model never re-types it."""
+    if not baseline.strip():
+        return None
+    try:
+        raw = await fireworks.complete(
+            [{"role": "system", "content": SYSTEM_EDIT_PATCH + "\n\n--- DOCUMENT ---\n" + baseline},
+             {"role": "user", "content": instruction}],
+            config.GROUNDED_MODEL, max_tokens=1500, temperature=0.0,
+            session=session, label="edit:patch")
+        data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
+    except Exception:
+        return None
+    edits = data.get("edits")
+    if data.get("broad") or not isinstance(edits, list) or not edits:
+        return None
+    text = baseline
+    for e in edits:
+        if not isinstance(e, dict):
+            return None
+        find = e.get("find") or ""
+        repl = "" if e.get("replace") is None else str(e.get("replace"))
+        if not find or text.count(find) != 1:   # must match exactly once, else fall back
+            return None
+        text = text.replace(find, repl, 1)
+    return text if (text.strip() and text != baseline) else None
 
 
 # Strong references to fire-and-forget background writes. asyncio keeps only a
@@ -679,30 +713,35 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             if config.SHOW_WORK:
                 yield ("content", "✏️ Revising the document…\n\n")
             baseline = (prior_deliverable.get("content") or "").strip()
-            revised = ""
-            try:
-                revised = (await fireworks.complete(
-                    [{"role": "system", "content":
-                        _now_line() + "\n\n" + _edit_inject(prior_deliverable)
-                        + "\n\nOutput ONLY the complete revised document — no commentary, "
-                        "no preamble, no tool calls."},
-                     {"role": "user", "content": _last_user_text(messages)}],
-                    config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
-                    temperature=config.WRITER_TEMPERATURE, session=session,
-                    label="edit:write")).strip()
-            except Exception as e:
-                log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
-            # Sanity: the revision must still BE the document (not an ack/refusal). If it
-            # isn't, fall through to the normal loop with the injected-doc directive.
-            # The writer may ask instead of guess (the user prefers collaboration). Its
-            # instructed contract is structural — output the document OR a short question —
-            # so a short, question-marked, non-document response IS the question; ship it
-            # straight to the user. Their reply re-enters this path, document still stored.
-            if (revised and not _same_doc(revised, baseline)
-                    and "?" in revised and len(revised) < 1200):
-                yield ("content", revised)
-                return
-            if revised and _same_doc(revised, baseline):
+            # 1. In-place targeted edit first (the Canvas/Artifact way): the model returns
+            #    only the find→replace changes, applied to the stored document so untouched
+            #    text is preserved byte-for-byte at ~1/40th the tokens of a rewrite.
+            revised = await _try_patch_edit(baseline, _last_user_text(messages), session=session)
+            patched = revised is not None
+            # 2. Broad change (or no clean patch) -> regenerate the whole document.
+            if not patched:
+                revised = ""
+                try:
+                    revised = (await fireworks.complete(
+                        [{"role": "system", "content":
+                            _now_line() + "\n\n" + _edit_inject(prior_deliverable)
+                            + "\n\nOutput ONLY the complete revised document — no commentary, "
+                            "no preamble, no tool calls."},
+                         {"role": "user", "content": _last_user_text(messages)}],
+                        config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
+                        temperature=config.WRITER_TEMPERATURE, session=session,
+                        label="edit:write")).strip()
+                except Exception as e:
+                    log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
+                # The writer may ask instead of guess (re-emit path only): a short,
+                # question-marked, non-document response IS a clarifying question — ship it
+                # straight to the user; their reply re-enters this path, document still stored.
+                if (revised and not _same_doc(revised, baseline)
+                        and "?" in revised and len(revised) < 1200):
+                    yield ("content", revised)
+                    return
+            # 3. Ship the revision (patched in-place OR fully re-emitted), if it's a real doc.
+            if revised and (patched or _same_doc(revised, baseline)):
                 if config.SHOW_WORK:
                     yield ("content", "🛡️ Verifying facts…\n\n")
                 src = ((_user_source(messages) + "\n\n" + baseline).strip()

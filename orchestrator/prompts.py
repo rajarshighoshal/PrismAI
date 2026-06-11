@@ -234,6 +234,25 @@ SYSTEM_EDIT_INTENT = (
     "unless the user states them."
 )
 
+SYSTEM_EDIT_PATCH = (
+    "You are editing a document the user already received (shown after the marker). Apply "
+    "their requested change IN PLACE, like updating a live document — as a set of EXACT "
+    "find-and-replace edits, never reprinting the whole document. Output STRICT JSON only:\n"
+    '{"edits": [{"find": "<verbatim text from the document>", "replace": "<new text>"}], '
+    '"broad": false}\n'
+    "Rules:\n"
+    "- Each \"find\" MUST be copied VERBATIM from the document and be UNIQUE (it must appear "
+    "exactly once); include enough surrounding context to make it unique.\n"
+    "- To INSERT text, pick a unique nearby anchor and put it back in \"replace\" with the "
+    "new text added, so nothing else moves.\n"
+    "- Make the SMALLEST edits that satisfy the request; never alter unrelated text.\n"
+    "- Only assert facts the user gave you or that are already in the document.\n"
+    "- If the request is BROAD (rewrite/reorganize a section, change the whole tone or "
+    "structure) and cannot be done as a few surgical edits, output {\"broad\": true} with no "
+    "edits — the system will regenerate the whole document instead.\n"
+    "- Output ONLY the JSON object. Never print the document itself."
+)
+
 SYSTEM_REQUEST_GATE = (
     "Decide if answering this user message needs tools, external/current facts, "
     "sources, file export, or writing about the user that must be verified — versus "

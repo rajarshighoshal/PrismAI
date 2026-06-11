@@ -36,6 +36,7 @@ _deliverable_holder = []     # the chat's "prior delivered document" (empty = no
 
 _last_active_holder = []     # unix time of the chat's previous turn (empty = none)
 _edit_write_queue = []       # directed-edit writer responses (empty/"" = revision fails)
+_patch_queue = []            # SYSTEM_EDIT_PATCH responses (in-place find/replace edits)
 
 
 async def _fake_deliverable_get(chat_id, session=None):
@@ -92,9 +93,12 @@ async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, se
 
 async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None, label="", reasoning_effort=None):
     _calls["complete_models"].append(model)
+    _calls.setdefault("labels", []).append(label)
     sys = messages[0]["content"] if messages else ""
     if model == config.VISION_MODEL:
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
+    if "editing a document the user already received" in sys:  # SYSTEM_EDIT_PATCH
+        return _patch_queue.pop(0) if _patch_queue else json.dumps({"broad": True})
     if "REVISION TASK" in sys:  # directed-edit writer (one plain completion, no tools)
         return _edit_write_queue.pop(0) if _edit_write_queue else ""
     if "relative to that document" in sys:  # SYSTEM_EDIT_INTENT
@@ -173,6 +177,7 @@ def _reset():
     _deliverable_holder.clear()
     _last_active_holder.clear()
     _edit_write_queue.clear()
+    _patch_queue.clear()
 
 
 async def _run_tests():
@@ -774,6 +779,34 @@ async def _run_tests():
           not _calls["chat_models"] and _calls["post"]
           and "I finished my MS" in _calls["post"][0][1]["markdown"]
           and "letter.docx" in _content(ev))
+
+    # IN-PLACE patch (Canvas/Artifact way): a surgical change is applied as a find→replace
+    # to the stored document — no full re-emit (the doc is never regenerated).
+    _reset()
+    _deliverable_holder[:] = [{"content": "Dear Committee, I am applying for the doctoral role at KTH.", "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _patch_queue.append(json.dumps({"broad": False, "edits": [{"find": "doctoral role", "replace": "doctoral position"}]}))
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/p/content/letter.docx"}])
+    ev = await _collect([{"role": "user", "content": "change 'doctoral role' to 'doctoral position'"}],
+                        request_headers={"x-openwebui-chat-id": "patch1"})
+    filed = _calls["post"][0][1]["markdown"] if _calls["post"] else ""
+    check("edit/patch: a surgical edit is applied in-place, NOT re-emitted",
+          "doctoral position" in filed and "doctoral role" not in filed
+          and "edit:patch" in _calls.get("labels", []) and "edit:write" not in _calls.get("labels", []))
+
+    # BROAD edit -> the patch model signals 'broad', and we fall back to a full re-emit.
+    _reset()
+    base = "Dear Committee, I have built ML systems and data science tools for years. " * 3
+    _deliverable_holder[:] = [{"content": base, "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "edit", "filename": "", "format": ""})
+    _patch_queue.append(json.dumps({"broad": True}))
+    _edit_write_queue.append(base.replace("data science", "applied machine learning"))
+    _post_queue.append([{"status": "success", "filename": "letter.docx", "download_url": "/api/v1/files/b/content/letter.docx"}])
+    ev = await _collect([{"role": "user", "content": "rework it to emphasize applied ML throughout"}],
+                        request_headers={"x-openwebui-chat-id": "patch2"})
+    check("edit/patch: a broad edit falls back to a full re-emit and still ships",
+          "edit:write" in _calls.get("labels", []) and _calls["post"]
+          and "applied machine learning" in _calls["post"][0][1]["markdown"])
 
     # A surgical edit must NOT re-polish / re-voice the whole document: v1 was already
     # polished and voiced; re-running both wastes ~40s and rewrites text the user didn't
