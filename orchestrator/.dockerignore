@@ -1,0 +1,22 @@
+# Production image = runtime request-path code only. Everything below is dev/eval/
+# ops tooling that does not belong in prod.
+__pycache__/
+*.pyc
+*.pyo
+# tests & live smoke — never ship to prod
+test_orchestrator.py
+smoke_live.py
+# the weekly style-consolidation job runs from the repo (docker cp into open-webui),
+# so it is not needed in the request-path image
+consolidate_style.py
+# dropped A/B harness (safety net if a stray file ever returns)
+ab_arena.py
+ab_cases_*.json
+arena/
+# logs, docs, build/deploy meta
+*.log
+*.md
+deploy.sh
+Dockerfile
+.dockerignore
+.gitignore
