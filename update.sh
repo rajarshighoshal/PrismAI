@@ -38,10 +38,19 @@ if [ -x tool-server/deploy.sh ]; then
     ./tool-server/deploy.sh
 fi
 
+# The orchestrator is a CONTAINER (not a hot-loaded OWUI function like router_fn.py), so a
+# code change there needs a rebuild — otherwise auto-deploy silently ships only the router
+# shim + tool-server while the orchestrator runs stale code. Built AFTER the tool-server
+# since it calls it.
+if [ -x orchestrator/deploy.sh ]; then
+    echo "--- Rebuilding/restarting orchestrator ---"
+    ./orchestrator/deploy.sh
+fi
+
 if [ -x owui-patches/apply.sh ]; then
     echo "--- Re-applying OWUI patches ---"
     ./owui-patches/apply.sh
 fi
 
 echo ""
-echo "=== Update complete. Function hot-loaded; tool server and patches synced. ==="
+echo "=== Update complete. Function hot-loaded; tool server, orchestrator, and patches synced. ==="
