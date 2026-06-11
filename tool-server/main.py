@@ -26,6 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 import memory  # same-directory module
+import llm     # provider-chain LLM (deepseek-direct -> fireworks)
 import usage  # spend-panel routes (router mounted below)
 
 logger = logging.getLogger("tool-server")
@@ -742,11 +743,11 @@ class VerifyGroundingRequest(BaseModel):
     ),
     operation_id="verify_grounding",
 )
-def verify_grounding(req: VerifyGroundingRequest) -> dict:
-    if not FIREWORKS_API_KEY:
+async def verify_grounding(req: VerifyGroundingRequest) -> dict:
+    if not (FIREWORKS_API_KEY or llm.DEEPSEEK_API_KEY):
         raise HTTPException(
             status_code=503,
-            detail="verify_grounding unavailable: FIREWORKS_API_KEY not set on the tool server.",
+            detail="verify_grounding unavailable: no LLM key set on the tool server.",
         )
     audit_sys = (
         "You are a grounding auditor. Flag ONLY claims in the DRAFT that introduce NEW "
@@ -764,27 +765,15 @@ def verify_grounding(req: VerifyGroundingRequest) -> dict:
         "Output a numbered list of only the genuinely-unsupported phrases, or the single "
         "word NONE if every claim is supported. No preamble, no reasoning."
     )
-    payload = {
-        "model": VERIFY_MODEL,
-        "max_tokens": 1500,
-        "temperature": 0.0,
-        "messages": [
-            {"role": "system", "content": audit_sys},
-            {"role": "user", "content": f"SOURCE:\n{req.source}\n\nDRAFT:\n{req.draft}\n\nUnsupported claims:"},
-        ],
-    }
-    if "flash" in VERIFY_MODEL:  # deepseek-v4-flash: auditor, not a thinker
-        payload["reasoning_effort"] = "none"
+    messages = [
+        {"role": "system", "content": audit_sys},
+        {"role": "user", "content": f"SOURCE:\n{req.source}\n\nDRAFT:\n{req.draft}\n\nUnsupported claims:"},
+    ]
     try:
-        with httpx.Client(timeout=60.0) as client:
-            r = client.post(
-                "https://api.fireworks.ai/inference/v1/chat/completions",
-                headers={"Authorization": f"Bearer {FIREWORKS_API_KEY}",
-                         "Content-Type": "application/json"},
-                json=payload,
-            )
-            r.raise_for_status()
-            content = (r.json()["choices"][0]["message"].get("content") or "").strip()
+        # DeepSeek-direct primary, Fireworks fallback. Flash = auditor, no chain-of-thought.
+        content = await llm.chat(
+            VERIFY_MODEL, messages, max_tokens=1500, temperature=0.0,
+            reasoning_effort=("none" if "flash" in VERIFY_MODEL else None))
     except Exception as e:
         logger.exception("verify_grounding failed")
         raise HTTPException(status_code=502, detail=f"auditor call failed: {e}")

@@ -23,6 +23,8 @@ from typing import Optional
 
 import httpx
 
+import llm  # provider-chain LLM (deepseek-direct -> fireworks)
+
 logger = logging.getLogger("memory")
 logging.basicConfig(level=logging.INFO)
 
@@ -296,7 +298,7 @@ async def get_embedding(text: str) -> list[float]:
 
 
 async def summarize_turns(turns: list[tuple[str, str]]) -> str:
-    if not FIREWORKS_API_KEY or not turns:
+    if not turns:
         return ""
     block = "\n".join(f"[{role}]: {content[:700]}" for role, content in turns)
     prompt = (
@@ -310,25 +312,11 @@ async def summarize_turns(turns: list[tuple[str, str]]) -> str:
         f"CONVERSATION TURNS:\n{block}\n\n"
         "MEMORY SUMMARY:"
     )
-    payload = {
-        "model": COMPRESSION_MODEL,
-        "max_tokens": 500,
-        "temperature": 0.0,
-        "messages": [{"role": "user", "content": prompt}],
-    }
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                CHAT_COMPLETIONS_URL,
-                headers={
-                    "Authorization": f"Bearer {FIREWORKS_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            resp.raise_for_status()
-            text = resp.json()["choices"][0]["message"].get("content") or ""
-            return THINKING_RE.sub("", text).strip()
+        # DeepSeek-direct primary, Fireworks fallback (via llm chain).
+        text = await llm.chat(COMPRESSION_MODEL, [{"role": "user", "content": prompt}],
+                              max_tokens=500, temperature=0.0)
+        return THINKING_RE.sub("", text).strip()
     except Exception as e:
         logger.warning(f"Memory compression LLM failed: {e}")
         return ""
