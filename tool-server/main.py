@@ -921,16 +921,21 @@ async def deliverable_get(req: DeliverableGetRequest) -> dict:
     return {"chat_id": req.chat_id, "deliverable": d}
 
 
-# $/Mtok (input, output) — ESTIMATES, edit via USAGE_PRICES env (JSON) when providers
-# change pricing; applied at query time so corrections re-price history.
+# $/Mtok (input, output). Fireworks published serverless rates (fireworks.ai/pricing,
+# verified 2026-06); OpenAI/Anthropic for the prose tiers. NOTE: Fireworks bills CACHED
+# input at 50%, so actual spend on cache-heavy workloads runs below token*rate here —
+# the authoritative dollars are Fireworks' GetBillingSummary. flash/oss/v3 are estimates.
+# Override any of these via the USAGE_PRICES env (JSON); applied at query time.
 USAGE_PRICES: dict = {
-    "deepseek-v4-pro": (0.90, 0.90), "deepseek-v4-flash": (0.10, 0.40),
-    "kimi-k2p6": (1.00, 3.00), "gpt-5.5": (1.25, 10.00),
-    "claude-sonnet-4-6": (3.00, 15.00), "qwen3-embedding": (0.02, 0.0), "glm-5p1": (0.80, 2.00), "glm-5": (0.80, 2.00),
-    "kimi-k2p5": (0.60, 2.50), "kimi-k2-thinking": (0.60, 2.50),
-    "deepseek-v3p1": (0.30, 1.20), "deepseek-v3p2": (0.30, 1.20),
-    "gpt-oss-120b": (0.15, 0.60), "mixtral-8x22b-instruct": (0.90, 0.90),
-    "cogito-671b-v2-p1": (0.90, 0.90), "v4-research-writing": (0.90, 0.90),
+    "deepseek-v4-pro": (1.74, 3.48), "deepseek-v4-flash": (0.22, 0.88),
+    "glm-5p1": (1.40, 4.40), "glm-5": (1.40, 4.40),
+    "kimi-k2p6": (0.95, 4.00), "kimi-k2p5": (0.95, 4.00), "kimi-k2-thinking": (0.95, 4.00),
+    "gpt-5.5": (1.25, 10.00), "claude-sonnet-4-6": (3.00, 15.00),
+    "qwen3-embedding": (0.02, 0.0),
+    "deepseek-v3p1": (0.27, 1.10), "deepseek-v3p2": (0.27, 1.10),
+    "gpt-oss-120b": (0.15, 0.60), "gpt-oss-20b": (0.05, 0.20),
+    "mixtral-8x22b-instruct": (0.90, 0.90), "cogito-671b-v2-p1": (0.90, 0.90),
+    "v4-research-writing": (1.74, 3.48),
 }
 try:
     USAGE_PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()})
