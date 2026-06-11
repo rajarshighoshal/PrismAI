@@ -181,6 +181,11 @@ MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 ENABLE_CHUNKED_WRITER = _flag("ENABLE_CHUNKED_WRITER", "true")
 OUTLINE_MAX_TOKENS = int(os.getenv("OUTLINE_MAX_TOKENS", "4000"))
 CHUNKED_MAX_SECTIONS = int(os.getenv("CHUNKED_MAX_SECTIONS", "20"))
+# A pending outline that's never approved must not trap the chat in the plan flow forever
+# (the classifier biases to 'revise' when unsure): treat a plan older than the TTL as gone,
+# and bail out after too many no-progress revise cycles.
+CHUNKED_PLAN_TTL_SECONDS = int(os.getenv("CHUNKED_PLAN_TTL_SECONDS", "86400"))
+CHUNKED_MAX_REVISES = int(os.getenv("CHUNKED_MAX_REVISES", "6"))
 
 # Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.

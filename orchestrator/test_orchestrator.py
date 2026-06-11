@@ -1396,6 +1396,72 @@ async def _run_tests():
           bool(_calls.get("plan_clear")) and "hello" in _content(ev).lower()
           and not _calls.get("section_writes"))
 
+    # Per-section verification (post-review fix): each section is audited on its OWN, so a
+    # fabricating section is caught and named, the whole build is held, and the plan is kept.
+    _reset()
+    _plan_holder.append({"title": "Doc", "sections": [{"heading": "Intro", "intent": "x"},
+                         {"heading": "Bad", "intent": "y"}], "source": "Real source material.",
+                         "request": "r", "filename": "doc", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "approve", "revision": ""})
+    _section_queue.extend(["## Intro\n\nGrounded.", "## Bad\n\nFabricated claim."])
+    _CLEAN = {"unsupported": [], "verdict": "CLEAN"}
+    _FAB = {"unsupported": ["fabricated claim"], "verdict": "FABRICATION"}
+    _honesty_queue.extend([_CLEAN, _FAB, _FAB, _FAB])   # Intro clean; Bad fails all 3 audit rounds
+    ev = await _collect([{"role": "user", "content": "write it"}], request_headers=CW_HDRS)
+    if agent._BG_TASKS:
+        await asyncio.gather(*list(agent._BG_TASKS), return_exceptions=True)
+    out = _content(ev)
+    check("chunked: per-section audit isolates + names the failing section, holds the build",
+          "§2" in out and "Bad" in out and not _calls.get("deliverable_store")
+          and not _calls.get("plan_clear") and len(_calls.get("section_writes") or []) == 2)
+
+    # A section that can't be generated (empty after one retry) -> NO placeholder ships, build held.
+    _reset()
+    _plan_holder.append({"title": "D", "sections": [{"heading": "S", "intent": "i"}],
+                         "source": "src", "request": "r", "filename": "d", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "approve", "revision": ""})
+    _section_queue.extend(["", ""])           # write + retry both empty
+    ev = await _collect([{"role": "user", "content": "go"}], request_headers=CW_HDRS)
+    check("chunked: an ungenerable section holds the build (no placeholder shipped)",
+          "could not be generated".lower() not in _content(ev).lower()  # the old placeholder text is gone
+          and not _calls.get("deliverable_store") and not _calls.get("plan_clear"))
+
+    # Citation-without-source: a NO-source section that cites [N] is blocked (the dead global
+    # guard, restored source-aware for this path).
+    _reset()
+    _plan_holder.append({"title": "P", "sections": [{"heading": "Lit", "intent": "review"}],
+                         "source": "", "request": "r", "filename": "p", "fmt": "docx"})
+    _plan_intent_queue.append({"action": "approve", "revision": ""})
+    _section_queue.append("## Lit\n\nPrior work shows much [1]. References: [1] Smith 2020.")
+    ev = await _collect([{"role": "user", "content": "go"}], request_headers=CW_HDRS)
+    check("chunked: a no-source section that cites [N] is held back, not shipped",
+          not _calls.get("deliverable_store") and not _calls.get("plan_clear"))
+
+    # Cost prefilter (#8): a short, cue-less heavy request never spends the flash longdoc gate.
+    check("chunked: _maybe_longdoc prefilter — short cue-less ask is skipped",
+          agent._maybe_longdoc([{"role": "user", "content": "summarize this"}]) is False
+          and agent._maybe_longdoc([{"role": "user", "content": "write a research paper on X"}]) is True)
+    _reset()
+    _longdoc_queue.append(True)               # would say longdoc IF the gate were even called
+    _chat_queue.append(_chat_content("A short summary."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "summarize this"}], request_headers=CW_HDRS)
+    check("chunked: prefilter skips the longdoc classifier on a short request (no gate call)",
+          "gate:longdoc" not in (_calls.get("labels") or []) and not _calls.get("plan_store"))
+
+    # Plan escape hatch (#4): a plan past the revise cap is dropped without re-classifying.
+    _reset()
+    config_max = config.CHUNKED_MAX_REVISES
+    _plan_holder.append({"title": "Stuck", "sections": [{"heading": "A", "intent": "a"}],
+                         "source": "", "request": "r", "filename": "s", "fmt": "docx",
+                         "created_at": 9_999_999_999.0, "revise_count": config_max + 1})  # fresh -> only the cap triggers
+    _longdoc_queue.append(False)
+    _chat_queue.append(_chat_content("Fresh answer."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": "hello again"}], request_headers=CW_HDRS)
+    check("chunked: a plan past the revise cap is auto-dropped (no plan-intent classify)",
+          bool(_calls.get("plan_clear")) and "gate:plan" not in (_calls.get("labels") or []))
+
     print()
     if fails:
         print(f"{len(fails)} FAILED: {fails}")

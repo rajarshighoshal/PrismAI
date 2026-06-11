@@ -392,7 +392,11 @@ SYSTEM_OUTLINE = (
     "sentence on what that section will cover. Use the conventional structure for the "
     "document type (e.g. a research paper: Abstract, Introduction, … , References) but adapt "
     "to the user's actual topic and any source. Aim for the natural number of sections (most "
-    "documents need 4-10), not padding. Output ONLY the JSON object."
+    "documents need 4-10), not padding.\n"
+    "If a CURRENT OUTLINE is supplied with a requested change, APPLY THAT SINGLE CHANGE to it "
+    "(add / remove / reorder / rename / re-scope the named section) and otherwise keep the "
+    "existing sections and their order intact — do NOT replan the whole document from scratch. "
+    "Output ONLY the JSON object."
 )
 
 SYSTEM_PLAN_INTENT = (
@@ -414,7 +418,8 @@ SYSTEM_SECTION_WRITER = (
     "TITLE, the FULL OUTLINE (for context and to avoid overlap), the SECTION you must write "
     "now (its heading + intent), what the PRECEDING sections already covered, and any SOURCE "
     "MATERIAL. Write ONLY this section's prose:\n"
-    "- Start with the section heading as a Markdown heading, then its content.\n"
+    "- Start with the section heading as a LEVEL-2 Markdown heading (`## Heading`), then its "
+    "content. (The document title is the H1; every section is an H2.)\n"
     "- Cover exactly this section's intent — do NOT write other sections or repeat what earlier "
     "sections covered; pick up naturally from them.\n"
     "- Assert only facts from the SOURCE MATERIAL, the user's stated facts, or genuine common "

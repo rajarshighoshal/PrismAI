@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .owui import (
@@ -37,7 +38,7 @@ from .memory_client import (
     _plan_store, _plan_get, _plan_clear,
 )
 from .timectx import _now_line, _gap_note
-from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE
+from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
@@ -671,6 +672,21 @@ def _slug(title: str) -> str:
     return (s or "document")[:60]
 
 
+_LONGDOC_CUES = (
+    "paper", "thesis", "dissertation", "report", "essay", "review", "chapter", "white paper",
+    "whitepaper", "case study", "proposal", "study guide", "manuscript", "literature review",
+    "section", "comprehensive", "in-depth", "in depth", "detailed", "multi-part",
+)
+
+
+def _maybe_longdoc(messages) -> bool:
+    """Cheap deterministic PREFILTER before the (flash) long-doc classifier: only spend the
+    gate on plausibly-long requests. A short ask with no doc cues is never a long document,
+    so skip the model call entirely (most heavy turns — short edits, summaries — land here)."""
+    t = _last_user_text(messages).strip().lower()
+    return len(t) > 140 or any(c in t for c in _LONGDOC_CUES)
+
+
 async def _classify_longdoc(messages, *, session=None) -> dict:
     """Is this a request to WRITE a long, multi-section document (-> outline-first chunked
     writer)? One cheap flash gate; uncertain / parse failure -> not a long doc (normal flow)."""
@@ -691,10 +707,22 @@ async def _classify_longdoc(messages, *, session=None) -> dict:
         return {"longdoc": False, "doc_type": ""}
 
 
-async def _generate_outline(request: str, source: str, *, session=None):
+def _outline_for_prompt(plan: dict) -> str:
+    """The current sections, compactly, to hand back for an in-place revision."""
+    return "\n".join(f"{i}. {s.get('heading','')}: {s.get('intent','')}"
+                     for i, s in enumerate(plan.get("sections") or [], 1))
+
+
+async def _generate_outline(request: str, source: str, *, current_outline: str = "",
+                            change: str = "", session=None):
     """Plan a long document: {title, sections:[{heading,intent}]}. Grounded model at MAX
-    reasoning (label not a gate). Returns the plan dict, or None on failure."""
+    reasoning (label not a gate). For a revision, current_outline + change are supplied so the
+    model adjusts THAT outline in place (positional edits land right). Returns plan or None."""
     user = f"USER REQUEST:\n{(request or '').strip()[:6000]}"
+    if (current_outline or "").strip():
+        user += "\n\nCURRENT OUTLINE (apply the requested change to THIS, keep the rest):\n" + current_outline
+    if (change or "").strip():
+        user += "\n\nREQUESTED CHANGE: " + change.strip()[:1000]
     if (source or "").strip():
         user += "\n\nSOURCE MATERIAL:\n" + source[:20000]
     try:
@@ -791,27 +819,34 @@ async def _write_section(title: str, sections: list, idx: int, prior_recap: str,
 
 
 async def _present_outline(request: str, source: str, *, chat_id: str, filename: str = "",
-                           fmt: str = "docx", session=None, revised: bool = False):
-    """Generate an outline, persist it as the pending plan, and yield it for approval.
-    Async generator of (kind, text)."""
-    plan = await _generate_outline(request, source, session=session)
+                           fmt: str = "docx", session=None, revised: bool = False,
+                           current_outline: str = "", change: str = "", revise_count: int = 0):
+    """Generate an outline (or revise the current one in place), persist it as the pending
+    plan with a timestamp + revise counter, and yield it for approval. Async gen of (kind, text)."""
+    plan = await _generate_outline(request, source, current_outline=current_outline,
+                                   change=change, session=session)
     if not plan:
         yield ("content", "I couldn't draft a clear outline for that — tell me a bit more "
                "about the document you want and I'll plan it.")
         return
     plan["source"] = source or ""
-    plan["request"] = request or ""
+    plan["request"] = request or ""        # the ORIGINAL request, stable across revisions
     plan["filename"] = filename or _slug(plan.get("title") or "document")
     plan["fmt"] = fmt or "docx"
+    plan["created_at"] = time.time()       # TTL anchor so a never-approved plan expires
+    plan["revise_count"] = revise_count
     if chat_id:
         await _plan_store(chat_id, plan)   # awaited: the NEXT turn reads this
     yield ("content", _render_outline(plan, revised=revised))
 
 
 async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, headers, session=None):
-    """Build the approved long document section-by-section with live progress, run ONE
-    whole-document honesty pass (the same guarantee as the single-emit path), then export
-    + persist it as the chat's deliverable. Async generator of (kind, text)."""
+    """Build the approved long document SECTION-BY-SECTION with live progress. Each section is
+    verified on its OWN — a small input, so the honesty audit reasons within budget (no
+    dilution across a giant doc) and the refiner re-emits only that section (never the
+    64k-truncation a whole-doc rewrite would hit). If any section can't be written or grounded,
+    NOTHING ships — the plan is kept so the user can add a source / adjust and rebuild.
+    Async generator of (kind, text)."""
     title = plan.get("title") or "Document"
     sections = plan.get("sections") or []
     source = plan.get("source") or ""
@@ -819,37 +854,67 @@ async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, hea
     fmt = plan.get("fmt") or "docx"
 
     yield ("content", f"📝 Writing **{title}** — {len(sections)} sections, one at a time.\n\n")
-    assembled, recap = [], ""
+    assembled, recap, prev_tail, failures = [], "", "", []
     for i, sec in enumerate(sections):
         heading = sec.get("heading") or f"Section {i+1}"
         yield ("content", f"✍️ §{i+1} {heading}…\n")
-        section_md = await _write_section(title, sections, i, recap, source, session=session)
+        # Hand the writer the prior headings AND a tail of the previous section's real prose,
+        # so it can actually pick up the thread instead of restating it.
+        prompt_recap = recap + (f"\n\nThe previous section ended:\n…{prev_tail}" if prev_tail else "")
+        section_md = await _write_section(title, sections, i, prompt_recap, source, session=session)
+        if not section_md:                      # one retry on an empty/failed generation
+            section_md = await _write_section(title, sections, i, prompt_recap, source, session=session)
         if not section_md:
-            section_md = f"## {heading}\n\n_(This section could not be generated.)_"
+            failures.append((i + 1, heading, "couldn't be generated"))
+            yield ("content", "   ⚠️ couldn't write this section\n")
+            continue
+        # A from-scratch section (no source) that cites sources we never had is a fabrication —
+        # the deterministic backstop, made source-aware here (the global guard is masked by the
+        # always-present date/user-text in grounding_source).
+        if not source.strip() and _has_citation_markers(section_md):
+            failures.append((i + 1, heading, "cited sources that weren't provided"))
+            yield ("content", "   ⚠️ cited unprovided sources — held back\n")
+            continue
+        # Per-section honesty pass. Force the audit when there's source to ground against;
+        # with no source, let the gate decide (a from-scratch essay isn't a grounding task).
+        status, checked = await _verified_or_blocked(
+            messages, section_md, source, force=bool(source.strip()), session=session)
+        if status != "ok":
+            failures.append((i + 1, heading, "made claims I couldn't verify against your sources"))
+            yield ("content", "   ⚠️ unverifiable claims — held back\n")
+            continue
+        section_md = checked
         assembled.append(section_md)
+        prev_tail = section_md[-300:]
         recap += f"- {heading}: {sec.get('intent','')}\n"
-        yield ("content", f"   ✓ {len(_WORD_RE.findall(section_md))} words\n")
+        yield ("content", f"   ✓ {len(_WORD_RE.findall(section_md)):,} words\n")
+
+    if failures or not assembled:
+        detail = ("\n".join(f"- §{n} {h} — {why}" for n, h, why in failures)
+                  or "- the document came back empty")
+        yield ("content",
+               "\n\n⚠️ I held this back rather than ship something unverified:\n\n" + detail
+               + "\n\nYour outline is saved — add a source for those sections (or tell me to write "
+               "them more conservatively) and say **write it** to rebuild.")
+        return  # plan kept on purpose
 
     full_doc = (f"# {title}\n\n" + "\n\n".join(assembled)).strip()
-
-    yield ("content", "\n🛡️ Verifying the whole document against your sources…\n")
-    status, verified = await _verified_or_blocked(messages, full_doc, source, force=True, session=session)
-    if status != "ok":
-        # Blocked: never ship fabrication. Keep the plan so the user can adjust and rebuild.
-        yield ("content", "\n\n⚠️ " + verified
-               + "\n\n*(Your outline is still saved — tell me how to adjust it and I'll rebuild.)*")
-        return
-    full_doc = verified
-
     link = await _repackage_deliverable(full_doc, filename, fmt,
                                         chat_id=chat_id, headers=headers, session=session)
+    if chat_id and not link:
+        # Export failed AFTER the doc verified — don't lose the verified bytes: store them as
+        # the deliverable so a 'export it as docx' (reformat path) recovers the file, no rebuild.
+        await _deliverable_store(chat_id, full_doc, filename, fmt)
     if chat_id:
         await _plan_clear(chat_id)
         _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", full_doc[:4000], session)))
     words = len(_WORD_RE.findall(full_doc))
-    yield ("content", (f"\n\n📄 **{title}** is ready — {len(sections)} sections, {words:,} words. "
-                       f"Download below.{link}") if link
-           else "\n\nI built the document but couldn't export the file — want me to try again?")
+    if link:
+        yield ("content", f"\n\n📄 **{title}** is ready — {len(assembled)} sections, {words:,} words. "
+               f"Download below.{link}")
+    else:
+        yield ("content", f"\n\n📄 **{title}** is written and saved ({words:,} words), but the file "
+               "export failed — say **export it as docx** and I'll produce the file.")
 
 
 async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
@@ -889,6 +954,16 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # so this is decided BEFORE the edit/chat paths, which would misread "go" as a new turn.
     pending_plan = (await plan_task) if plan_task else None
     if pending_plan:
+        # Escape hatch: a never-approved plan must not trap the chat forever (the intent
+        # classifier biases to 'revise' when unsure). Expire on age or on too many revises.
+        # A missing created_at means "unknown age" -> don't expire on age (only on revises).
+        created = float(pending_plan.get("created_at") or 0)
+        age = (time.time() - created) if created else 0
+        revises = int(pending_plan.get("revise_count") or 0)
+        if age > config.CHUNKED_PLAN_TTL_SECONDS or revises > config.CHUNKED_MAX_REVISES:
+            await _plan_clear(chat_id)
+            pending_plan = None
+    if pending_plan:
         intent = await _classify_plan_intent(_last_user_text(messages), pending_plan, session=session)
         if intent["action"] == "approve":
             async for kt in _build_from_plan(pending_plan, messages, user_id, chat_id, req_headers, session):
@@ -897,14 +972,19 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
         if intent["action"] == "revise":
             revision = intent.get("revision") or ""
             if revision:
-                req = (pending_plan.get("request") or "") + "\n\nADJUST THE OUTLINE: " + revision
+                # Revise the CURRENT outline in place (so 'remove section 3' lands), keeping the
+                # ORIGINAL request stable across revisions; bump the revise counter.
                 async for kt in _present_outline(
-                        req, pending_plan.get("source") or "", chat_id=chat_id,
-                        filename=pending_plan.get("filename") or "", fmt=pending_plan.get("fmt") or "docx",
-                        session=session, revised=True):
+                        pending_plan.get("request") or "", pending_plan.get("source") or "",
+                        chat_id=chat_id, filename=pending_plan.get("filename") or "",
+                        fmt=pending_plan.get("fmt") or "docx", session=session, revised=True,
+                        current_outline=_outline_for_prompt(pending_plan), change=revision,
+                        revise_count=revises + 1):
                     yield kt
             else:
-                yield ("content", _render_outline(pending_plan))  # re-show unchanged
+                # Couldn't read a change (or empty reply) — re-show, but make the state escapable.
+                yield ("content", _render_outline(pending_plan)
+                       + "\n\n*(Say “write it” to build, name a change, or “never mind” to drop it.)*")
             return
         # abandon -> drop the plan and fall through to the normal flow with this message
         await _plan_clear(chat_id)
@@ -1107,8 +1187,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # We're past the plain-chat fast path, so this is a heavy turn. If the user is asking
     # for a long, multi-section document, don't emit it in one capped shot — propose an
     # outline now, then write it section-by-section once they approve (see Hook above).
-    # Skips edits (handled) and user-model regens (they picked a model). One cheap flash gate.
+    # Skips edits (handled) and user-model regens (they picked a model). A cheap deterministic
+    # prefilter (_maybe_longdoc) gates the flash classifier so it never fires on short heavy
+    # turns (quick edits, summaries) — only on plausibly-long requests.
     if (config.ENABLE_CHUNKED_WRITER and chat_id and not is_user_model and not edit_baseline
+            and _maybe_longdoc(messages)
             and (await _classify_longdoc(messages, session=session)).get("longdoc")):
         async for kt in _present_outline(
                 _all_user_text(messages), user_source, chat_id=chat_id,
