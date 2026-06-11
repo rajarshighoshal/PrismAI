@@ -183,15 +183,47 @@ MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 # then the recent tail is kept verbatim and older relevant facts are recalled to
 # stand in for the compacted head.
 #
-# The cap is a fraction of the SMALLEST generation window (glm-5p1, ~200k tokens),
-# NOT deepseek's 1M: a grounded turn runs on glm, so the conversation must never be
-# allowed to fill more than its share of glm's window. Compact at 80% of the window
-# (~160k tokens of conversation), leaving ~20% (~40k tokens) for the system prompt,
-# tool schemas, accumulated tool results, and the answer. ~3.5 chars/token for prose.
-# Note: 20% (~40k tokens) is comfortable for normal turns but near the edge for a
-# heavily tool-using GROUNDED turn (several web fetches) on a near-full window; dial
-# MEMORY_COMPACT_FRACTION down toward 0.70 if you ever see glm truncation.
-MODEL_CONTEXT_TOKENS = int(os.getenv("MODEL_CONTEXT_TOKENS", "200000"))      # glm-5p1 floor
+# The budget is a fraction of the SMALLEST window among the models that bind a
+# FULL-conversation turn (_BINDING_MODELS) — a long chat must never overflow whichever
+# model serves the turn, INCLUDING the Fireworks fallback. We derive the floor from the
+# actually-configured models instead of a hardcoded number, so swapping a model retunes
+# the trigger automatically.
+#
+# deepseek-v4 (our main; pro for chat/agent/grounded, flash for the gate) serves ~1M on
+# BOTH providers: DeepSeek-direct 1,048,576 / Fireworks 1,000,000 -> take the smaller,
+# 1,000,000 (covers the fallback). This REPLACES glm-5p1's 200k floor (glm bound grounded
+# turns and is now retired). Vision (kimi) is NOT a binder: it only ever sees the single
+# image-bearing message, never the conversation, so its window doesn't constrain the budget.
+CONTEXT_WINDOWS = {
+    "deepseek-v4-pro": 1_000_000,    # DeepSeek-direct 1,048,576 / Fireworks 1,000,000
+    "deepseek-v4-flash": 1_000_000,
+    "kimi-k2p6": 256_000,
+    "gemini-3.1-pro": 1_000_000,
+    "gpt-5.5": 400_000,
+    "claude-opus-4-8": 200_000,
+    "claude-sonnet-4-6": 200_000,
+}
+
+
+def context_window(model: str) -> int:
+    """Input-token context window for a model id (substring match on the bare name).
+    Unknown models fall back to a conservative 128k floor so we under- rather than
+    over-estimate a new model's room."""
+    name = (model or "").split("/")[-1]
+    best = max((win for key, win in CONTEXT_WINDOWS.items() if key in name), default=0)
+    return best or 128_000
+
+
+# Models that receive the FULL (compacted) conversation each turn. The budget must fit
+# the SMALLEST of these. QUERY / prose-classifier models only see a single turn, and
+# premium prose models polish a deliverable (not the raw conversation), so neither binds.
+_BINDING_MODELS = [CHAT_MODEL, AGENT_MODEL, GROUNDED_MODEL, DRAFT_MODEL, REFINE_MODEL,
+                   GROUNDING_GATE_MODEL]
+# Compact at 80% of that window, leaving ~20% for the system prompt, tool schemas,
+# accumulated tool results, and the answer. At 1M that's ~200k tokens of headroom —
+# comfortable even for a heavily tool-using grounded turn. ~3.5 chars/token for prose.
+MODEL_CONTEXT_TOKENS = int(os.getenv(
+    "MODEL_CONTEXT_TOKENS", str(min(context_window(m) for m in _BINDING_MODELS))))
 MEMORY_COMPACT_FRACTION = float(os.getenv("MEMORY_COMPACT_FRACTION", "0.80"))
 # ~3.5 chars/token is Latin-prose-tuned; dense scripts (e.g. CJK) run ~1-2
 # chars/token, so this under-counts tokens there — tolerable because the budget

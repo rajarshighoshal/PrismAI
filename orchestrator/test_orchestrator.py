@@ -1170,6 +1170,19 @@ async def _run_tests():
     finally:
         config.REASONING_EFFORT = _saved_re
 
+    # ── Compaction trigger is model-aware: floor = smallest window in the binding set ──
+    check("ctx: deepseek-v4 window is 1M (DeepSeek-direct/Fireworks both serve ~1M)",
+          config.context_window("accounts/fireworks/models/deepseek-v4-pro") == 1_000_000)
+    check("ctx: bare name matches too (DeepSeek-direct strips the prefix)",
+          config.context_window("deepseek-v4-flash") == 1_000_000)
+    check("ctx: unknown model -> conservative 128k floor (under-estimate room)",
+          config.context_window("accounts/fireworks/models/brand-new-thing") == 128_000)
+    check("ctx: binding floor follows deepseek now, NOT glm's retired 200k",
+          config.MODEL_CONTEXT_TOKENS == min(config.context_window(m) for m in config._BINDING_MODELS)
+          and config.MODEL_CONTEXT_TOKENS == 1_000_000)
+    check("ctx: vision model (kimi) is NOT in the binding set",
+          config.VISION_MODEL not in config._BINDING_MODELS)
+
     # e2e fallback driving the REAL chat/stream with a fake HTTP session.
     _fakes = (fireworks.complete, fireworks.chat, fireworks.stream)
     fireworks.complete, fireworks.chat, fireworks.stream = _REAL_FW_COMPLETE, _REAL_FW_CHAT, _REAL_FW_STREAM
