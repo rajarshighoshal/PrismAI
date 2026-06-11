@@ -16,6 +16,15 @@ FIREWORKS_BASE_URL = os.getenv(
     "FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"
 ).rstrip("/")
 
+# DeepSeek's own API as the PRIMARY provider for deepseek models, with Fireworks (above)
+# as the automatic fallback. DeepSeek's API is OpenAI-compatible AND uses the SAME model
+# names (deepseek-v4-pro / deepseek-v4-flash) and the same reasoning_effort param — so the
+# only difference is base_url + key + dropping the "accounts/fireworks/models/" prefix.
+# Inert until DEEPSEEK_API_KEY is set: with no key, deepseek calls go to Fireworks as before.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+ENABLE_DEEPSEEK_DIRECT = _flag("ENABLE_DEEPSEEK_DIRECT", "true")
+
 # Google Gemini API (legacy, kept for fallback).
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 ENABLE_GEMINI_PROSE = _flag("ENABLE_GEMINI_PROSE", "false")

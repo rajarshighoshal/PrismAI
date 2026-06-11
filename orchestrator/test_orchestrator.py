@@ -12,6 +12,56 @@ import time
 
 from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver, verifier
 
+# Real Fireworks fns captured BEFORE the per-test monkeypatching, so the provider-chain
+# tests can drive the ACTUAL fallback logic (real chat/stream) with a fake HTTP session.
+_REAL_FW_COMPLETE = fireworks.complete
+_REAL_FW_CHAT = fireworks.chat
+_REAL_FW_STREAM = fireworks.stream
+
+
+class _FakeHTTPResp:
+    """Stand-in aiohttp response: status>=400 -> raise_for_status throws; otherwise serves
+    a JSON payload (non-stream) or SSE byte-lines (stream)."""
+    def __init__(self, status, payload=None, lines=None):
+        self.status = status
+        self._payload = payload or {}
+        self._lines = lines or []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    async def json(self):
+        return self._payload
+
+    @property
+    def content(self):
+        async def _gen():
+            for ln in self._lines:
+                yield ln.encode()
+        return _gen()
+
+
+class _FakeHTTPSession:
+    """Routes each POST to a behavior fn keyed on the URL; records the URLs hit so a test
+    can assert provider order and that the fallback fired."""
+    def __init__(self, behavior):
+        self._behavior = behavior
+        self.urls = []
+
+    def post(self, url, **kw):
+        self.urls.append(url)
+        return self._behavior(url)
+
+    async def close(self):
+        pass
+
 _calls = {
     "chat_models": [],
     "chat_messages": [],
@@ -1076,6 +1126,54 @@ async def _run_tests():
     check("dedup: different chat -> different key",
           dedup.make_key(msgs, "PrismAI", "user-1", "chat-a")
           != dedup.make_key(msgs, "PrismAI", "user-1", "chat-b"))
+
+    # ── Provider chain: DeepSeek-direct primary, Fireworks fallback (deepseek-only) ──
+    _dsk, _fwk = config.DEEPSEEK_API_KEY, config.FIREWORKS_API_KEY
+    config.FIREWORKS_API_KEY = "fwkey"
+    config.DEEPSEEK_API_KEY = ""
+    check("provider: no DeepSeek key -> Fireworks only",
+          [p[3] for p in fireworks._providers("accounts/fireworks/models/deepseek-v4-pro")] == [False])
+    config.DEEPSEEK_API_KEY = "dskey"
+    _chain = fireworks._providers("accounts/fireworks/models/deepseek-v4-pro")
+    check("provider: deepseek model -> DeepSeek-direct THEN Fireworks, prefix stripped",
+          [p[3] for p in _chain] == [True, False] and _chain[0][2] == "deepseek-v4-pro")
+    check("provider: non-deepseek model -> Fireworks only even with a DeepSeek key",
+          [p[3] for p in fireworks._providers("accounts/fireworks/models/kimi-k2p6")] == [False])
+
+    # e2e fallback driving the REAL chat/stream with a fake HTTP session.
+    _fakes = (fireworks.complete, fireworks.chat, fireworks.stream)
+    fireworks.complete, fireworks.chat, fireworks.stream = _REAL_FW_COMPLETE, _REAL_FW_CHAT, _REAL_FW_STREAM
+    try:
+        DS = "accounts/fireworks/models/deepseek-v4-pro"
+        OK = {"choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}], "usage": {}}
+        s1 = _FakeHTTPSession(lambda url: _FakeHTTPResp(200, OK))
+        out1 = await fireworks.complete([{"role": "user", "content": "hi"}], DS, max_tokens=8, session=s1)
+        check("provider e2e: DeepSeek success answers WITHOUT touching Fireworks",
+              out1 == "answer" and any("deepseek.com" in u for u in s1.urls)
+              and not any("fireworks.ai" in u for u in s1.urls))
+
+        def _ovl(url):
+            return _FakeHTTPResp(503) if "deepseek.com" in url else _FakeHTTPResp(
+                200, {"choices": [{"message": {"content": "fw-fallback"}, "finish_reason": "stop"}], "usage": {}})
+        s2 = _FakeHTTPSession(_ovl)
+        out2 = await fireworks.complete([{"role": "user", "content": "hi"}], DS, max_tokens=8, session=s2)
+        check("provider e2e: DeepSeek overload (503) auto-falls-back to Fireworks",
+              out2 == "fw-fallback" and s2.urls[0].startswith("https://api.deepseek.com")
+              and any("fireworks.ai" in u for u in s2.urls))
+
+        _sse = ['data: {"choices":[{"delta":{"content":"streamed ok"}}]}', 'data: [DONE]']
+        def _ovl_stream(url):
+            return _FakeHTTPResp(503) if "deepseek.com" in url else _FakeHTTPResp(200, lines=_sse)
+        s3 = _FakeHTTPSession(_ovl_stream)
+        _parts = []
+        async for kind, text in fireworks.stream([{"role": "user", "content": "hi"}], DS, max_tokens=8, session=s3):
+            if kind == "content":
+                _parts.append(text)
+        check("provider e2e (stream): DeepSeek overload falls back to Fireworks pre-token",
+              "".join(_parts) == "streamed ok" and any("fireworks.ai" in u for u in s3.urls))
+    finally:
+        fireworks.complete, fireworks.chat, fireworks.stream = _fakes
+        config.DEEPSEEK_API_KEY, config.FIREWORKS_API_KEY = _dsk, _fwk
 
     # first request leads; an identical one arriving mid-flight follows the SAME future
     mode, fut = dedup.begin(key)
