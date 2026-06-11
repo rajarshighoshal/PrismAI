@@ -79,7 +79,7 @@ def _providers(model: str):
 
 
 def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_id,
-                  tools=None, tool_choice=None, stream=False, reasoning_effort=None):
+                  tools=None, tool_choice=None, stream=False, reasoning_effort=None, is_ds=False):
     p = {
         "model": provider_model,
         "messages": messages,
@@ -94,10 +94,18 @@ def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_
         p["tools"] = tools
     if tool_choice is not None:
         p["tool_choice"] = tool_choice
-    # Flash defaults to no chain-of-thought (fast classifier); a caller that needs careful
-    # grounding passes reasoning_effort. Same param on Fireworks and DeepSeek-direct.
+    # Flash reasoning differs by provider. Fireworks: reasoning_effort, where "none"
+    # disables chain-of-thought (fast classifier). DeepSeek-direct: "none" is NOT a valid
+    # value (it's a Fireworks extension) — omit it for the fast default, and ENABLE thinking
+    # (thinking:enabled + reasoning_effort) only when a real effort level is requested.
     if "deepseek-v4-flash" in (provider_model or ""):
-        p.setdefault("reasoning_effort", reasoning_effort or "none")
+        eff = reasoning_effort or "none"
+        if is_ds:
+            if eff and eff != "none":
+                p["reasoning_effort"] = eff
+                p["thinking"] = {"type": "enabled"}
+        else:
+            p.setdefault("reasoning_effort", eff)
     return p
 
 
@@ -146,7 +154,7 @@ async def chat(
             payload = _chat_payload(
                 pmodel, messages=messages, max_tokens=max_tokens, temperature=temperature,
                 session_id=session_id, tools=tools, tool_choice=tool_choice,
-                reasoning_effort=reasoning_effort)
+                reasoning_effort=reasoning_effort, is_ds=is_ds)
             t0 = time.perf_counter()
             try:
                 async with session.post(
@@ -191,7 +199,7 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
         last_exc = None
         for idx, (base, key, pmodel, is_ds) in enumerate(providers):
             payload = _chat_payload(pmodel, messages=messages, max_tokens=max_tokens,
-                                    temperature=temperature, session_id=session_id, stream=True)
+                                    temperature=temperature, session_id=session_id, stream=True, is_ds=is_ds)
             t0 = time.perf_counter()
             ttft = None
             usage = None
@@ -268,7 +276,7 @@ async def stream_chat(messages, model, *, max_tokens, temperature=None, session=
         for idx, (base, key, pmodel, is_ds) in enumerate(providers):
             payload = _chat_payload(pmodel, messages=messages, max_tokens=max_tokens,
                                     temperature=temperature, session_id=session_id,
-                                    tools=tools, tool_choice=tool_choice, stream=True)
+                                    tools=tools, tool_choice=tool_choice, stream=True, is_ds=is_ds)
             content_parts, calls, finish = [], {}, None
             t0 = time.perf_counter()
             ttft = None
