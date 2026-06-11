@@ -1019,6 +1019,89 @@ def _period_window(period: str):
         return None, None, "all time"
 
 
+# ── Actual Fireworks bill, split by channel (= API key) ───────────────────────────
+# billing/summary gives REAL cache-adjusted $ per MODEL (no key split); billingUsage gives
+# TOKENS per (key, model) but no $. Combine: apportion each model's real $ to channels by
+# their token share of that model. So OpenCode vs PrismAI show their actual billed dollars.
+_FW_ACCT: dict = {}
+
+
+def _fw_money(c: dict) -> float:
+    return int(c.get("units") or 0) + int(c.get("nanos") or 0) / 1e9
+
+
+def _fw_norm(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower().replace(".", "p"))
+
+
+async def _fw_account():
+    if _FW_ACCT:
+        return _FW_ACCT["id"], _FW_ACCT["created"]
+    import datetime as _dt
+    key = os.getenv("FIREWORKS_API_KEY", "")
+    async with httpx.AsyncClient(timeout=15) as cl:
+        r = await cl.get("https://api.fireworks.ai/v1/accounts",
+                         headers={"Authorization": "Bearer " + key})
+    a = (r.json().get("accounts") or [{}])[0]
+    _FW_ACCT["id"] = a.get("name", "").split("/")[-1]
+    _FW_ACCT["created"] = _dt.datetime.fromisoformat(
+        a.get("createTime", "2026-01-01T00:00:00Z").replace("Z", "+00:00"))
+    return _FW_ACCT["id"], _FW_ACCT["created"]
+
+
+async def _fireworks_billing(since, until) -> dict:
+    import datetime as _dt
+    acct, created = await _fw_account()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    s = _dt.datetime.fromtimestamp(since, _dt.timezone.utc) if since else created
+    u = _dt.datetime.fromtimestamp(until, _dt.timezone.utc) if until else now
+    s = max(s, created)
+    wins, cur = [], s
+    while cur < u:                                  # Fireworks caps windows at 31 days
+        nxt = min(cur + _dt.timedelta(days=30), u)
+        wins.append((cur, nxt)); cur = nxt
+    key = os.getenv("FIREWORKS_API_KEY", "")
+    hdr = {"Authorization": "Bearer " + key}
+    model_usd, key_model_tok, model_tok = {}, {}, {}
+    async with httpx.AsyncClient(timeout=30) as cl:
+        for a, b in wins:
+            qp = f"start_time={a:%Y-%m-%dT%H:%M:%SZ}&end_time={b:%Y-%m-%dT%H:%M:%SZ}"
+            base = f"https://api.fireworks.ai/v1/accounts/{acct}"
+            r1 = await cl.get(f"{base}/billing/summary?{qp}", headers=hdr)
+            for li in r1.json().get("lineItems", []):
+                nm = _fw_norm(str(li.get("groupingValue") or ""))
+                model_usd[nm] = model_usd.get(nm, 0.0) + _fw_money(li.get("totalCost") or {})
+            r2 = await cl.get(f"{base}/billingUsage?{qp}&groupBy=api_key_name", headers=hdr)
+            for row in r2.json().get("serverlessCosts", []):
+                ch = row.get("group", {}).get("api_key_name") or "(unnamed key)"
+                nm = _fw_norm(str(row.get("modelName", "")).split("/")[-1])
+                t = int(row.get("promptTokens") or 0) + int(row.get("completionTokens") or 0)
+                key_model_tok.setdefault(ch, {})[nm] = key_model_tok.setdefault(ch, {}).get(nm, 0) + t
+                model_tok[nm] = model_tok.get(nm, 0) + t
+    by_channel = {}
+    for ch, mt in key_model_tok.items():
+        usd = sum(model_usd.get(nm, 0.0) * (t / model_tok[nm])
+                  for nm, t in mt.items() if model_tok.get(nm))
+        by_channel[ch] = {"usd": round(usd, 4)}
+    by_model = {nm: {"usd": round(v, 4)} for nm, v in model_usd.items() if v > 0}
+    return {"by_channel": by_channel, "by_model": by_model,
+            "total_usd": round(sum(model_usd.values()), 2)}
+
+
+@app.get("/usage/fireworks")
+async def usage_fireworks_api(request: Request, period: str = "") -> dict:
+    if not await _owui_admin(_bearer(request)):
+        raise HTTPException(status_code=403, detail="admin only")
+    since, until, label = _period_window(period)
+    try:
+        d = await _fireworks_billing(since, until)
+    except Exception as e:
+        logger.warning(f"fireworks billing failed: {e}")
+        d = {"by_channel": {}, "by_model": {}, "total_usd": 0, "error": str(e)}
+    d["period"] = label
+    return d
+
+
 @app.get("/usage/summary", operation_id="usage_summary")
 async def usage_summary_api(request: Request, period: str = "") -> dict:
     if not await _owui_admin(_bearer(request)):
@@ -1126,6 +1209,24 @@ function tbl(title,obj,money){
     h+=`<tr><td>${k}</td><td>${fmt(b.calls)}</td><td>${fmt(b.in)}</td><td>${fmt(b.out)}</td><td class=usd>$${b.usd.toFixed(3)}</td></tr>`;
   return h+'</table>';
 }
+function ctbl(title,obj){
+  const rows=Object.entries(obj||{}).sort((a,b)=>b[1].usd-a[1].usd);
+  if(!rows.length)return '';
+  let h=`<h3>${title}</h3><table><tr><th></th><th>$</th></tr>`;
+  for(const [k,b] of rows) h+=`<tr><td>${k}</td><td class=usd>$${(b.usd||0).toFixed(2)}</td></tr>`;
+  return h+'</table>';
+}
+async function loadFireworks(period){
+  try{
+    const r=await fetch('/usage/fireworks?period='+encodeURIComponent(period||''),{headers:{Authorization:'Bearer '+token}});
+    if(!r.ok)return;
+    const f=await r.json();
+    const app=document.getElementById('app');
+    app.append($(`<h1 style="margin-top:2.5rem">⚡ $${(f.total_usd||0).toFixed(2)} <span class=sub style="font-size:1rem;font-weight:400">· Fireworks actual bill</span></h1>`));
+    app.append($(`<div class=sub>real rated dollars from Fireworks (cache-adjusted) · channels = API keys${f.error?(' · error: '+f.error):''}</div>`));
+    app.append($('<div>'+ctbl('By channel (API key)',f.by_channel)+ctbl('By model',f.by_model)+'</div>'));
+  }catch(e){}
+}
 function periodOptions(){
   var d=new Date(), o=[];
   for(var i=0;i<3;i++){var m=new Date(d.getFullYear(),d.getMonth()-i,1);
@@ -1152,7 +1253,9 @@ async function load(period){
   app.append($(`<div class=sub>${fmt(s.calls||0)} model calls · prices are configurable estimates</div>`));
   app.append(buildBar(period||CUR));
   const timeTbl = s.multi_month ? tbl('By month',s.by_month) : tbl('By day',s.by_day);
+  app.append($('<h2 style="margin-top:.5rem;font-size:1rem;color:#888">PrismAI metered (this server)</h2>'));
   app.append($('<div>'+tbl('By user',s.by_user)+tbl('By model',s.by_model)+tbl('By job',s.by_label)+timeTbl+'</div>'));
+  loadFireworks(period||CUR);   // append the actual Fireworks-bill section (all channels)
 }
 var CUR=periodOptions()[0].v;
 load(CUR);
