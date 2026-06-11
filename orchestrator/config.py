@@ -69,11 +69,36 @@ GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/mod
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
 ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 
-# Generation knobs.
-CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", "4096"))
-DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "8192"))
-# Image transcription is short by nature — no need for the full chat budget.
-VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "1024"))
+# Generation knobs — max_tokens caps OUTPUT (reasoning + answer TOGETHER, since MAX
+# reasoning is now default for substantive deepseek calls; see REASONING_EFFORT).
+#
+# WHY cap at all instead of just using the provider max? Billing is on ACTUAL output
+# tokens, so a high ceiling is FREE for a normal answer — the cap is NOT a cost lever,
+# it's a GUARDRAIL: (a) it bounds a runaway/looping generation (worst-case wall-clock
+# ~= ceiling / output-rate, so a stuck stream fails fast instead of hanging for minutes),
+# and (b) the provider hard-caps deepseek-v4 output at ~131k on Fireworks (our fallback)
+# anyway, so "all possible" lands there regardless. Rule: substantive generations get a
+# GENEROUS ceiling (well above any realistic thinking+answer — nothing truncates) but
+# stay a few x under 131k for runaway safety; classifiers/gates keep a TIGHT cap on
+# purpose (output is one label; a tight cap enforces terseness + catches misbehavior
+# instantly). Two substantive ceilings, split by what the call EMITS:
+#   GENERATION_MAX_TOKENS (32k) — a chat REPLY / agent turn / audit verdict: generous for any
+#     reply + max-reasoning thinking, well under the ~131k provider output cap.
+#   DRAFT_MAX_TOKENS (64k) — a DELIVERABLE / full whole-document REWRITE. When you drop a paper
+#     and say "rewrite it", the model re-emits the ENTIRE document in one reply, so this path
+#     needs ~2x the reply budget (~40k words out + thinking): a paper (6-10k words) or an MSc
+#     thesis (15-20k words) fits with room. For a full PhD-thesis single-shot rewrite, bump
+#     toward 120k via env (~40min worst-case stream). Input is NEVER the limit — any paper fits
+#     the 1M context window many times over; only the written-back output is bounded here.
+GENERATION_MAX_TOKENS = int(os.getenv("GENERATION_MAX_TOKENS", "32000"))
+CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", str(GENERATION_MAX_TOKENS)))
+DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "64000"))
+# Vision transcribes the image VERBATIM ("quote visible text exactly") for the
+# downstream text agent. 1024 (~700 words) truncated dense inputs — a full paper page,
+# a wide table, a psych-study figure, a long screenshot — silently dropping the bottom
+# of the image. 8192 covers a dense page-or-two; it's a ceiling (bills on actual tokens),
+# and vision runs on kimi (no reasoning/thinking overhead), so this is pure transcription.
+VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "8192"))
 # Split temperature by job instead of one compromise value:
 # - TOOL_TEMPERATURE: turns where the model decides/chains tools. Low = reliable
 #   tool selection and tight instruction-following (no "Here's a..." preamble).
@@ -136,13 +161,14 @@ HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v
 # Pinned explicitly because DeepSeek defaults to "high", not "max".
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "max")
 AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "max") or None
-# Reasoning-mode flash spends tokens THINKING before the JSON verdict, so the cap must
-# leave room for both — 900 truncated the verdict on a big source and the audit
-# fail-softed (didn't actually verify). The auditor now reads the FULL source (no
-# distilled list), so give it ample headroom to think over many files and still finish.
-AUDIT_MAX_TOKENS = int(os.getenv("AUDIT_MAX_TOKENS", "8000"))
+# The auditor reads the FULL source and now THINKS at MAX reasoning before its JSON
+# verdict; max_tokens bounds thinking + verdict together. Generous on purpose — a
+# truncated verdict silently fail-softs (didn't actually verify) = honesty hole. Shares
+# the generation ceiling (was 900 once -> truncated; 8000 pre-thinking).
+AUDIT_MAX_TOKENS = int(os.getenv("AUDIT_MAX_TOKENS", str(GENERATION_MAX_TOKENS)))
 AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "12"))
-AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
+# chat / agent / voice answers — shares the budget with MAX-reasoning thinking.
+AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", str(GENERATION_MAX_TOKENS)))
 GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
 MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10"))
 MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))

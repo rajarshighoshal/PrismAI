@@ -54,6 +54,11 @@ OPENWEBUI_ATTACH_EXPORTS = os.getenv("OPENWEBUI_ATTACH_EXPORTS", "true").lower()
 # clear error if unset, so the server still starts without it.
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY", "")
 VERIFY_MODEL = os.getenv("VERIFY_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
+# Generous ceiling: the auditor thinks at MAX reasoning before its list, and max_tokens
+# bounds thinking + list together. A truncated (empty) result reads as grounded below =
+# silent honesty hole, so leave ample room. Bills on actual tokens; capped under the
+# provider's ~131k output limit for runaway safety. (Mirrors orchestrator GENERATION_MAX_TOKENS.)
+VERIFY_MAX_TOKENS = int(os.getenv("VERIFY_MAX_TOKENS", "32000"))
 
 
 # --- Request models -------------------------------------------------------
@@ -772,8 +777,11 @@ async def verify_grounding(req: VerifyGroundingRequest) -> dict:
     try:
         # DeepSeek-direct primary, Fireworks fallback. Grounding is the core honesty check —
         # substantive, so MAX reasoning (internal thinking; the output stays a clean list).
+        # VERIFY_MAX_TOKENS is generous so max thinking can't crowd out the list and leave
+        # content empty — empty reads as grounded=True below (fail-soft), which would
+        # silently wave an ungrounded draft through.
         content = await llm.chat(
-            VERIFY_MODEL, messages, max_tokens=1500, temperature=0.0,
+            VERIFY_MODEL, messages, max_tokens=VERIFY_MAX_TOKENS, temperature=0.0,
             reasoning_effort="max")
     except Exception as e:
         logger.exception("verify_grounding failed")

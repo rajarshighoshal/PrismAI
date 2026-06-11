@@ -223,7 +223,7 @@ async def _try_patch_edit(baseline: str, instruction: str, *, session=None):
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_EDIT_PATCH + "\n\n--- DOCUMENT ---\n" + baseline},
              {"role": "user", "content": instruction}],
-            config.GROUNDED_MODEL, max_tokens=1500, temperature=0.0,
+            config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS, temperature=0.0,
             session=session, label="edit:patch")
         data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
     except Exception:
