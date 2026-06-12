@@ -92,6 +92,7 @@ _longdoc_queue = []          # SYSTEM_LONGDOC_GATE responses (bool: is it a long
 _outline_queue = []          # SYSTEM_OUTLINE responses (plan dict)
 _plan_intent_queue = []      # SYSTEM_PLAN_INTENT responses ({action, revision})
 _section_queue = []          # SYSTEM_SECTION_WRITER responses (section markdown)
+_vision_queue = []           # vision-model outputs (M3 two-part / fallback caption)
 
 
 async def _fake_deliverable_get(chat_id, session=None):
@@ -167,7 +168,10 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
     _calls["complete_models"].append(model)
     _calls.setdefault("labels", []).append(label)
     sys = messages[0]["content"] if messages else ""
-    if model == config.VISION_MODEL:
+    if model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):
+        _calls.setdefault("vision_models", []).append(model)
+        if _vision_queue:
+            return _vision_queue.pop(0)
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
     if "editing a document the user already received" in sys:  # SYSTEM_EDIT_PATCH
         return _patch_queue.pop(0) if _patch_queue else json.dumps({"broad": True})
@@ -271,6 +275,7 @@ def _reset():
     _outline_queue.clear()
     _plan_intent_queue.clear()
     _section_queue.clear()
+    _vision_queue.clear()
 
 
 async def _run_tests():
@@ -707,6 +712,39 @@ async def _run_tests():
     check("vision: used agent loop after transcription",
           _calls["chat_models"] in ([config.AGENT_MODEL], [config.GROUNDED_MODEL]))
     check("vision: injected image context into agent", "VISIBLE TEXT" in json.dumps(_calls["chat_messages"][0]))
+
+    # Native vision (M3): two-part emission splits into an audit-grade transcript + a reading.
+    _t, _r = agent._split_vision_output("## EVIDENCE TRANSCRIPT\nTable: X = 5 [T1]\n## READING\nX is 5 (from [T1]).")
+    check("vision: two-part output splits into transcript + reading",
+          "Table: X = 5 [T1]" in _t and "EVIDENCE TRANSCRIPT" not in _t and "X is 5" in _r)
+    _t2, _r2 = agent._split_vision_output("Just a flat caption, no headers.")
+    check("vision: a flat caption (no two-part) is used as BOTH source and reading",
+          _t2 == _r2 == "Just a flat caption, no headers.")
+
+    # The EVIDENCE TRANSCRIPT reaches the honesty auditor as SOURCE — so image claims are grounded.
+    _reset()
+    _vision_queue.append("## EVIDENCE TRANSCRIPT\nRevenue Q1 was $1.2M. [T1]\n\n## READING\n"
+                         "The image shows Q1 revenue of $1.2M (from [T1]).")
+    _chat_queue.append(_chat_content("Q1 revenue was $1.2M."))
+    _gate_queue.append(True)                 # this turn IS a factual deliverable -> audit runs
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
+    ev = await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "summarize the revenue figure"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]}])
+    check("vision: the evidence transcript reaches the auditor as grounding source",
+          "Revenue Q1 was $1.2M" in "".join(_calls.get("fact_audit") or []))
+
+    # M3 failure/empty read degrades to the fallback reader (kimi), order preserved.
+    _reset()
+    _vision_queue.extend(["", "FALLBACK CAPTION from the backup reader."])
+    _chat_queue.append(_chat_content("Here's what it shows."))
+    _gate_queue.append(False)
+    ev = await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]}])
+    check("vision: an empty M3 read degrades to the fallback model",
+          _calls.get("vision_models") == [config.VISION_MODEL, config.VISION_FALLBACK_MODEL]
+          and "FALLBACK CAPTION" in json.dumps(_calls["chat_messages"][0]))
 
     # The verifier flags a fabricated FACT but leaves motivation/voice untouched —
     # for any kind of writing, not a hand-coded "application" category.

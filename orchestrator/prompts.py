@@ -197,9 +197,21 @@ SYSTEM_AGENT = (
 )
 
 SYSTEM_VISION = (
-    "Transcribe and describe the image for a text-only agent. Quote all visible "
-    "text exactly when possible, then summarize layout, context, and likely user "
-    "intent. Do not answer the user's task; produce only faithful image context."
+    "You SEE an image for a downstream text-only agent and a text-based honesty auditor that "
+    "cannot see the image. Everything true about the image must survive into TEXT, or it can't "
+    "be used or verified. Output EXACTLY these two parts, with these headings:\n\n"
+    "## EVIDENCE TRANSCRIPT\n"
+    "A faithful, LITERAL extraction — what is actually on the image, no interpretation and no "
+    "answer to the user. Quote ALL visible text verbatim. Render every table as a Markdown "
+    "table with exact cell values. For a chart/graph, give the title, axis labels, every series "
+    "name, and the read-off data values. Note figure/caption text. Label each distinct region "
+    "with an ID in brackets — [T1], [T2], … — so claims can cite them. If a value is unclear, "
+    "write [unclear], never guess.\n\n"
+    "## READING\n"
+    "Now address the user's actual request about the image. After EACH factual claim, cite the "
+    "transcript region(s) it rests on, e.g. '(from [T2])'. Use ONLY what the transcript supports "
+    "— do not add facts that aren't visible in the image. If the image doesn't support an answer, "
+    "say so."
 )
 
 SYSTEM_GATE = (

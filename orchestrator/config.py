@@ -55,7 +55,12 @@ TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").r
 
 # Per-task model selection. Defaults mirror router_fn.
 CHAT_MODEL = os.getenv("CHAT_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
-VISION_MODEL = os.getenv("VISION_MODEL", "accounts/fireworks/models/kimi-k2p6")
+# NATIVE vision: M3 sees the actual pixels and emits a structured EVIDENCE TRANSCRIPT
+# (audit-grade) + a cited READING, replacing the old lossy kimi caption (which flattened a
+# figure/table to one sentence the auditor couldn't ground against). M3 reasons by default
+# (thinking on). VISION_FALLBACK_MODEL is the graceful degrade if the M3 call fails.
+VISION_MODEL = os.getenv("VISION_MODEL", "accounts/fireworks/models/minimax-m3")
+VISION_FALLBACK_MODEL = os.getenv("VISION_FALLBACK_MODEL", "accounts/fireworks/models/kimi-k2p6")
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", CHAT_MODEL)          # deliverable first draft
 REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 # Agentic harness model roles. The controller decides tool use; the final model
@@ -93,12 +98,11 @@ ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 GENERATION_MAX_TOKENS = int(os.getenv("GENERATION_MAX_TOKENS", "32000"))
 CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", str(GENERATION_MAX_TOKENS)))
 DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "64000"))
-# Vision transcribes the image VERBATIM ("quote visible text exactly") for the
-# downstream text agent. 1024 (~700 words) truncated dense inputs — a full paper page,
-# a wide table, a psych-study figure, a long screenshot — silently dropping the bottom
-# of the image. 8192 covers a dense page-or-two; it's a ceiling (bills on actual tokens),
-# and vision runs on kimi (no reasoning/thinking overhead), so this is pure transcription.
-VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "8192"))
+# Vision now emits a STRUCTURED EVIDENCE TRANSCRIPT (verbatim OCR + markdown tables +
+# region IDs) AND a cited READING, with M3 thinking on — so the budget covers transcript +
+# reading + reasoning together (was 8192 for a flat kimi caption). 16k handles a dense
+# multi-region page; it's a ceiling (bills on actual tokens).
+VISION_MAX_TOKENS = int(os.getenv("VISION_MAX_TOKENS", "16000"))
 # Split temperature by job instead of one compromise value:
 # - TOOL_TEMPERATURE: turns where the model decides/chains tools. Low = reliable
 #   tool selection and tight instruction-following (no "Here's a..." preamble).
@@ -237,6 +241,7 @@ MIN_SOURCE_CHARS = int(os.getenv("MIN_SOURCE_CHARS", "200"))
 CONTEXT_WINDOWS = {
     "deepseek-v4-pro": 1_000_000,    # DeepSeek-direct 1,048,576 / Fireworks 1,000,000
     "deepseek-v4-flash": 1_000_000,
+    "minimax-m3": 500_000,           # native-vision reader (500k at launch, 1M soon); not a binder
     "kimi-k2p6": 256_000,
     "gemini-3.1-pro": 1_000_000,
     "gpt-5.5": 400_000,

@@ -56,51 +56,71 @@ _TEXTUAL_TOOL_BLOCK_RE = re.compile(
     re.I | re.S)
 
 
+def _split_vision_output(text: str):
+    """Split the vision model's emission into (evidence_transcript, reading). The transcript is
+    the audit-grade SOURCE (literal, verbatim); the reading is the interpretation for the
+    reasoner. Falls back to using the whole text for both when the model didn't emit the
+    two-part structure (e.g. the kimi fallback produced a flat caption)."""
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+    parts = re.split(r"(?im)^\s*#+\s*reading\b.*$", t, maxsplit=1)
+    if len(parts) == 2:
+        transcript = re.sub(r"(?im)^\s*#+\s*evidence transcript\b.*$", "", parts[0]).strip()
+        reading = parts[1].strip()
+        if transcript:
+            return transcript, reading
+    return t, t  # no clean split -> the whole emission serves as both source and context
+
+
 async def _describe_images_for_agent(messages, *, session=None):
-    # Transcribe every image-bearing message CONCURRENTLY — a chat with several image
-    # turns (e.g. figures across a thread) used to caption them one after another, paying
-    # the 9-18s vision latency per image in series. gather preserves order.
+    """Replace each image with NATIVE-vision text: the model SEES the pixels and emits a
+    structured EVIDENCE TRANSCRIPT (audit-grade source) + a cited READING (context for the
+    text reasoner). Returns (messages, image_transcript): the transcript is surfaced
+    SEPARATELY so run() can route it into the grounding source, where the text auditor can
+    verify image-derived claims against it. Images are read CONCURRENTLY (order preserved)."""
     async def _describe(m):
         content = m.get("content")
         text_parts, image_parts = _split_content_parts(content)
         if not image_parts:
-            return dict(m)
+            return dict(m), ""
         user_text = "\n".join(t.strip() for t in text_parts if t.strip())
         prompt = (
-            "The user attached image(s) to this message. Preserve the visual evidence "
-            "for a downstream text-only agent.\n\n"
-            f"USER TEXT:\n{user_text or '(none)'}\n\n"
-            "Return a faithful transcription/description. Quote visible text exactly. "
-            "Do not answer the user's task."
+            "The user attached image(s) with this message. Read them natively and follow your "
+            "two-part contract — EVIDENCE TRANSCRIPT, then READING.\n\n"
+            f"USER REQUEST:\n{user_text or '(none)'}"
         )
         vision_content = [{"type": "text", "text": prompt}] + image_parts
-        try:
-            description = await fireworks.complete(
-                [{"role": "system", "content": SYSTEM_VISION},
-                 {"role": "user", "content": vision_content}],
-                config.VISION_MODEL,
-                max_tokens=config.VISION_MAX_TOKENS,
-                temperature=0.0,
-                session=session,
-                label="vision",
-            )
-        except Exception as e:
-            log.warning(f"[vision] image description failed: {e}")
-            description = "Image was attached, but the vision transcription failed."
-        combined = user_text
-        if description.strip():
-            # Frame the vision output as the ASSISTANT's own sight of the image, not as
-            # text the user pasted — otherwise the agent disclaims "I'm text-only, based
-            # on the transcription you provided" (factually right, but it never saw a
-            # user transcription; the system's vision step produced it).
-            combined = (
-                (combined + "\n\n") if combined else ""
-            ) + "[What you see in the image the user attached:]\n" + description.strip()
+        out = ""
+        # M3 (native vision) first; degrade to the fallback reader if its call fails/empties.
+        for model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):
+            if not model:
+                continue
+            try:
+                out = (await fireworks.complete(
+                    [{"role": "system", "content": SYSTEM_VISION},
+                     {"role": "user", "content": vision_content}],
+                    model, max_tokens=config.VISION_MAX_TOKENS, temperature=0.0,
+                    session=session, label="vision")).strip()
+                if out:
+                    break
+            except Exception as e:
+                log.warning(f"[vision] {model.split('/')[-1]} read failed: {e}")
+        transcript, _reading = _split_vision_output(out)
         new_m = dict(m)
-        new_m["content"] = combined or "Image was attached, but no text was available."
-        return new_m
+        if out:
+            # Frame as the assistant's OWN sight of the image (not user-pasted text), so the
+            # reasoner doesn't disclaim "based on the transcription you gave me".
+            new_m["content"] = (((user_text + "\n\n") if user_text else "")
+                                + "[What you see in the attached image:]\n" + out)
+        else:
+            new_m["content"] = user_text or "Image was attached, but the vision read failed."
+        return new_m, transcript
 
-    return list(await asyncio.gather(*(_describe(m) for m in messages)))
+    pairs = list(await asyncio.gather(*(_describe(m) for m in messages)))
+    msgs = [p[0] for p in pairs]
+    transcript = "\n\n".join(p[1] for p in pairs if p[1].strip())
+    return msgs, transcript
 
 
 def _with_system(messages, system_text):
@@ -939,10 +959,11 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     active_task = asyncio.ensure_future(_last_active(chat_id)) if chat_id else None
     plan_task = (asyncio.ensure_future(_plan_get(chat_id))
                  if chat_id and config.ENABLE_CHUNKED_WRITER else None)
+    image_transcript = ""
     if had_images:
         if config.SHOW_WORK:
             yield ("content", "🖼️ Reading the image…\n\n")
-        messages = await _describe_images_for_agent(messages, session=session)
+        messages, image_transcript = await _describe_images_for_agent(messages, session=session)
 
     style_profile = await style_task
     prior_deliverable = (await deliverable_task) if deliverable_task else None
@@ -1141,6 +1162,14 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     # context budget, so a document pasted in a since-trimmed turn can still ground
     # a faithful quote; recall_context separately carries older user-stated facts.
     user_source = _user_source(messages)
+    if image_transcript:
+        # The native-vision EVIDENCE TRANSCRIPT is the auditable proxy for the pixels: routing
+        # it into the grounding source lets the text auditor verify image-derived claims (a
+        # fabricated chart value / invented table cell is flagged because it isn't in the
+        # transcript) — turning the unauditable-image problem into the auditable-text one.
+        tag = ("IMAGE EVIDENCE TRANSCRIPT (what the vision reader saw in the attached image; "
+               "authoritative source for any claim about the image):\n" + image_transcript)
+        user_source = (user_source + "\n\n" + tag).strip() if user_source.strip() else tag
     if edit_baseline:
         # The prior verified document grounds the edit: its carried-over facts count as
         # established, and a non-empty source routes the turn to the grounded writer and
