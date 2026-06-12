@@ -90,30 +90,34 @@ async def _describe_images_for_agent(messages, *, session=None):
             "two-part contract — EVIDENCE TRANSCRIPT, then READING.\n\n"
             f"USER REQUEST:\n{user_text or '(none)'}"
         )
-        # Pin high image detail so the provider tiles a large/dense image at full resolution
-        # instead of downscaling it into a blur the model confabulates from (A/B-proven).
         detail = (config.VISION_IMAGE_DETAIL or "").strip().lower()
-        imgs = []
-        for p in image_parts:
-            if detail and detail != "auto" and isinstance(p.get("image_url"), dict):
-                p = {**p, "image_url": {**p["image_url"], "detail": detail}}
-            imgs.append(p)
-        vision_content = [{"type": "text", "text": prompt}] + imgs
+
+        def _content(use_detail: bool):
+            # High image detail makes the provider tile a large/dense image at full resolution
+            # instead of downscaling it into a blur the model confabulates from (A/B-proven).
+            parts = []
+            for p in image_parts:
+                if use_detail and detail and detail != "auto" and isinstance(p.get("image_url"), dict):
+                    p = {**p, "image_url": {**p["image_url"], "detail": detail}}
+                parts.append(p)
+            return [{"type": "text", "text": prompt}] + parts
+
         out = ""
-        # M3 (native vision) first; degrade to the fallback reader if its call fails/empties.
-        for model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):
-            if not model:
-                continue
+        readers = [m for m in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL) if m]
+        for i, model in enumerate(readers):
+            # Primary (M3) gets high-detail tiling for faithfulness; the FALLBACK runs WITHOUT
+            # it — a lighter, faster degrade that actually returns when the primary stalled on a
+            # huge tiled image (both stalling = the image getting silently dropped, the bug).
             try:
                 out = (await fireworks.complete(
                     [{"role": "system", "content": SYSTEM_VISION},
-                     {"role": "user", "content": vision_content}],
+                     {"role": "user", "content": _content(use_detail=(i == 0))}],
                     model, max_tokens=config.VISION_MAX_TOKENS, temperature=0.0,
                     session=session, label="vision")).strip()
                 if out:
                     break
             except Exception as e:
-                log.warning(f"[vision] {model.split('/')[-1]} read failed: {e}")
+                log.warning(f"[vision] {model.split('/')[-1]} read failed: {type(e).__name__}: {e}")
         transcript, _reading = _split_vision_output(out)
         new_m = dict(m)
         if out:
@@ -122,7 +126,13 @@ async def _describe_images_for_agent(messages, *, session=None):
             new_m["content"] = (((user_text + "\n\n") if user_text else "")
                                 + "[What you see in the attached image:]\n" + out)
         else:
-            new_m["content"] = user_text or "Image was attached, but the vision read failed."
+            # NEVER silently drop the image — without this the agent sees only the question and
+            # claims "no image was attached". Keep an explicit signal so it owns the failure.
+            new_m["content"] = (((user_text + "\n\n") if user_text else "")
+                                + "[An image WAS attached, but the vision reader could not "
+                                "process it this time. Tell the user you had trouble reading "
+                                "the image and ask them to re-send it — do NOT say no image was "
+                                "attached.]")
         return new_m, transcript
 
     pairs = list(await asyncio.gather(*(_describe(m) for m in messages)))

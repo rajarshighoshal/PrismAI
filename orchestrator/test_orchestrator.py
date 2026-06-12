@@ -777,6 +777,31 @@ async def _run_tests():
     check("vision: detail:high is pinned on the image sent to the reader",
           '"detail": "high"' in json.dumps(_calls.get("vision_msgs") or []))
 
+    # The PRIMARY read gets detail:high; the FALLBACK runs WITHOUT it (fast degrade, so it
+    # actually returns when the primary stalled on a huge tiled image).
+    _reset()
+    _vision_queue.extend(["", "FALLBACK CAPTION."])
+    _chat_queue.append(_chat_content("ok"))
+    _gate_queue.append(False)
+    await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]}])
+    _vm = _calls.get("vision_msgs") or []
+    check("vision: fallback read drops detail:high (lighter/faster degrade)",
+          len(_vm) == 2 and '"detail": "high"' in json.dumps(_vm[0]) and '"detail"' not in json.dumps(_vm[1]))
+
+    # TOTAL read failure must NOT silently drop the image (the 'I don't see any images' bug):
+    # the agent's context keeps an explicit 'image attached but unreadable' note.
+    _reset()
+    _vision_queue.extend(["", ""])           # primary AND fallback both fail/empty
+    _chat_queue.append(_chat_content("I had trouble reading that image — could you re-send it?"))
+    _gate_queue.append(False)
+    await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "what is in this image?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]}])
+    check("vision: a total read failure keeps an 'image attached but unreadable' note (no silent drop)",
+          "could not process it" in json.dumps(_calls.get("chat_messages") or []))
+
     # ── Auditor FAILS CLOSED: an unusable verdict blocks, never silently 'clean' (task #30) ──
     _reset()
     _honesty_queue.append("__TRUNCATED__")           # verdict truncated (finish=length)
