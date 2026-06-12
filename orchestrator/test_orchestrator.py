@@ -819,6 +819,20 @@ async def _run_tests():
     check("vision: a re-sent image is served from cache (read once, not per turn)",
           _reads_after_first == 1 and len(_calls.get("vision_models") or []) == 1)
 
+    # #2: an image-derived answer is FORCE-audited even when the gate says 'no verify' (image
+    # Q&A is otherwise classified 'answering about a file' so the transcript-as-source
+    # guarantee silently never fires). With the fix, the audit runs against the transcript.
+    _reset()
+    _vision_queue.append("## EVIDENCE TRANSCRIPT\nRevenue was $1.2M [T1]\n## READING\n$1.2M (from [T1]).")
+    _chat_queue.append(_chat_content("The image shows revenue of $1.2M."))
+    _gate_queue.append(False)   # the gate would SKIP verification for image Q&A
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
+    await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "what's the revenue?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,REVNUM"}}]}])
+    check("vision: image answer is force-audited even when the gate says no-verify (#2 honesty)",
+          len(_calls.get("fact_audit") or []) >= 1)
+
     # ── Auditor FAILS CLOSED: an unusable verdict blocks, never silently 'clean' (task #30) ──
     _reset()
     _honesty_queue.append("__TRUNCATED__")           # verdict truncated (finish=length)

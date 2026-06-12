@@ -135,11 +135,16 @@ async def _describe_images_for_agent(messages, *, session=None):
             # it — a lighter, faster degrade that actually returns when the primary stalled on a
             # huge tiled image (both stalling = the image getting silently dropped, the bug).
             try:
-                out = (await fireworks.complete(
+                _read = fireworks.complete(
                     [{"role": "system", "content": SYSTEM_VISION},
                      {"role": "user", "content": _content(use_detail=(i == 0))}],
                     model, max_tokens=config.VISION_MAX_TOKENS, temperature=0.0,
-                    session=session, label="vision")).strip()
+                    session=session, label="vision",
+                    reasoning_effort=config.VISION_REASONING_EFFORT)
+                # Deadline the PRIMARY so a stall hands off to the light fallback promptly.
+                if i == 0 and len(readers) > 1 and config.VISION_PRIMARY_TIMEOUT > 0:
+                    _read = asyncio.wait_for(_read, timeout=config.VISION_PRIMARY_TIMEOUT)
+                out = (await _read).strip()
                 if out:
                     break
             except Exception as e:
@@ -1572,7 +1577,10 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
             source,
             recall_context=recall_context,
             prose=prose,
-            force=bool(pending_exports),  # an exported file is always a deliverable -> verify
+            # An exported file is always a deliverable -> verify. ALSO force it whenever an
+            # image was read, so an image-derived factual claim is grounded against the
+            # transcript (image Q&A is otherwise classified 'no verification needed').
+            force=bool(pending_exports or (image_transcript and config.VISION_FORCE_AUDIT)),
             session=session,
         )
         links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""

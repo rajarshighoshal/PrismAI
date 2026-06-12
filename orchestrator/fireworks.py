@@ -125,6 +125,11 @@ def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_
                 p["thinking"] = {"type": "enabled"}
         elif "deepseek-v4-flash" in provider_model:
             p.setdefault("reasoning_effort", "high" if effort == "max" else effort)
+    elif "minimax" in (provider_model or "") and effort:
+        # minimax-m3 (vision) honors reasoning_effort directly — 'none' turns thinking OFF.
+        # A/B-proven: OCR/transcription is perception, identical accuracy with thinking off
+        # but cheaper + no cap-truncation; deepseek does the actual interpretation downstream.
+        p["reasoning_effort"] = "high" if effort == "max" else effort
     return p
 
 

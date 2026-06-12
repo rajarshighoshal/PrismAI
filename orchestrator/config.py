@@ -67,6 +67,22 @@ VISION_FALLBACK_MODEL = os.getenv("VISION_FALLBACK_MODEL", "accounts/fireworks/m
 # visual tokens, still ~$0.001/image) and it reads small text EXACTLY. Pin high so dense docs
 # stay faithful; set "auto" to let the provider decide, or "low" to force the cheap downscale.
 VISION_IMAGE_DETAIL = os.getenv("VISION_IMAGE_DETAIL", "high")
+# Vision is PERCEPTION (OCR/transcription), not reasoning — A/B-proven: M3 reads a dense
+# screenshot 4/4 correct WITH thinking off, identical to thinking on, but cheaper (215->65
+# tokens) and no cap-truncation. The downstream deepseek reasoner does the interpretation at
+# max. So pin vision thinking OFF by default; bump to low/medium if a dense-table class dips.
+VISION_REASONING_EFFORT = os.getenv("VISION_REASONING_EFFORT", "none")
+# Force the honesty audit on any answer derived from an image. Without this, image Q&A is
+# classified 'answering about a file' -> needs_verification=false -> the answer is NEVER
+# grounded against the image transcript, so the transcript-as-source guarantee silently
+# never fires for the most common vision use. The audit no-ops cheaply when the answer makes
+# no factual claims (casual photo chat stays cheap); it only blocks an unsupported image fact.
+VISION_FORCE_AUDIT = _flag("VISION_FORCE_AUDIT", "true")
+# Per-attempt deadline on the PRIMARY vision read: if M3 stalls on a huge tiled image, cancel
+# it and run the light no-detail fallback PROMPTLY, instead of burning the full GEN_TIMEOUT
+# (90s) before kimi even gets a turn. With reasoning off + proportional transcript a normal
+# read is ~5s, so this only trips a genuine stall.
+VISION_PRIMARY_TIMEOUT = float(os.getenv("VISION_PRIMARY_TIMEOUT", "40"))
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", CHAT_MODEL)          # deliverable first draft
 REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 # Agentic harness model roles. The controller decides tool use; the final model
