@@ -90,7 +90,15 @@ async def _describe_images_for_agent(messages, *, session=None):
             "two-part contract — EVIDENCE TRANSCRIPT, then READING.\n\n"
             f"USER REQUEST:\n{user_text or '(none)'}"
         )
-        vision_content = [{"type": "text", "text": prompt}] + image_parts
+        # Pin high image detail so the provider tiles a large/dense image at full resolution
+        # instead of downscaling it into a blur the model confabulates from (A/B-proven).
+        detail = (config.VISION_IMAGE_DETAIL or "").strip().lower()
+        imgs = []
+        for p in image_parts:
+            if detail and detail != "auto" and isinstance(p.get("image_url"), dict):
+                p = {**p, "image_url": {**p["image_url"], "detail": detail}}
+            imgs.append(p)
+        vision_content = [{"type": "text", "text": prompt}] + imgs
         out = ""
         # M3 (native vision) first; degrade to the fallback reader if its call fails/empties.
         for model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):

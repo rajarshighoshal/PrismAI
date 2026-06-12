@@ -123,8 +123,11 @@ def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_
     return p
 
 
-async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="", reasoning_effort=None) -> str:
-    """Non-streaming completion. Returns the final answer text (content only)."""
+async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="", reasoning_effort=None, return_finish=False):
+    """Non-streaming completion. Returns the final answer text (content only) — or, when
+    return_finish=True, the tuple (content, finish_reason) so a caller can tell a complete
+    answer from a TRUNCATED one (finish_reason == 'length'). The honesty auditor needs that:
+    a verdict cut off mid-emit must fail closed, not read as 'clean'."""
     result = await chat(
         messages,
         model,
@@ -135,7 +138,10 @@ async def complete(messages, model, *, max_tokens, temperature=None, session=Non
         label=label,
         reasoning_effort=reasoning_effort,
     )
-    return (result.get("message", {}).get("content") or "").strip()
+    content = (result.get("message", {}).get("content") or "").strip()
+    if return_finish:
+        return content, result.get("finish_reason")
+    return content
 
 
 async def chat(

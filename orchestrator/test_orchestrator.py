@@ -164,12 +164,13 @@ async def _fake_stream_chat(messages, model, *, max_tokens, temperature=None, se
                      "finish_reason": item.get("finish_reason")})
 
 
-async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None, label="", reasoning_effort=None):
+async def _fc_body(messages, model, *, max_tokens, temperature=None, session=None, label="", reasoning_effort=None):
     _calls["complete_models"].append(model)
     _calls.setdefault("labels", []).append(label)
     sys = messages[0]["content"] if messages else ""
     if model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):
         _calls.setdefault("vision_models", []).append(model)
+        _calls.setdefault("vision_msgs", []).append(messages)
         if _vision_queue:
             return _vision_queue.pop(0)
         return "VISIBLE TEXT: Apply for this PhD by Friday.\nCONTEXT: screenshot of an application email."
@@ -213,6 +214,24 @@ async def _fake_complete(messages, model, *, max_tokens, temperature=None, sessi
         return (_section_queue.pop(0) if _section_queue
                 else "## Section\n\nSection prose grounded in the provided source.")
     return "completion"
+
+
+async def _fake_complete(messages, model, *, max_tokens, temperature=None, session=None,
+                         label="", reasoning_effort=None, return_finish=False):
+    """Wraps _fc_body to support return_finish (the auditor now reads finish_reason) and to
+    simulate an UNUSABLE audit verdict: a _honesty_queue entry of '__TRUNCATED__' returns
+    ('', 'length') and '__GARBAGE__' returns unparseable content — both must fail closed."""
+    sys = messages[0]["content"] if messages else ""
+    if "fact-integrity verifier" in sys and _honesty_queue and _honesty_queue[0] in ("__TRUNCATED__", "__GARBAGE__"):
+        _calls["complete_models"].append(model)
+        _calls.setdefault("labels", []).append(label)
+        _calls["fact_audit"].append(messages[1]["content"] if len(messages) > 1 else "")
+        sentinel = _honesty_queue.pop(0)
+        content, finish = ("", "length") if sentinel == "__TRUNCATED__" else ("looks fine, no issues.", "stop")
+        return (content, finish) if return_finish else content
+    result = await _fc_body(messages, model, max_tokens=max_tokens, temperature=temperature,
+                            session=session, label=label, reasoning_effort=reasoning_effort)
+    return (result, "stop") if return_finish else result
 
 
 async def _fake_stream(messages, model, *, max_tokens, temperature=None, session=None, label=""):
@@ -745,6 +764,39 @@ async def _run_tests():
     check("vision: an empty M3 read degrades to the fallback model",
           _calls.get("vision_models") == [config.VISION_MODEL, config.VISION_FALLBACK_MODEL]
           and "FALLBACK CAPTION" in json.dumps(_calls["chat_messages"][0]))
+
+    # detail:"high" is pinned on the image part so the provider tiles at full res (no downscale
+    # confabulation — A/B-proven: default misreads small text, high reads it exactly).
+    _reset()
+    _vision_queue.append("## EVIDENCE TRANSCRIPT\nTitle [T1]\n## READING\nShows the title (from [T1]).")
+    _chat_queue.append(_chat_content("It shows a title."))
+    _gate_queue.append(False)
+    await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "read this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,zzz"}}]}])
+    check("vision: detail:high is pinned on the image sent to the reader",
+          '"detail": "high"' in json.dumps(_calls.get("vision_msgs") or []))
+
+    # ── Auditor FAILS CLOSED: an unusable verdict blocks, never silently 'clean' (task #30) ──
+    _reset()
+    _honesty_queue.append("__TRUNCATED__")           # verdict truncated (finish=length)
+    status, text = await verifier._verified_or_blocked(
+        [{"role": "user", "content": "write about revenue"}],
+        "Revenue grew 50% last year.", "Some source material.", force=True, session=None)
+    check("audit fail-closed: a TRUNCATED verdict blocks (not read as grounded)",
+          status == "audit_unavailable" and "honesty check" in text.lower())
+
+    _reset()
+    _honesty_queue.extend(["__GARBAGE__", "__GARBAGE__"])   # unparseable on both attempts
+    status, _t = await verifier._verified_or_blocked(
+        [{"role": "user", "content": "x"}], "A factual claim.", "Source.", force=True, session=None)
+    check("audit fail-closed: an UNPARSEABLE verdict (after retry) blocks", status == "audit_unavailable")
+
+    _reset()
+    _honesty_queue.extend(["__GARBAGE__", {"unsupported": [], "verdict": "CLEAN"}])  # garble then real verdict
+    status, _t = await verifier._verified_or_blocked(
+        [{"role": "user", "content": "x"}], "A factual claim.", "Source.", force=True, session=None)
+    check("audit fail-closed: a TRANSIENT garble recovers on retry (not over-blocked)", status == "ok")
 
     # The verifier flags a fabricated FACT but leaves motivation/voice untouched —
     # for any kind of writing, not a hand-coded "application" category.

@@ -158,15 +158,27 @@ def _fit_audit_source(source: str, draft: str, budget: int) -> str:
     return "\n\n".join(p for _i, p in kept) or source[:budget]
 
 
+# The auditor could NOT return a usable verdict (call failed / empty / unparseable /
+# truncated). This is NOT 'clean' — the can't-lie layer FAILS CLOSED on it.
+_AUDIT_ERROR = "ERROR"
+
+
+class _AuditUnavailable(Exception):
+    """Raised when the honesty auditor can't produce a usable verdict, so the draft must
+    not be certified. The verify flow catches it and blocks (fail closed)."""
+
+
 async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
     """The single fact-integrity verifier for ANY written deliverable. Sees the USER
     REQUEST, the full SOURCE MATERIAL, and the DRAFT side by side and flags only
     unsupported FACTUAL claims (against the user's stated facts + SOURCE + common
     knowledge); motivation, opinion, and framing pass. `raw_source` (if given) mirrors
     `source` and is used only for the diagnostic.
-    Returns {unsupported:[...], verdict:FABRICATION|CLEAN} or None on failure (fail-soft)."""
+    Returns {unsupported, verdict:FABRICATION|CLEAN} on a real verdict, or {verdict:ERROR}
+    when it could NOT get a usable verdict after a retry — a FAIL-CLOSED signal, never a
+    silent CLEAN. An empty draft has no claims -> CLEAN."""
     if not candidate.strip():
-        return None
+        return {"unsupported": [], "verdict": "CLEAN"}
     fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
     # De-dup only: the source lives in SOURCE MATERIAL, so drop the identical <source>
     # blocks from the request (no information lost). NO truncation — the auditor sees
@@ -177,31 +189,44 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
         f"SOURCE MATERIAL:\n{fitted if fitted else '(none)'}\n\n"
         f"DRAFT:\n{candidate}"
     )
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_FACT_AUDIT},
-             {"role": "user", "content": user}],
-            config.HONESTY_MODEL,
-            max_tokens=config.AUDIT_MAX_TOKENS,
-            temperature=0.0,
-            reasoning_effort=config.AUDIT_REASONING_EFFORT,
-            session=session,
-            label="audit",
-        )
-        match = re.search(r"\{.*\}", raw, flags=re.S)
-        data = json.loads(match.group(0) if match else raw)
-        if isinstance(data, dict) and config.LOG_SOURCE_DIAG:
-            # How many flagged phrases appear verbatim in the source? A non-zero count
-            # means the auditor mis-flagged something literally present — a false
-            # positive the verbatim backstop will keep.
-            source_norm = _norm_token_str(raw_source or fitted)
-            flagged = data.get("unsupported") or []
-            false_pos = sum(1 for f in flagged if _claim_verbatim_in_source(f, source_norm))
-            log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
-                     f"verdict={data.get('verdict')} flagged={len(flagged)} verbatim_false_pos={false_pos}")
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    for attempt in range(2):  # one retry for a transient hiccup / formatting fluke
+        try:
+            raw, finish = await fireworks.complete(
+                [{"role": "system", "content": SYSTEM_FACT_AUDIT},
+                 {"role": "user", "content": user}],
+                config.HONESTY_MODEL,
+                max_tokens=config.AUDIT_MAX_TOKENS,
+                temperature=0.0,
+                reasoning_effort=config.AUDIT_REASONING_EFFORT,
+                session=session,
+                label="audit",
+                return_finish=True,
+            )
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            data = None
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    data = None  # truncated mid-object / malformed
+            if isinstance(data, dict) and data.get("verdict"):
+                if config.LOG_SOURCE_DIAG:
+                    source_norm = _norm_token_str(raw_source or fitted)
+                    flagged = data.get("unsupported") or []
+                    false_pos = sum(1 for f in flagged if _claim_verbatim_in_source(f, source_norm))
+                    log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
+                             f"verdict={data.get('verdict')} flagged={len(flagged)} verbatim_false_pos={false_pos}")
+                return data
+            # No usable verdict. If truncated, a retry won't help (same input, same cap) ->
+            # fail closed now; otherwise retry once for a transient garble.
+            if finish == "length":
+                log.warning("[audit] verdict truncated/unparseable (finish=length) -> FAIL CLOSED")
+                return {"verdict": _AUDIT_ERROR, "reason": "truncated"}
+            log.warning(f"[audit] no parseable verdict (attempt {attempt + 1}/2)")
+        except Exception as e:
+            log.warning(f"[audit] call failed (attempt {attempt + 1}/2): {type(e).__name__}: {e}")
+    log.warning("[audit] no usable verdict after retry -> FAIL CLOSED")
+    return {"verdict": _AUDIT_ERROR, "reason": "no_verdict"}
 
 
 async def _refine_facts(full_request: str, source: str, candidate: str, unsupported,
@@ -331,23 +356,35 @@ async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_
             """Genuinely-unsupported claims in `text`: the auditor's flags MINUS any whose
             exact phrase appears contiguously in the source (a literal false positive). The
             auditor judges meaning; the backstop only rescues verbatim quotes — it never
-            keeps a same-words inflation. [] means clean."""
+            keeps a same-words inflation. [] means clean. Raises _AuditUnavailable when the
+            auditor returned NO usable verdict — so the flow fails closed instead of reading
+            an unavailable audit as 'clean'."""
             a = await _fact_audit(full_request, grounding_source, text, session=session, raw_source=grounding_source)
+            if a and str(a.get("verdict", "")).upper() == _AUDIT_ERROR:
+                raise _AuditUnavailable()
             if not (a and str(a.get("verdict", "")).upper().startswith("FAB")):
                 return []
             return [u for u in (a.get("unsupported") or []) if not _claim_verbatim_in_source(u, source_norm)]
 
-        unsupported = await _flags(candidate)
-        if unsupported:
-            refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, user_said=_user_said, session=session)
-            remaining = (await _flags(refined)) if refined else unsupported
-            if remaining:  # surgical patch left genuine fabrications — one full-rewrite attempt
-                refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, user_said=_user_said, session=session)
+        try:
+            unsupported = await _flags(candidate)
+            if unsupported:
+                refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, prose=prose, user_said=_user_said, session=session)
                 remaining = (await _flags(refined)) if refined else unsupported
-            if refined and not remaining:
-                candidate = refined
-            else:
-                return "unsupported_claims", _facts_block_msg(unsupported)
+                if remaining:  # surgical patch left genuine fabrications — one full-rewrite attempt
+                    refined = await _refine_facts(full_request, grounding_source, candidate, unsupported, rewrite=True, prose=prose, user_said=_user_said, session=session)
+                    remaining = (await _flags(refined)) if refined else unsupported
+                if refined and not remaining:
+                    candidate = refined
+                else:
+                    return "unsupported_claims", _facts_block_msg(unsupported)
+        except _AuditUnavailable:
+            # The honesty check could not run (truncated/unavailable verdict). For a can't-lie
+            # product the only safe move is to fail CLOSED — never present an unverified draft.
+            log.warning("[verify] auditor unavailable -> failing closed (not certifying draft)")
+            return ("audit_unavailable",
+                    "I couldn't complete the honesty check on this draft (the verifier didn't "
+                    "return a usable result), so I won't present it as verified. Please try again.")
 
     # Citations must rest on real retrieved sources.
     if not grounding_source.strip() and _has_citation_markers(candidate):

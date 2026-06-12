@@ -787,7 +787,19 @@ async def verify_grounding(req: VerifyGroundingRequest) -> dict:
         logger.exception("verify_grounding failed")
         raise HTTPException(status_code=502, detail=f"auditor call failed: {e}")
 
-    grounded = content.upper().strip().startswith("NONE") or not content
+    if not req.draft.strip():
+        # Nothing to audit -> trivially grounded (no claims to be unsupported).
+        return {"grounded": True, "unsupported_claims": "",
+                "guidance": "Empty draft; nothing to verify."}
+    if not content.strip():
+        # FAIL CLOSED: an empty verdict means the auditor produced NO output (truncated /
+        # failed), NOT that the draft is clean. Never wave an unverified draft through as
+        # grounded — the whole point of the honesty layer.
+        logger.warning("verify_grounding: empty verdict -> failing closed (not grounded)")
+        return {"grounded": False, "unsupported_claims": "",
+                "guidance": "The honesty check could not be completed (the verifier returned no "
+                            "verdict); treat the draft as UNVERIFIED and try again."}
+    grounded = content.upper().strip().startswith("NONE")
     return {
         "grounded": grounded,
         "unsupported_claims": "" if grounded else content,

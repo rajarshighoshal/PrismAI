@@ -61,6 +61,12 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "accounts/fireworks/models/deepseek-v4-pro"
 # (thinking on). VISION_FALLBACK_MODEL is the graceful degrade if the M3 call fails.
 VISION_MODEL = os.getenv("VISION_MODEL", "accounts/fireworks/models/minimax-m3")
 VISION_FALLBACK_MODEL = os.getenv("VISION_FALLBACK_MODEL", "accounts/fireworks/models/kimi-k2p6")
+# Image detail. A/B-proven: with the default, M3 DOWNSCALES a large/dense image (a screenshot,
+# a full page) into a blur and CONFABULATES small text from its language prior (task #4 not #30,
+# invented list items); "high" makes the provider tile the image at full resolution (~5x the
+# visual tokens, still ~$0.001/image) and it reads small text EXACTLY. Pin high so dense docs
+# stay faithful; set "auto" to let the provider decide, or "low" to force the cheap downscale.
+VISION_IMAGE_DETAIL = os.getenv("VISION_IMAGE_DETAIL", "high")
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", CHAT_MODEL)          # deliverable first draft
 REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
 # Agentic harness model roles. The controller decides tool use; the final model
