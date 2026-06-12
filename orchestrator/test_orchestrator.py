@@ -1309,6 +1309,9 @@ async def _run_tests():
         check("effort: gate:* classifier -> none", fireworks._effort_for("gate:tool", None) == "none")
         check("effort: summarize classifier -> none", fireworks._effort_for("summarize", None) == "none")
         check("effort: explicit value always wins", fireworks._effort_for("gate:tool", "low") == "low")
+        check("effort: casual chat -> CHAT_REASONING_EFFORT (fast tier, not max)",
+              fireworks._effort_for("chat", None) == config.CHAT_REASONING_EFFORT
+              and config.CHAT_REASONING_EFFORT != "max")
 
         def _pay(model, effort, is_ds):
             return fireworks._chat_payload(model, messages=[], max_tokens=8, temperature=0.0,

@@ -170,6 +170,12 @@ HONESTY_MODEL = os.getenv("HONESTY_MODEL", "accounts/fireworks/models/deepseek-v
 # substantive labels get REASONING_EFFORT, classifier labels (gate:*, summarize) get "none".
 # Pinned explicitly because DeepSeek defaults to "high", not "max".
 REASONING_EFFORT = os.getenv("REASONING_EFFORT", "max")
+# CASUAL chat (the plain-chat fast path, already gated as 'no work needed') is the ONE
+# substantive-but-conversational role where MAX thinking is pure latency: measured ~2x
+# slower (3.0s vs 1.4s) AND it ate a short reply's token budget and truncated it. Keep it
+# snappy at 'none' (thinking off) by default — bump to low/medium for a touch of reasoning.
+# Everything that actually reasons or writes a deliverable stays at REASONING_EFFORT (max).
+CHAT_REASONING_EFFORT = os.getenv("CHAT_REASONING_EFFORT", "none")
 AUDIT_REASONING_EFFORT = os.getenv("AUDIT_REASONING_EFFORT", "max") or None
 # The auditor reads the FULL source and now THINKS at MAX reasoning before its JSON
 # verdict; max_tokens bounds thinking + verdict together. Generous on purpose — a
