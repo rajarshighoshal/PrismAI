@@ -295,6 +295,7 @@ def _reset():
     _plan_intent_queue.clear()
     _section_queue.clear()
     _vision_queue.clear()
+    agent._VISION_CACHE.clear()
 
 
 async def _run_tests():
@@ -801,6 +802,22 @@ async def _run_tests():
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}]}])
     check("vision: a total read failure keeps an 'image attached but unreadable' note (no silent drop)",
           "could not process it" in json.dumps(_calls.get("chat_messages") or []))
+
+    # Vision cache: the same image is read ONCE; a re-sent image (multi-turn) reuses the
+    # transcript with no second M3 call — the big multi-turn-image latency win.
+    _reset()
+    _vision_queue.append("## EVIDENCE TRANSCRIPT\nCached title [T1]\n## READING\nShows it (from [T1]).")
+    _chat_queue.extend([_chat_content("first answer"), _chat_content("second answer")])
+    _gate_queue.extend([False, False])
+    _imgmsg = {"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,CACHEDIMG"}}]}
+    await _collect([_imgmsg])
+    _reads_after_first = len(_calls.get("vision_models") or [])
+    await _collect([_imgmsg, {"role": "assistant", "content": "first answer"},
+                    {"role": "user", "content": "and what else is in it?"}])
+    check("vision: a re-sent image is served from cache (read once, not per turn)",
+          _reads_after_first == 1 and len(_calls.get("vision_models") or []) == 1)
 
     # ── Auditor FAILS CLOSED: an unusable verdict blocks, never silently 'clean' (task #30) ──
     _reset()

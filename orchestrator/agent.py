@@ -23,6 +23,7 @@ Module map (in lifecycle order):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -73,18 +74,43 @@ def _split_vision_output(text: str):
     return t, t  # no clean split -> the whole emission serves as both source and context
 
 
+# Per-image vision cache: the EVIDENCE TRANSCRIPT is a question-independent, literal read of
+# the pixels, so once a given image is read we never pay the 15-50s M3 call again — OWUI
+# re-sends the whole conversation every turn, so a multi-turn chat about one image used to
+# re-read it on EVERY follow-up. Bounded; keyed by image-content hash.
+_VISION_CACHE: dict = {}
+_VISION_CACHE_MAX = int(getattr(config, "VISION_CACHE_MAX", 0) or 128)
+
+
+def _image_hash(image_parts) -> str:
+    h = hashlib.sha256()
+    for p in image_parts:
+        h.update(((p.get("image_url") or {}).get("url") or "").encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
 async def _describe_images_for_agent(messages, *, session=None):
     """Replace each image with NATIVE-vision text: the model SEES the pixels and emits a
     structured EVIDENCE TRANSCRIPT (audit-grade source) + a cited READING (context for the
     text reasoner). Returns (messages, image_transcript): the transcript is surfaced
     SEPARATELY so run() can route it into the grounding source, where the text auditor can
-    verify image-derived claims against it. Images are read CONCURRENTLY (order preserved)."""
+    verify image-derived claims against it. Images are read CONCURRENTLY (order preserved),
+    and a previously-read image is served from cache (no repeat M3 call across turns)."""
     async def _describe(m):
         content = m.get("content")
         text_parts, image_parts = _split_content_parts(content)
         if not image_parts:
             return dict(m), ""
         user_text = "\n".join(t.strip() for t in text_parts if t.strip())
+        ihash = _image_hash(image_parts)
+        cached = _VISION_CACHE.get(ihash)
+        if cached:
+            # Reuse the literal transcript (question-independent); the text reasoner answers
+            # THIS turn's question from it. Skips the expensive re-read entirely.
+            new_m = dict(m)
+            new_m["content"] = (((user_text + "\n\n") if user_text else "")
+                                + "[What you see in the attached image:]\n" + cached)
+            return new_m, cached
         prompt = (
             "The user attached image(s) with this message. Read them natively and follow your "
             "two-part contract — EVIDENCE TRANSCRIPT, then READING.\n\n"
@@ -121,6 +147,11 @@ async def _describe_images_for_agent(messages, *, session=None):
         transcript, _reading = _split_vision_output(out)
         new_m = dict(m)
         if out:
+            # Cache the literal transcript so later turns about this same image skip the read.
+            if transcript:
+                if len(_VISION_CACHE) >= _VISION_CACHE_MAX:
+                    _VISION_CACHE.pop(next(iter(_VISION_CACHE)), None)  # FIFO evict
+                _VISION_CACHE[ihash] = transcript
             # Frame as the assistant's OWN sight of the image (not user-pasted text), so the
             # reasoner doesn't disclaim "based on the transcription you gave me".
             new_m["content"] = (((user_text + "\n\n") if user_text else "")
