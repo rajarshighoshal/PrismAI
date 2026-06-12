@@ -34,10 +34,15 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
     if not candidate.strip():
         return False
+    # Show the gate the HEAD and the TAIL of a long draft, not just the first 6000 chars —
+    # otherwise a fabrication in the tail (a long answer whose opening is clean) is never seen
+    # by the gate, so verification is skipped and it ships unaudited. Seeing more can only flip
+    # the gate toward verifying (the safe direction).
+    draft = candidate if len(candidate) <= 6000 else (candidate[:4000] + "\n…\n" + candidate[-2000:])
     payload = {
         "latest_user": _last_user_text(messages),
         "source_available": bool(source.strip()),
-        "draft": candidate[:6000],
+        "draft": draft,
     }
     try:
         raw = await fireworks.complete(
