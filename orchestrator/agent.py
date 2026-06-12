@@ -39,7 +39,7 @@ from .memory_client import (
     _plan_store, _plan_get, _plan_clear,
 )
 from .timectx import _now_line, _gap_note
-from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers
+from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers, _fit_audit_source
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
     SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
@@ -879,7 +879,12 @@ async def _write_section(title: str, sections: list, idx: int, prior_recap: str,
     if (prior_recap or "").strip():
         parts.append("PRECEDING SECTIONS ALREADY COVERED (continue from these, don't repeat):\n" + prior_recap)
     if (source or "").strip():
-        parts.append("SOURCE MATERIAL (assert only what this supports; never fabricate):\n" + source[:24000])
+        # Relevance-FIT the source to THIS section (its heading+intent) instead of a blind
+        # head-truncation — so a section sees the source material that's actually about it,
+        # not just whatever happened to be in the first 24k chars (matters for a long paper
+        # with a big source where the relevant bits are deep in the document).
+        sec_source = _fit_audit_source(source, f"{sec.get('heading','')} {sec.get('intent','')}", 24000)
+        parts.append("SOURCE MATERIAL (assert only what this supports; never fabricate):\n" + sec_source)
     try:
         return (await fireworks.complete(
             [{"role": "system", "content": SYSTEM_SECTION_WRITER},
