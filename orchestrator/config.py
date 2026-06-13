@@ -165,6 +165,11 @@ ENABLE_STYLE_MEMORY = _flag("ENABLE_STYLE_MEMORY", "true")
 # Verification: run verify_grounding on deliverables that have source material.
 ENABLE_VERIFICATION = _flag("ENABLE_VERIFICATION", "true")
 ENABLE_GROUNDING_GATE = _flag("ENABLE_GROUNDING_GATE", "true")
+# The verification gate sees the WHOLE draft (input is ~free on flash). This is only a
+# fail-SAFE ceiling: a draft longer than this is almost certainly a deliverable that gets
+# audited regardless, so rather than truncate-and-sample (and risk missing a fabrication in
+# the dropped part) we just verify it. Not a content cap — covers any realistic chat answer whole.
+GATE_MAX_DRAFT_CHARS = int(os.getenv("GATE_MAX_DRAFT_CHARS", "40000"))
 
 # Honesty audit: catch claims about the USER (experience, seniority, credentials,
 # metrics, revenue) that the user never actually stated — an INSTRUCTION to assert
