@@ -16,3 +16,9 @@ eval/
 orchestrator/arena/
 orchestrator/ab_cases_*.json
 *.db
+data/
+backup-r2.sh
+set_deepseek_key.sh
+swap_fw_key.sh
+orchestrator/*.bak*
+tool-server/*.bak*
