@@ -34,11 +34,13 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
     if not candidate.strip():
         return False
-    # Show the gate the HEAD and the TAIL of a long draft, not just the first 6000 chars —
-    # otherwise a fabrication in the tail (a long answer whose opening is clean) is never seen
-    # by the gate, so verification is skipped and it ships unaudited. Seeing more can only flip
-    # the gate toward verifying (the safe direction).
-    draft = candidate if len(candidate) <= 6000 else (candidate[:4000] + "\n…\n" + candidate[-2000:])
+    # Show the gate the full original HEAD plus the TAIL of a long draft — otherwise a
+    # fabrication in the tail (a long answer whose opening is clean) is never seen by the
+    # gate, so verification is skipped and it ships unaudited. Keep the WHOLE [:6000] head (a
+    # superset of the old input) and ADD the tail, so this strictly only ADDS gate visibility
+    # — it can never hide a band the old code showed (review caught an earlier 4000-head slice
+    # that dropped the 4000-6000 middle).
+    draft = candidate if len(candidate) <= 6000 else (candidate[:6000] + "\n…\n" + candidate[-2000:])
     payload = {
         "latest_user": _last_user_text(messages),
         "source_available": bool(source.strip()),

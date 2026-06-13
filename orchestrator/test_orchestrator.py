@@ -833,6 +833,35 @@ async def _run_tests():
     check("vision: image answer is force-audited even when the gate says no-verify (#2 honesty)",
           len(_calls.get("fact_audit") or []) >= 1)
 
+    # review-fix #2: grounding now includes the READING's cited inference (a breed/landmark),
+    # not just the literal transcript — so a legitimate visual ID isn't over-blocked.
+    _reset()
+    _vision_queue.append("## EVIDENCE TRANSCRIPT\nA golden long-haired dog outdoors [T1]\n"
+                         "## READING\nIt's a golden retriever (from [T1]).")
+    _chat_queue.append(_chat_content("It's a golden retriever."))
+    _gate_queue.append(False)
+    _honesty_queue.append({"unsupported": [], "verdict": "CLEAN"})
+    await _collect([{"role": "user", "content": [
+        {"type": "text", "text": "what breed is the dog?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,DOG"}}]}])
+    check("vision: grounding includes the reading's cited inference, not transcript-only (#2)",
+          "golden retriever" in "".join(_calls.get("fact_audit") or []))
+
+    # review-fix #6: the vision cache is scoped by user — a DIFFERENT user re-reads the same
+    # bytes (no shared audit-grade grounding source across users).
+    _reset()
+    _vision_queue.extend(["## EVIDENCE TRANSCRIPT\nX [T1]\n## READING\nx (from [T1]).",
+                          "## EVIDENCE TRANSCRIPT\nX [T1]\n## READING\nx (from [T1])."])
+    _chat_queue.extend([_chat_content("a1"), _chat_content("b1")])
+    _gate_queue.extend([False, False])
+    _uimg = {"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,USERSCOPED"}}]}
+    await _collect([_uimg], user_id="alice")
+    await _collect([_uimg], user_id="bob")
+    check("vision: cache is user-scoped (a different user re-reads, no cross-user share)",
+          len(_calls.get("vision_models") or []) == 2)
+
     # ── Auditor FAILS CLOSED: an unusable verdict blocks, never silently 'clean' (task #30) ──
     _reset()
     _honesty_queue.append("__TRUNCATED__")           # verdict truncated (finish=length)

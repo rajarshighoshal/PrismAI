@@ -82,14 +82,17 @@ _VISION_CACHE: dict = {}
 _VISION_CACHE_MAX = int(getattr(config, "VISION_CACHE_MAX", 0) or 128)
 
 
-def _image_hash(image_parts) -> str:
+def _image_hash(image_parts, user_id: str = "") -> str:
+    # Scope the key by user so two different users who upload the byte-identical image don't
+    # share one cached grounding source (the value is also request-shaped via the reading).
     h = hashlib.sha256()
+    h.update((user_id or "").encode("utf-8", "ignore") + b"\x00")
     for p in image_parts:
         h.update(((p.get("image_url") or {}).get("url") or "").encode("utf-8", "ignore"))
     return h.hexdigest()
 
 
-async def _describe_images_for_agent(messages, *, session=None):
+async def _describe_images_for_agent(messages, *, user_id="", session=None):
     """Replace each image with NATIVE-vision text: the model SEES the pixels and emits a
     structured EVIDENCE TRANSCRIPT (audit-grade source) + a cited READING (context for the
     text reasoner). Returns (messages, image_transcript): the transcript is surfaced
@@ -102,11 +105,12 @@ async def _describe_images_for_agent(messages, *, session=None):
         if not image_parts:
             return dict(m), ""
         user_text = "\n".join(t.strip() for t in text_parts if t.strip())
-        ihash = _image_hash(image_parts)
+        ihash = _image_hash(image_parts, user_id)
         cached = _VISION_CACHE.get(ihash)
         if cached:
-            # Reuse the literal transcript (question-independent); the text reasoner answers
-            # THIS turn's question from it. Skips the expensive re-read entirely.
+            # Reuse the cached read (the question-independent transcript drives this; the text
+            # reasoner answers THIS turn's question from it). Skips the expensive re-read.
+            _VISION_CACHE[ihash] = _VISION_CACHE.pop(ihash)  # LRU promote: a hot image isn't evicted
             new_m = dict(m)
             new_m["content"] = (((user_text + "\n\n") if user_text else "")
                                 + "[What you see in the attached image:]\n" + cached)
@@ -149,14 +153,16 @@ async def _describe_images_for_agent(messages, *, session=None):
                     break
             except Exception as e:
                 log.warning(f"[vision] {model.split('/')[-1]} read failed: {type(e).__name__}: {e}")
-        transcript, _reading = _split_vision_output(out)
         new_m = dict(m)
         if out:
-            # Cache the literal transcript so later turns about this same image skip the read.
-            if transcript:
-                if len(_VISION_CACHE) >= _VISION_CACHE_MAX:
-                    _VISION_CACHE.pop(next(iter(_VISION_CACHE)), None)  # FIFO evict
-                _VISION_CACHE[ihash] = transcript
+            # Cache + GROUND against the full output (transcript + cited READING), not the
+            # literal transcript alone: a legitimate visual identification the reading makes
+            # (a breed/landmark/object, cited to a region) is then IN the grounding source, so
+            # the forced image audit doesn't flag it as an 'unsupported' world-fact. The
+            # transcript is question-independent (durable), so the cache stays valid per image.
+            if len(_VISION_CACHE) >= _VISION_CACHE_MAX:
+                _VISION_CACHE.pop(next(iter(_VISION_CACHE)), None)  # evict oldest (LRU; hits promote)
+            _VISION_CACHE[ihash] = out
             # Frame as the assistant's OWN sight of the image (not user-pasted text), so the
             # reasoner doesn't disclaim "based on the transcription you gave me".
             new_m["content"] = (((user_text + "\n\n") if user_text else "")
@@ -169,7 +175,7 @@ async def _describe_images_for_agent(messages, *, session=None):
                                 "process it this time. Tell the user you had trouble reading "
                                 "the image and ask them to re-send it — do NOT say no image was "
                                 "attached.]")
-        return new_m, transcript
+        return new_m, out   # "" on a failed read -> no grounding source, no forced audit
 
     pairs = list(await asyncio.gather(*(_describe(m) for m in messages)))
     msgs = [p[0] for p in pairs]
@@ -1022,7 +1028,7 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
     if had_images:
         if config.SHOW_WORK:
             yield ("content", "🖼️ Reading the image…\n\n")
-        messages, image_transcript = await _describe_images_for_agent(messages, session=session)
+        messages, image_transcript = await _describe_images_for_agent(messages, user_id=user_id, session=session)
 
     style_profile = await style_task
     prior_deliverable = (await deliverable_task) if deliverable_task else None
