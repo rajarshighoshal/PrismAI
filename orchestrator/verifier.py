@@ -34,17 +34,17 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
         return bool(source)
     if not candidate.strip():
         return False
-    # Show the gate the full original HEAD plus the TAIL of a long draft — otherwise a
-    # fabrication in the tail (a long answer whose opening is clean) is never seen by the
-    # gate, so verification is skipped and it ships unaudited. Keep the WHOLE [:6000] head (a
-    # superset of the old input) and ADD the tail, so this strictly only ADDS gate visibility
-    # — it can never hide a band the old code showed (review caught an earlier 4000-head slice
-    # that dropped the 4000-6000 middle).
-    draft = candidate if len(candidate) <= 6000 else (candidate[:6000] + "\n…\n" + candidate[-2000:])
+    # Send the gate the WHOLE draft — it's a cheap flash classifier and input is ~free, so
+    # there is no reason to truncate, and ANY truncation means a fabrication in the un-sent part
+    # silently skips the audit. For a pathologically huge draft, don't truncate-and-guess: fail
+    # SAFE and just verify (it's almost always a deliverable that would be audited anyway, and
+    # the audit no-ops cheaply when there are no factual claims).
+    if len(candidate) > config.GATE_MAX_DRAFT_CHARS:
+        return True
     payload = {
         "latest_user": _last_user_text(messages),
         "source_available": bool(source.strip()),
-        "draft": draft,
+        "draft": candidate,
     }
     try:
         raw = await fireworks.complete(
