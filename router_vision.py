@@ -292,9 +292,9 @@ class VisionProxy:
     def _caption_fallback_chain(self):
         """Build the caption model fallback chain with the primary first."""
         chain = [
+            "accounts/fireworks/models/kimi-k2p6",
             "accounts/fireworks/models/kimi-k2p5",
             "groq/meta-llama/llama-4-scout-17b-16e-instruct",
-            "accounts/fireworks/models/kimi-k2p6",
         ]
         if self.valves.IMAGE_CAPTION_MODEL in chain:
             chain.remove(self.valves.IMAGE_CAPTION_MODEL)
