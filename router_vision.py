@@ -19,6 +19,8 @@ import logging
 import os
 from typing import Callable, Optional
 
+import aiohttp
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +84,7 @@ class VisionProxy:
             try:
                 async with session.head(
                     f"{candidate}/api/v1/auths",
-                    timeout=asyncio.TimeoutError(1) if hasattr(asyncio, "TimeoutError") else None,
+                    timeout=aiohttp.ClientTimeout(total=1),
                 ) as probe:
                     if probe.status in (200, 401, 403, 405, 422):
                         self._owui_base_url = candidate
@@ -94,7 +96,10 @@ class VisionProxy:
         # 4. Docker container names
         for host in ("http://open-webui:8080", "http://openwebui:8080"):
             try:
-                async with session.head(f"{host}/api/v1/auths") as probe:
+                async with session.head(
+                    f"{host}/api/v1/auths",
+                    timeout=aiohttp.ClientTimeout(total=1),
+                ) as probe:
                     if probe.status in (200, 401, 403, 405, 422):
                         self._owui_base_url = host
                         logger.info("OWUI detected at %s", host)
@@ -151,7 +156,7 @@ class VisionProxy:
                 continue
 
             try:
-                async with session.get(full_url) as img_resp:
+                async with session.get(full_url, timeout=aiohttp.ClientTimeout(total=15)) as img_resp:
                     if img_resp.status != 200:
                         errors.append(f"Image fetch HTTP {img_resp.status}: {url[:60]}")
                         continue

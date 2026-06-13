@@ -29,6 +29,23 @@ _THINKING_BLOCK_RE = re.compile(
     r"<think>.*?</think>|<tool_call>.*?</tool_call>", re.DOTALL
 )
 
+# Prompt-injection patterns to redact from user text injected into LLM prompts.
+_INJECTION_RE = re.compile(
+    r"(?i)\b("
+    r"ignore\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions?|prompts?|messages?)"
+    r"|disregard\s+(?:all\s+)?(?:previous|above|prior)\s+(?:instructions?|prompts?|messages?)"
+    r"|forget\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions?|prompts?|messages?)"
+    r"|new\s+instructions?\s*:"
+    r"|system\s+prompt\s*:"
+    r")\b.*"
+)
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Remove prompt-injection patterns and code fences from user text."""
+    return _INJECTION_RE.sub("[redacted]", text.replace("```", "")).strip()
+
+
 _ROUTER_STATE_STRIP_RE = re.compile(
     r"\[ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\]"
     r"|<!--\s*ROUTER_STATE:\s*[A-Z]+(?:_SEARCH)?\s*-->",
@@ -492,7 +509,7 @@ class ChatMemory:
         ctx_lines: list[str] = []
         for m in prior[-3:]:
             role = m.get("role", "user")
-            c = _text_of(m.get("content", ""))[:200].strip()
+            c = _sanitize_user_text(_text_of(m.get("content", ""))[:200])
             if c:
                 ctx_lines.append(f"[{role}]: {c}")
         if not ctx_lines:
@@ -505,7 +522,7 @@ class ChatMemory:
             "no preamble, no quotes, no explanation.\n\n"
             "Prior context:\n"
             + "\n".join(ctx_lines)
-            + f"\n\nUser's latest message: {query}\n\n"
+            + f"\n\nUser's latest message: {_sanitize_user_text(query)}\n\n"
             "Rewritten query:"
         )
         rewritten = await self.call_llm(

@@ -1429,7 +1429,7 @@ async def _agent_loop(messages, scratch, messages_for_verify, user_source,
             yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
             messages_for_verify, candidate, source,
-            recall_context=recall_context,
+            recall_context=recall_context, prose=prose,
             force=bool(st.pending_exports or (image_transcript and config.VISION_FORCE_AUDIT)),
             session=session)
 
