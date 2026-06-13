@@ -1002,558 +1002,407 @@ async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, hea
                "export failed — say **export it as docx** and I'll produce the file.")
 
 
-async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
-    """Drive one chat turn. Async generator of (kind, text)."""
-    if not messages:
-        yield ("content", "")
+# ── AgentState import (replaces scattered boolean flags) ────────────────
+from .agent_state import AgentState
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase helpers — regular async functions that return data, plus a few
+# async generators for streaming phases (plan dispatch, plain chat, longdoc).
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _read_images(messages, user_id, session):
+    """Transcribe attached images. Returns (messages, transcript)."""
+    if not _has_images(messages):
+        return messages, ""
+    return await _describe_images_for_agent(messages, user_id=user_id, session=session)
+
+
+async def _gather_context(user_id, chat_id, session):
+    """Parallel fetch: style profile, prior deliverable, last-active, pending plan.
+    Returns (profile, prior_deliverable, gap_note, pending_plan)."""
+    profile, prior, active, plan = "", None, None, None
+    tasks = [asyncio.ensure_future(style.get_style_profile(user_id))]
+    if chat_id:
+        tasks.append(asyncio.ensure_future(_deliverable_get(chat_id)))
+        tasks.append(asyncio.ensure_future(_last_active(chat_id)))
+        if config.ENABLE_CHUNKED_WRITER:
+            tasks.append(asyncio.ensure_future(_plan_get(chat_id)))
+    results = await asyncio.gather(*tasks)
+    profile = results[0]
+    idx = 1
+    if chat_id:
+        prior = results[idx]; idx += 1
+        active = results[idx]; idx += 1
+        if config.ENABLE_CHUNKED_WRITER:
+            plan = results[idx]; idx += 1
+    return profile, prior, _gap_note(active) if active else "", plan
+
+
+async def _dispatch_plan(messages, plan, chat_id, req_headers, session):
+    """Handle pending outline. Yields output if plan handled; caller detects via flag."""
+    if not plan:
         return
-
-    # Instant feedback: a heavy turn (uploaded doc, big paste) spends a few seconds
-    # on the first generation before any other breadcrumb — show something now so
-    # the user isn't staring at a blank.
-    user_final_model = (user_model or "").strip()
-    is_user_model = bool(user_final_model)
-
-    had_images = _has_images(messages)
-    req_headers = request_headers or {}
-    chat_id = req_headers.get("x-openwebui-chat-id", "")
-    # Startup I/O in parallel: the style profile and the chat's last delivered document
-    # (for multi-turn edits) both load off-thread, overlapped with image description.
-    style_task = asyncio.ensure_future(style.get_style_profile(user_id))
-    deliverable_task = asyncio.ensure_future(_deliverable_get(chat_id)) if chat_id else None
-    active_task = asyncio.ensure_future(_last_active(chat_id)) if chat_id else None
-    plan_task = (asyncio.ensure_future(_plan_get(chat_id))
-                 if chat_id and config.ENABLE_CHUNKED_WRITER else None)
-    image_transcript = ""
-    if had_images:
-        if config.SHOW_WORK:
-            yield ("content", "🖼️ Reading the image…\n\n")
-        messages, image_transcript = await _describe_images_for_agent(messages, user_id=user_id, session=session)
-
-    style_profile = await style_task
-    prior_deliverable = (await deliverable_task) if deliverable_task else None
-    gap_note = _gap_note(await active_task) if active_task else ""
-
-    # ── Pending long-doc outline awaiting approval (chunked writer, turn 2+) ─────────
-    # A plan is pending only mid-flow (we proposed an outline last turn). The user's reply
-    # is ABOUT that outline — approve (build it), revise (adjust + re-show), or abandon —
-    # so this is decided BEFORE the edit/chat paths, which would misread "go" as a new turn.
-    pending_plan = (await plan_task) if plan_task else None
-    if pending_plan:
-        # Escape hatch: a never-approved plan must not trap the chat forever (the intent
-        # classifier biases to 'revise' when unsure). Expire on age or on too many revises.
-        # A missing created_at means "unknown age" -> don't expire on age (only on revises).
-        created = float(pending_plan.get("created_at") or 0)
-        age = (time.time() - created) if created else 0
-        revises = int(pending_plan.get("revise_count") or 0)
-        if age > config.CHUNKED_PLAN_TTL_SECONDS or revises > config.CHUNKED_MAX_REVISES:
-            await _plan_clear(chat_id)
-            pending_plan = None
-    if pending_plan:
-        intent = await _classify_plan_intent(_last_user_text(messages), pending_plan, session=session)
-        if intent["action"] == "approve":
-            async for kt in _build_from_plan(pending_plan, messages, user_id, chat_id, req_headers, session):
-                yield kt
-            return
-        if intent["action"] == "revise":
-            revision = intent.get("revision") or ""
-            if revision:
-                # Revise the CURRENT outline in place (so 'remove section 3' lands), keeping the
-                # ORIGINAL request stable across revisions; bump the revise counter.
-                async for kt in _present_outline(
-                        pending_plan.get("request") or "", pending_plan.get("source") or "",
-                        chat_id=chat_id, filename=pending_plan.get("filename") or "",
-                        fmt=pending_plan.get("fmt") or "docx", session=session, revised=True,
-                        current_outline=_outline_for_prompt(pending_plan), change=revision,
-                        revise_count=revises + 1):
-                    yield kt
-            else:
-                # Couldn't read a change (or empty reply) — re-show, but make the state escapable.
-                yield ("content", _render_outline(pending_plan)
-                       + "\n\n*(Say “write it” to build, name a change, or “never mind” to drop it.)*")
-            return
-        # abandon -> drop the plan and fall through to the normal flow with this message
+    created = float(plan.get("created_at") or 0)
+    age = (time.time() - created) if created else 0
+    revises = int(plan.get("revise_count") or 0)
+    if age > config.CHUNKED_PLAN_TTL_SECONDS or revises > config.CHUNKED_MAX_REVISES:
         await _plan_clear(chat_id)
-
-    # ── Multi-turn edit of the chat's last delivered document ──────────────────────
-    # Do the LEAST the request needs, DETERMINISTICALLY. rename/reformat re-package the
-    # verified bytes (no writer, no verifier). A content edit runs a DIRECTED pipeline:
-    # one writer call (revised document as its plain response — no tool choice involved),
-    # verify, then the HARNESS exports with the stored filename/format. The smoke harness
-    # proved any path where the model must CHOOSE to call export is a coin flip.
-    edit_directive, edit_baseline = "", ""
-    if prior_deliverable and prior_deliverable.get("content"):
-        intent = await _classify_edit(_last_user_text(messages), prior_deliverable,
-                                      messages=messages, session=session)
-        if intent["action"] in ("rename", "reformat"):
-            fmt = intent.get("format") or prior_deliverable.get("fmt") or "docx"
-            filename = intent.get("filename") or prior_deliverable.get("filename") or "document"
-            link = await _repackage_deliverable(
-                prior_deliverable["content"], filename, fmt,
-                chat_id=chat_id, headers=req_headers, session=session)
-            verb = "Renamed" if intent["action"] == "rename" else f"Re-exported as {fmt.upper()}"
-            yield ("content", (f"📄 {verb} — download below.{link}") if link
-                   else "I couldn't re-export that file — want me to try again?")
-            return
-        if intent["action"] == "edit":
-            if config.SHOW_WORK:
-                yield ("content", "✏️ Revising the document…\n\n")
-            baseline = (prior_deliverable.get("content") or "").strip()
-            # 1. In-place targeted edit first (the Canvas/Artifact way): the model returns
-            #    only the find→replace changes, applied to the stored document so untouched
-            #    text is preserved byte-for-byte at ~1/40th the tokens of a rewrite.
-            revised = await _try_patch_edit(baseline, _last_user_text(messages), session=session)
-            patched = revised is not None
-            # 2. Broad change (or no clean patch) -> regenerate the whole document.
-            if not patched:
-                revised = ""
-                try:
-                    revised = (await fireworks.complete(
-                        [{"role": "system", "content":
-                            _now_line() + "\n\n" + _edit_inject(prior_deliverable)
-                            + "\n\nOutput ONLY the complete revised document — no commentary, "
-                            "no preamble, no tool calls."},
-                         {"role": "user", "content": _last_user_text(messages)}],
-                        config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
-                        temperature=config.WRITER_TEMPERATURE, session=session,
-                        label="edit:write")).strip()
-                except Exception as e:
-                    log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
-                # The writer may ask instead of guess (re-emit path only): a short,
-                # question-marked, non-document response IS a clarifying question — ship it
-                # straight to the user; their reply re-enters this path, document still stored.
-                if (revised and not _same_doc(revised, baseline)
-                        and "?" in revised and len(revised) < 1200):
-                    yield ("content", revised)
-                    return
-            # 3. Ship the revision (patched in-place OR fully re-emitted), if it's a real doc.
-            if revised and (patched or _same_doc(revised, baseline)):
-                if config.SHOW_WORK:
-                    yield ("content", "🛡️ Verifying facts…\n\n")
-                src = ((_user_source(messages) + "\n\n" + baseline).strip()
-                       if _user_source(messages).strip() else baseline)
-                status, text = await _verified_or_blocked(
-                    messages, revised, src, force=True, session=session)
-                if status != "ok":
-                    yield ("content", text)
-                    return
-                link = await _repackage_deliverable(
-                    text, prior_deliverable.get("filename") or "document",
-                    prior_deliverable.get("fmt") or "docx",
-                    chat_id=chat_id, headers=req_headers, session=session)
-                summary = await _summarize_correction(baseline, text, session=session)
-                yield ("content", ("📄 Updated — download below."
-                       + (("\n\n" + summary) if summary else "") + link) if link
-                       else "I couldn't rebuild the file — want me to try again?")
-                if chat_id:
-                    user_memory = _consolidated_user_memory(messages)
-                    if user_memory:
-                        _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
-                    _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
-                return
-            edit_directive = _edit_inject(prior_deliverable)
-            edit_baseline = baseline
-
-    # Extra system context handed to the writer: the resume-after-gap note (if any) and,
-    # for a content edit, the prior document to revise.
-    agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
-
-    # Chat-memory recall = OVERFLOW handler only. OWUI sends the full native
-    # conversation history every turn, so for normal-length chats the model (and
-    # the verifier) already have everything — running recall would just re-inject
-    # what is already present AND risk the can't-lie layer flagging a recalled
-    # fact it cannot see as a fabrication. Only when the history exceeds the
-    # context budget do we keep the recent tail verbatim and recall the relevant
-    # older facts to stand in for the trimmed head. recall_context is then handed
-    # to the verifier so those facts count as established (not fabricated).
-    recall_context = ""
-    messages_for_verify = messages
-    history_chars = sum(len(_text_of(m.get("content"))) for m in messages)
-    if chat_id and history_chars > config.MEMORY_CONTEXT_BUDGET_CHARS:
-        recent, _older = _split_recent_history(messages, config.MEMORY_CONTEXT_BUDGET_CHARS)
-        recent_norm = {_norm_turn(_text_of(m.get("content"))) for m in recent}
-        # Query recall on the CURRENT question (last user turn). Joining several
-        # recent turns lets a big pasted message crowd out the actual intent once
-        # clipped, so recall would search on filler instead of what's being asked.
-        recall_query = next(
-            (_text_of(m.get("content")).strip() for m in reversed(messages) if m.get("role") == "user"),
-            "",
-        )[:2000]
-        # Split recalled turns by ROLE. Only the user's OWN earlier statements may
-        # be treated as established/grounding context. Feeding the assistant's own
-        # prior answers back into the verifier as "source" would let the model
-        # ground a fresh claim on its own earlier (possibly unverified) output —
-        # the verifier rubber-stamping itself. Assistant turns are kept for
-        # continuity only, clearly labeled, and never grounded against.
-        user_lines, asst_lines, seen = [], [], set()
-        if recall_query.strip():  # no current question -> nothing meaningful to recall
-            for role, content in await _memory_recall(chat_id, recall_query, session):
-                c = _norm_turn(content)[:500]
-                if not c or c in recent_norm or c in seen:
-                    continue  # already visible in the kept tail, or a duplicate
-                seen.add(c)
-                (user_lines if role == "user" else asst_lines).append(c)
-        if user_lines or asst_lines:
-            scratch = _initial_messages(recent, user_id, style_profile, extra_system=agent_extra)
-            messages_for_verify = recent
-            recall_context = "\n".join(user_lines)  # USER-stated facts only -> verifier
-            blocks = []
-            if user_lines:
-                blocks.append(
-                    "Earlier in THIS conversation the user stated (established facts "
-                    "they told you):\n" + recall_context
-                )
-            if asst_lines:
-                blocks.append(
-                    "Earlier assistant replies, for continuity only — NOT verified "
-                    "facts; do not rely on them as sources:\n" + "\n".join(asst_lines)
-                )
-            scratch.append({
-                "role": "system",
-                "content": "This is a long conversation; earlier turns were trimmed "
-                "to fit.\n\n" + "\n\n".join(blocks),
-            })
-        else:
-            # Recall produced nothing (cold chat, service down, transient embed
-            # failure). Don't trim blind: ~140k chars is still well within the
-            # model window, so keep the full conversation rather than silently
-            # dropping the older head with no replacement.
-            scratch = _initial_messages(messages, user_id, style_profile, extra_system=agent_extra)
-    else:
-        scratch = _initial_messages(messages, user_id, style_profile, extra_system=agent_extra)
-
-    # Grounding source = the user's pasted/quoted material across the WHOLE
-    # conversation. verify_grounding takes the source independently of the model's
-    # context budget, so a document pasted in a since-trimmed turn can still ground
-    # a faithful quote; recall_context separately carries older user-stated facts.
-    user_source = _user_source(messages)
-    if image_transcript:
-        # The native-vision EVIDENCE TRANSCRIPT is the auditable proxy for the pixels: routing
-        # it into the grounding source lets the text auditor verify image-derived claims (a
-        # fabricated chart value / invented table cell is flagged because it isn't in the
-        # transcript) — turning the unauditable-image problem into the auditable-text one.
-        tag = ("IMAGE EVIDENCE TRANSCRIPT (what the vision reader saw in the attached image; "
-               "authoritative source for any claim about the image):\n" + image_transcript)
-        user_source = (user_source + "\n\n" + tag).strip() if user_source.strip() else tag
-    if edit_baseline:
-        # The prior verified document grounds the edit: its carried-over facts count as
-        # established, and a non-empty source routes the turn to the grounded writer and
-        # the honesty gate (never the plain-chat fast path).
-        user_source = (user_source + "\n\n" + edit_baseline).strip() if user_source.strip() else edit_baseline
-
-    if config.LOG_SOURCE_DIAG:
-        chars_by_role, source_blocks = {}, 0
-        for m in messages:
-            r = m.get("role", "?")
-            t = _text_of(m.get("content"))
-            chars_by_role[r] = chars_by_role.get(r, 0) + len(t)
-            source_blocks += len(_owui_source_blocks(t))
-        log.info(
-            f"[source-diag] user_source_chars={len(user_source)} "
-            f"owui_source_blocks={source_blocks} chars_by_role={chars_by_role}"
-        )
-
-    # Plain-chat fast path: stream the answer live when the turn needs no tools,
-    # source, or verification. No verifier runs — there is nothing to ground or
-    # audit. Anything uncertain falls through to the buffered loop below.
-    if (config.STREAM_SIMPLE_CHAT and not is_user_model and not had_images
-            and not user_source
-            and not await _request_needs_work(messages, session=session)):
-        streamed = []
-        async for kind, tok in fireworks.stream(
-            scratch, config.AGENT_MODEL,
-            max_tokens=config.AGENT_MAX_TOKENS,
-            temperature=config.WRITER_TEMPERATURE, session=session,
-            label="chat",
-        ):
-            if kind == "content":
-                streamed.append(tok)
-            yield (kind, tok)
-        answer = "".join(streamed).strip()
-        if answer and chat_id:
-            user_memory = _consolidated_user_memory(messages)
-            if user_memory:
-                _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
-            _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
         return
-
-    # ── NEW long document -> outline-first chunked writer ──────────────────────────
-    # We're past the plain-chat fast path, so this is a heavy turn. If the user is asking
-    # for a long, multi-section document, don't emit it in one capped shot — propose an
-    # outline now, then write it section-by-section once they approve (see Hook above).
-    # Skips edits (handled) and user-model regens (they picked a model). A cheap deterministic
-    # prefilter (_maybe_longdoc) gates the flash classifier so it never fires on short heavy
-    # turns (quick edits, summaries) — only on plausibly-long requests.
-    if (config.ENABLE_CHUNKED_WRITER and chat_id and not is_user_model and not edit_baseline
-            and _maybe_longdoc(messages)
-            and (await _classify_longdoc(messages, session=session)).get("longdoc")):
-        async for kt in _present_outline(
-                _all_user_text(messages), user_source, chat_id=chat_id,
-                filename="", fmt="docx", session=session):
+    intent = await _classify_plan_intent(_last_user_text(messages), plan, session=session)
+    if intent["action"] == "approve":
+        async for kt in _build_from_plan(plan, messages, "user", chat_id, req_headers, session):
             yield kt
         return
+    if intent["action"] == "revise":
+        revision = intent.get("revision") or ""
+        if revision:
+            async for kt in _present_outline(
+                plan.get("request") or "", plan.get("source") or "",
+                chat_id=chat_id, filename=plan.get("filename") or "",
+                fmt=plan.get("fmt") or "docx", session=session, revised=True,
+                current_outline=_outline_for_prompt(plan), change=revision,
+                revise_count=revises + 1):
+                yield kt
+        else:
+            yield ("content", _render_outline(plan)
+                   + "\n\n*(Say \"write it\" to build, name a change, or \"never mind\" to drop it.)*")
+        return
+    await _plan_clear(chat_id)
 
-    # Heavy turn: show an instant status line so the user sees activity while the first
-    # heavy generation runs. A deterministic line — not a model call: spending a flash
-    # generation to emit filler added latency and cost and cluttered the thinking panel
-    # with non-model text. (feat/progress-ux will make these stages user-visible.)
-    if config.SHOW_WORK and config.STREAM_PREAMBLE:
-        yield ("content", "🧭 Working on it…\n\n")
 
-    tool_sources = []
-    export_links = []        # immediate exports (csv) — link collected as they run
-    pending_exports = []     # deferred prose exports (docx/pdf/md) — built from the final answer
-    repair_steps = 0
-    tool_call_count = 0
-    web_search_count = 0
-    budget_note_added = False
-    edit_nudged = False
-    textual_tool_nudged = False
-    polish_voice = None
-    polish_voice_pass = None
+async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_work):
+    """Handle multi-turn edit. Returns (handled, output_or_directive, baseline).
+    If handled: output_or_directive is the response text, baseline is "".
+    If not handled: output_or_directive is the edit directive, baseline is the prior doc."""
+    if not (prior and prior.get("content")):
+        return False, "", ""
+
+    intent = await _classify_edit(_last_user_text(messages), prior, messages=messages, session=session)
+
+    if intent["action"] in ("rename", "reformat"):
+        fmt = intent.get("format") or prior.get("fmt") or "docx"
+        filename = intent.get("filename") or prior.get("filename") or "document"
+        link = await _repackage_deliverable(prior["content"], filename, fmt,
+                                            chat_id=chat_id, headers=req_headers, session=session)
+        verb = "Renamed" if intent["action"] == "rename" else f"Re-exported as {fmt.upper()}"
+        return True, (f"📄 {verb} — download below.{link}" if link
+                       else "I couldn't re-export that file — want me to try again?"), ""
+
+    if intent["action"] != "edit":
+        return False, "", ""
+
+    baseline = (prior.get("content") or "").strip()
+
+    # 1. Targeted in-place patches
+    revised = await _try_patch_edit(baseline, _last_user_text(messages), session=session)
+    patched = revised is not None
+
+    # 2. Full rewrite if patches aren't clean
+    if not patched:
+        revised = ""
+        try:
+            revised = (await fireworks.complete(
+                [{"role": "system", "content": _now_line() + "\n\n" + _edit_inject(prior)
+                  + "\n\nOutput ONLY the complete revised document — no commentary."},
+                 {"role": "user", "content": _last_user_text(messages)}],
+                config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
+                temperature=config.WRITER_TEMPERATURE, session=session, label="edit:write")).strip()
+        except Exception as e:
+            log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
+        if revised and not _same_doc(revised, baseline) and "?" in revised and len(revised) < 1200:
+            return True, revised, ""
+
+    # 3. Verify + re-export
+    if revised and (patched or _same_doc(revised, baseline)):
+        src = ((_user_source(messages) + "\n\n" + baseline).strip()
+               if _user_source(messages).strip() else baseline)
+        status, text = await _verified_or_blocked(messages, revised, src, force=True, session=session)
+        if status != "ok":
+            return True, text, ""
+        link = await _repackage_deliverable(text, prior.get("filename") or "document",
+                                            prior.get("fmt") or "docx",
+                                            chat_id=chat_id, headers=req_headers, session=session)
+        summary = await _summarize_correction(baseline, text, session=session)
+        output = ("📄 Updated — download below." + (("\n\n" + summary) if summary else "") + link) if link \
+                 else "I couldn't rebuild the file — want me to try again?"
+        if chat_id:
+            um = _consolidated_user_memory(messages)
+            if um:
+                _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
+            _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
+        return True, output, ""
+    # Fell through — inject prior doc as context for normal agent loop
+    return False, _edit_inject(prior), baseline
+
+
+def _build_source(messages, image_transcript, edit_baseline):
+    """Assemble grounding source: user files/pastes + image transcript + prior doc."""
+    src = _user_source(messages)
+    if image_transcript:
+        tag = "IMAGE EVIDENCE TRANSCRIPT:\n" + image_transcript
+        src = (src + "\n\n" + tag).strip() if src.strip() else tag
+    if edit_baseline:
+        src = (src + "\n\n" + edit_baseline).strip() if src.strip() else edit_baseline
+    return src
+
+
+async def _build_system_prompt(messages, user_id, chat_id, profile, extra, session):
+    """Build system prompt, handling context overflow with memory recall.
+    Returns (scratch, recall_context, messages_for_verify)."""
+    recall_ctx = ""
+    msg_for_verify = messages
+    history_chars = sum(len(_text_of(m.get("content"))) for m in messages)
+
+    if not (chat_id and history_chars > config.MEMORY_CONTEXT_BUDGET_CHARS):
+        return _initial_messages(messages, user_id, profile, extra_system=extra), "", messages
+
+    recent, _ = _split_recent_history(messages, config.MEMORY_CONTEXT_BUDGET_CHARS)
+    recent_norm = {_norm_turn(_text_of(m.get("content"))) for m in recent}
+    recall_query = next(
+        (_text_of(m.get("content")).strip() for m in reversed(messages) if m.get("role") == "user"), "",
+    )[:2000]
+    user_lines, asst_lines, seen = [], [], set()
+    if recall_query.strip():
+        for role, content in await _memory_recall(chat_id, recall_query, session):
+            c = _norm_turn(content)[:500]
+            if not c or c in recent_norm or c in seen:
+                continue
+            seen.add(c)
+            (user_lines if role == "user" else asst_lines).append(c)
+    if not (user_lines or asst_lines):
+        return _initial_messages(messages, user_id, profile, extra_system=extra), "", messages
+
+    scratch = _initial_messages(recent, user_id, profile, extra_system=extra)
+    msg_for_verify = recent
+    recall_ctx = "\n".join(user_lines)
+    blocks = []
+    if user_lines:
+        blocks.append("Earlier in THIS conversation the user stated:\n" + recall_ctx)
+    if asst_lines:
+        blocks.append("Earlier assistant replies (for continuity only — NOT verified facts):\n"
+                      + "\n".join(asst_lines))
+    scratch.append({"role": "system", "content": "This is a long conversation; earlier turns were trimmed.\n\n"
+                     + "\n\n".join(blocks)})
+    return scratch, recall_ctx, msg_for_verify
+
+
+async def _try_plain_chat(messages, scratch, user_source, chat_id, session, is_user_model, had_images):
+    """Stream a simple answer if no tools/sources needed. Yields output if handled."""
+    if not config.STREAM_SIMPLE_CHAT or is_user_model or had_images or user_source:
+        return
+    if await _request_needs_work(messages, session=session):
+        return
+    streamed = []
+    async for kind, tok in fireworks.stream(
+        scratch, config.AGENT_MODEL, max_tokens=config.AGENT_MAX_TOKENS,
+        temperature=config.WRITER_TEMPERATURE, session=session, label="chat"):
+        if kind == "content":
+            streamed.append(tok)
+        yield (kind, tok)
+    answer = "".join(streamed).strip()
+    if answer and chat_id:
+        um = _consolidated_user_memory(messages)
+        if um:
+            _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
+        _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
+
+
+async def _try_longdoc(messages, user_source, chat_id, session, is_user_model, edit_baseline):
+    """Propose outline for long-document requests. Yields output if handled."""
+    if not (config.ENABLE_CHUNKED_WRITER and chat_id and not is_user_model and not edit_baseline):
+        return
+    if not _maybe_longdoc(messages):
+        return
+    ld = await _classify_longdoc(messages, session=session)
+    if not ld.get("longdoc"):
+        return
+    async for kt in _present_outline(_all_user_text(messages), user_source,
+                                      chat_id=chat_id, filename="", fmt="docx", session=session):
+        yield kt
+
+
+def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
+    tool_outputs = []
+    for m in scratch:
+        if m.get("role") == "tool":
+            tool_outputs.append(f"[{m.get('name', 'tool')}]: {(m.get('content') or '')[:2000]}")
+    tool_text = "\n\n".join(tool_outputs)
+    if tool_text:
+        return [
+            {"role": "system", "content": (
+                "You have gathered information using tools. Answer the user's original "
+                "question using ONLY the evidence below. Cite source URLs where available.")},
+            {"role": "user", "content": f"Tool results:\n\n{tool_text}\n\nOriginal question:\n{source[:4000]}"},
+        ]
+    user_texts = [_text_of(m.get("content")) for m in scratch if m.get("role") == "user"]
+    last_user = user_texts[-1] if user_texts else source[:2000]
+    return [{"role": "user", "content": last_user.strip()}]
+
+
+async def _regenerate_with_user_model(scratch, user_model, source, session) -> str:
+    if not user_model.startswith("accounts/fireworks/"):
+        return ""
+    messages = _build_regeneration_context(scratch, source)
+    result = await fireworks.chat(messages, user_model, max_tokens=config.AGENT_MAX_TOKENS,
+                                  temperature=config.WRITER_TEMPERATURE, session=session)
+    return (result.get("message") or {}).get("content", "") or ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agent loop — the heavy path, now driven by AgentState
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _agent_loop(messages, scratch, messages_for_verify, user_source,
+                        image_transcript, recall_context, edit_baseline, is_user_model, user_final_model,
+                        chat_id, request_headers, session):
+    """Model-driven tool loop: calls → execute → verify → deliver."""
+    st = AgentState()
+    export_links: list = []
 
     for _ in range(config.AGENT_MAX_STEPS):
-        source = _combined_source(user_source, tool_sources)
+        source = _combined_source(user_source, st.tool_sources)
         model = _select_model(bool(source)) if not is_user_model else config.AGENT_MODEL
-        tools = _budgeted_tools(tool_call_count, web_search_count)
+        tools = _budgeted_tools(st.tool_call_count, st.web_search_count)
 
-        if tools is None and not budget_note_added:
-            budget_note_added = True
-            scratch.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Internal harness note: tool budget reached. Produce the "
-                        "best final answer from gathered evidence now. If evidence "
-                        "is insufficient, say what cannot be verified."
-                    ),
-                }
-            )
+        if tools is None and not st.budget_note_added:
+            st.budget_note_added = True
+            scratch.append({"role": "system", "content": (
+                "Internal harness note: tool budget reached. Produce the best final answer "
+                "from gathered evidence. If evidence insufficient, say what cannot be verified.")})
 
-        # The open model always drives generation (it owns tool-calling + reasoning).
-        # Prose polish happens AFTER a final answer is produced (see below), so it
-        # applies whether or not tools were still on the table — pure writing tasks
-        # finish on turn 1 with tools still offered and must still get polished.
         step_temp = config.TOOL_TEMPERATURE if tools is not None else config.WRITER_TEMPERATURE
-        # Stream the open model's output live when this generation will BE the final
-        # answer — not a draft about to be polished, and not a user-model regen
-        # (those produce their own final text below). Streamed optimistically; a tool
-        # step carries little prose and the loop just continues.
-        stream_live = config.STREAM_ANSWER and not polish_voice and not is_user_model
+        stream_live = config.STREAM_ANSWER and not st.polish_voice and not is_user_model
         parts, message, tool_calls = [], {}, []
+
         async for kind, data in fireworks.stream_chat(
             scratch, model, max_tokens=config.AGENT_MAX_TOKENS, temperature=step_temp,
             session=session, tools=tools, tool_choice="auto" if tools is not None else None,
-            label="agent",
-        ):
+            label="agent"):
             if kind == "reasoning":
                 if config.SHOW_WORK:
                     yield ("reasoning", data)
             elif kind == "content":
                 parts.append(data)
-                if stream_live and not pending_exports:
+                if stream_live and not st.pending_exports:
                     yield ("content", data)
             elif kind == "final":
                 message = {"role": "assistant", "content": data["content"],
                            "tool_calls": data["tool_calls"]}
                 tool_calls = data["tool_calls"]
 
+        # ── Tool execution ────────────────────────────────────────────
         if tool_calls:
             scratch.append(_clean_assistant_tool_message(message))
-            executable = []  # search/fetch/etc. — collected here, then run concurrently
+            executable = []
             for call in tool_calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 args = _json_args(fn.get("arguments") or "{}")
                 if name in ("export_docx", "export_pdf", "export_markdown"):
-                    # Defer prose exports to the FINAL answer (built after polish +
-                    # verify below) so the downloaded file matches the polished chat
-                    # answer rather than this rough mid-draft. Skip only an EXACT
-                    # duplicate (same format + filename + content — a model
-                    # double-calling export); genuinely distinct files in one turn
-                    # (a resume AND a cover letter, several docx) are all kept.
-                    exp = {
-                        "tool": name,
-                        "markdown": str(args.get("markdown") or ""),
-                        "filename": args.get("filename") or "document",
-                        "title": args.get("title") or "",
-                    }
-                    if exp not in pending_exports:
-                        pending_exports.append(exp)
-                    fmt = name.replace("export_", "")
-                    scratch.append({
-                        "role": "tool",
-                        "tool_call_id": call.get("id") or name,
-                        "name": name,
-                        "content": f"Acknowledged: the {fmt} file will be exported from your final, verified answer and delivered to the user. Do not call export again.",
-                    })
+                    exp = {"tool": name, "markdown": str(args.get("markdown") or ""),
+                           "filename": args.get("filename") or "document",
+                           "title": args.get("title") or ""}
+                    if exp not in st.pending_exports:
+                        st.pending_exports.append(exp)
+                    scratch.append({"role": "tool", "tool_call_id": call.get("id") or name,
+                                    "name": name, "content": (
+                        f"Acknowledged: the {name.replace('export_', '')} file will be exported "
+                        "from your final, verified answer. Do not call export again.")})
                     continue
-                tool_call_count += 1
+                st.tool_call_count += 1
                 if name == "web_search":
-                    web_search_count += 1
+                    st.web_search_count += 1
                 if config.SHOW_WORK:
                     yield ("reasoning", _tool_status(name, args) + "\n")
                 executable.append((call, name, args))
 
-            # Run the batch CONCURRENTLY: when the model fires several searches/fetches
-            # in one step, every result returns in a SINGLE round instead of N
-            # sequential trips. Guard + execute run together, per call.
-            async def _run_tool(call, name, args):
+            async def _run_one(call, name, args):
                 allowed, reason = await _tool_allowed(name, args, messages, source, session=session)
-                if allowed:
-                    raw = await _execute_tool(name, args, session=session, headers=request_headers)
-                else:
-                    raw = {
-                        "rejected": True,
-                        "tool": name,
-                        "reason": reason or "tool call was not necessary for this request",
-                        "instruction": (
-                            "Answer the user's actual question directly without this tool. "
-                            "If you genuinely cannot answer it from what you know, say so "
-                            "plainly and state what you'd need — NEVER say you will look it "
-                            "up or search later; there is no later, this answer is final."
-                        ),
-                    }
+                raw = await _execute_tool(name, args, session=session, headers=request_headers) if allowed else {
+                    "rejected": True, "tool": name, "reason": reason or "not necessary",
+                    "instruction": "Answer the user's actual question directly without this tool."}
                 return call, name, raw
 
-            for call, name, raw_result in await asyncio.gather(
-                *[_run_tool(c, n, a) for c, n, a in executable]
-            ):
-                source_text = _source_from_tool(name, raw_result)
-                if source_text:
-                    tool_sources.append(source_text)
-                dl = _export_download(name, raw_result)
+            for call, name, raw in await asyncio.gather(*[_run_one(c, n, a) for c, n, a in executable]):
+                src_text = _source_from_tool(name, raw)
+                if src_text:
+                    st.tool_sources.append(src_text)
+                dl = _export_download(name, raw)
                 if dl and dl not in export_links:
                     export_links.append(dl)
-                visible = _compact_json(_visible_tool_result(name, raw_result))
-                # External/source-bearing tool output (web, fetched pages, citations)
-                # is untrusted: wrap it so embedded instructions are treated as data.
-                if source_text:
+                visible = _compact_json(_visible_tool_result(name, raw))
+                if src_text:
                     visible = prompt_security.wrap_untrusted(name, visible)
-                scratch.append({
-                    "role": "tool",
-                    "tool_call_id": call.get("id") or name,
-                    "name": name,
-                    "content": visible,
-                })
+                scratch.append({"role": "tool", "tool_call_id": call.get("id") or name,
+                                "name": name, "content": visible})
             continue
 
         candidate = (message.get("content") or "").strip()
 
-        # DeepSeek sometimes writes its tool call as PLAIN TEXT ("<tool_calls>…") instead
-        # of the function-calling channel — nothing executes and the user would see raw
-        # markup as the answer (live report). Same defense the tool-server has for
-        # exports: nudge once so the model re-issues it properly; strip as last resort.
+        # Handle textual tool-call leaks (DeepSeek DSML in content)
         if _TEXTUAL_TOOL_CALL_RE.search(candidate):
-            if not textual_tool_nudged:
-                textual_tool_nudged = True
+            if not st.textual_tool_nudged:
+                st.textual_tool_nudged = True
                 scratch.append({"role": "assistant", "content": candidate})
-                scratch.append({
-                    "role": "system",
-                    "content": (
-                        "Internal harness note: you wrote a tool call as plain text — it "
-                        "did NOT execute and the user would see raw markup. Issue it "
-                        "through the function-calling interface, or answer directly "
-                        "without the tool."
-                    ),
-                })
+                scratch.append({"role": "system", "content": (
+                    "Internal harness note: you wrote a tool call as plain text — it did NOT "
+                    "execute. Issue it through the function-calling interface, or answer directly.")})
                 continue
             candidate = _TEXTUAL_TOOL_BLOCK_RE.sub("", candidate).strip()
 
         if not candidate:
-            scratch.append(
-                {
-                    "role": "system",
-                    "content": "Internal harness note: produce a final answer or call a tool.",
-                }
-            )
+            scratch.append({"role": "system", "content": "Produce a final answer or call a tool."})
             continue
 
-        # REVISION invariant, harness-enforced: an edit of a delivered file MUST re-export
-        # the revised document. The live smoke run proved hope is not an invariant — the
-        # model acknowledged the edit in 174 chars and never called the export tool, so no
-        # new file existed. One bounded nudge; if it still refuses, the turn proceeds.
-        if edit_baseline and not pending_exports and not export_links and not edit_nudged:
-            edit_nudged = True
+        # Edit re-export insurance
+        if edit_baseline and not st.pending_exports and not export_links and not st.edit_nudged:
+            st.edit_nudged = True
             scratch.append({"role": "assistant", "content": candidate})
-            scratch.append({
-                "role": "system",
-                "content": (
-                    "Internal harness note: this is a REVISION of a document you delivered "
-                    "as a file. You have not re-exported it. Call the same export tool now "
-                    "with the COMPLETE revised document (the prior document with only the "
-                    "requested change applied) and the same filename."
-                ),
-            })
+            scratch.append({"role": "system", "content": (
+                "This is a REVISION of a document you delivered as a file. Call the same export "
+                "tool now with the COMPLETE revised document and the same filename.")})
             continue
 
-        # A file export carries the deliverable, so its body is kept out of the chat
-        # (shown as a download + a what-changed note instead) — meaning nothing was
-        # streamed live for it.
-        streamed_live = stream_live and not pending_exports
+        streamed_live = stream_live and not st.pending_exports
         is_clar = _is_clarification(candidate)
 
-        # User-chosen model: regenerate final answer with their model
-        # Runs regardless of tool use — the user picks the model, they get it.
+        # User-chosen model regeneration
         if is_user_model and not is_clar:
             if config.SHOW_WORK:
                 yield ("reasoning", f"✨ Writing with {user_final_model.split('/')[-1]}…\n")
-            regen = await _regenerate_with_user_model(
-                scratch, user_final_model, source, session
-            )
+            regen = await _regenerate_with_user_model(scratch, user_final_model, source, session)
             if regen:
                 candidate = regen
-            # if regen is empty (API failure or non-Fireworks model), keep agent draft
-        elif is_user_model and is_clar:
-            pass  # keep clarification as-is
 
-        # If the model produced a prose FILE, the export ARGUMENT is the real
-        # deliverable — the model often writes the document in the export call and only
-        # a summary as its chat message. Make THAT the thing we polish, verify, and
-        # file, so the file carries the verified document (not the summary) and the
-        # chat is just a note. This also routes the document through the honesty gate.
+        # Auto-polish new exports (never surgical edits)
         if not is_user_model and not is_clar:
-            doc = _pending_prose_deliverable(pending_exports)
+            doc = _pending_prose_deliverable(st.pending_exports)
             if doc and len(doc) >= config.POLISH_MIN_CHARS:
                 candidate = doc
-                # Auto-polish any NEW exported document — but never a surgical EDIT of an
-                # already-delivered one: v1 was already polished and voiced, and re-running
-                # a full polish + voice pass on the whole doc both wastes ~40s and rewrites
-                # text the user did not ask to change.
                 if not edit_baseline:
-                    polish_voice = polish_voice or config.AUTO_POLISH_MODEL
-                    # ...and give important documents a voice pass at the register that
-                    # fits them (cover letter -> formal, email -> warm, code -> none),
-                    # decided from the document rather than always-on or hand-picked.
-                    if polish_voice_pass is None:
-                        polish_voice_pass = await _classify_voice_register(
+                    st.polish_voice = st.polish_voice or config.AUTO_POLISH_MODEL
+                    if st.polish_voice_pass is None:
+                        st.polish_voice_pass = await _classify_voice_register(
                             _all_user_text(messages), candidate, session=session)
 
-        # Polish runs on a substantial deliverable (auto-set above for exports), not a
-        # clarifying question and not a user-chosen model.
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
-        prose = None
-        if polish_voice and not is_clar and substantial and not is_user_model:
-            prose = _prose_provider(polish_voice)
+        prose = _prose_provider(st.polish_voice) if (st.polish_voice and not is_clar and substantial and not is_user_model) else None
+
+        # Premium prose polish
         if prose is not None:
-            prose_client, prose_model = prose
+            pclient, pmodel = prose
             if config.SHOW_WORK:
-                yield ("content" if pending_exports else "reasoning", f"✨ Polishing the document ({prose_model.split('/')[-1]})…\n\n")
-            # messages_for_verify (= the kept tail in overflow) bounds the premium
-            # polish prompt. Stream the polished deliverable live ONLY when the chat
-            # carries it. When a FILE carries it, the body goes nowhere near the thinking
-            # panel — thinking is the model's reasoning + a clean stage log, never a
-            # scratch dump of the whole letter scrolling by.
+                yield ("content" if st.pending_exports else "reasoning",
+                       f"✨ Polishing the document ({pmodel.split('/')[-1]})…\n\n")
             pmsgs = _prose_polish_messages(messages_for_verify, candidate, source)
-            to_chat = not pending_exports
+            to_chat = not st.pending_exports
             try:
                 if config.STREAM_ANSWER and to_chat:
                     pparts = []
-                    async for k, t in prose_client.stream(
-                        pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
-                        temperature=config.WRITER_TEMPERATURE, session=session,
-                        label="polish",
-                    ):
+                    async for k, t in pclient.stream(pmsgs, pmodel, max_tokens=config.AGENT_MAX_TOKENS,
+                                                      temperature=config.WRITER_TEMPERATURE,
+                                                      session=session, label="polish"):
                         if k == "content":
                             pparts.append(t)
                             yield ("content", t)
@@ -1561,116 +1410,168 @@ async def run(messages, *, user_id="", session=None, request_headers=None, user_
                         candidate = "".join(pparts).strip()
                         streamed_live = True
                 else:
-                    polish = await prose_client.complete(
-                        pmsgs, prose_model, max_tokens=config.AGENT_MAX_TOKENS,
-                        temperature=config.WRITER_TEMPERATURE, session=session,
-                        label="polish",
-                    )
-                    if polish and polish.strip():
-                        candidate = polish.strip()
+                    polished = await pclient.complete(pmsgs, pmodel, max_tokens=config.AGENT_MAX_TOKENS,
+                                                       temperature=config.WRITER_TEMPERATURE,
+                                                       session=session, label="polish")
+                    if polished and polished.strip():
+                        candidate = polished.strip()
             except Exception as e:
-                log.warning(f"[prose_polish] {prose_model} failed, keeping open-model draft: {e}")
-        # Stage 2 — optional voice-only register pass (sonnet); facts untouched.
-        # A SECOND premium call, so reserve it for genuinely long-form prose.
-        if (not streamed_live and polish_voice_pass and polish_voice_pass != "none"
+                log.warning(f"[prose_polish] {pmodel} failed, keeping open-model draft: {e}")
+
+        # Voice pass (long-form only)
+        if (not streamed_live and st.polish_voice_pass and st.polish_voice_pass != "none"
                 and not is_clar and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
             if config.SHOW_WORK:
-                yield ("reasoning", f"✨ Voice pass ({polish_voice_pass})…\n")
-            candidate = await _voice_pass(candidate, polish_voice_pass, session=session)
+                yield ("reasoning", f"✨ Voice pass ({st.polish_voice_pass})…\n")
+            candidate = await _voice_pass(candidate, st.polish_voice_pass, session=session)
 
-        # Don't emit status as reasoning once content has streamed live — OWUI renders a
-        # post-content reasoning token as a stray <details> block visible IN the answer.
         if config.SHOW_WORK and not streamed_live:
             yield ("reasoning", "✍️ Verifying the answer…\n")
         status, text = await _verified_or_blocked(
-            messages_for_verify,
-            candidate,
-            source,
+            messages_for_verify, candidate, source,
             recall_context=recall_context,
-            prose=prose,
-            # An exported file is always a deliverable -> verify. ALSO force it whenever an
-            # image was read, so an image-derived factual claim is grounded against the
-            # transcript (image Q&A is otherwise classified 'no verification needed').
-            force=bool(pending_exports or (image_transcript and config.VISION_FORCE_AUDIT)),
-            session=session,
-        )
-        links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
+            force=bool(st.pending_exports or (image_transcript and config.VISION_FORCE_AUDIT)),
+            session=session)
+
+        links_str = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
 
         if status == "ok":
-            # Build the deferred prose exports from the FINAL, verified text.
-            file_links, filed_deliverable = await _export_final(
-                pending_exports, text, prose, messages_for_verify, source,
-                chat_id=chat_id, headers=request_headers, session=session,
-            )
-            links += file_links
+            file_links, filed = await _export_final(
+                st.pending_exports, text, prose, messages_for_verify, source,
+                chat_id=chat_id, headers=request_headers, session=session)
+            links_str += file_links
             changed = text.strip() != candidate.strip()
-            summary = await _summarize_correction(candidate, text, session=session) if (changed and filed_deliverable) else ""
+            summary = ""
+            if changed and filed:
+                summary = await _summarize_correction(candidate, text, session=session) or ""
 
-            if filed_deliverable:
-                # The file carries the deliverable. The chat never repeats its body —
-                # just a what-changed note (if the verifier touched it) + the download.
-                if changed:
-                    yield ("content", "\n\n---\n\n*Corrected before saving the file:*\n\n"
-                           + (summary or "- Tightened a few details to match your source.") + links)
-                else:
-                    yield ("content", ("\n\n" if streamed_live else "") + "📄 Your file is ready — download below." + links)
+            if filed:
+                yield ("content", ("\n\n---\n\n*Corrected before saving:*\n\n"
+                       + (summary or "- Tightened to match your source.") + links_str) if changed
+                       else (("\n\n" if streamed_live else "") + "📄 Your file is ready — download below." + links_str))
                 final_text = text
             elif streamed_live:
-                # Chat IS the deliverable and was already shown live. Add only what's new:
-                # a what-changed note + corrected text if it was touched, else the links.
                 if changed:
-                    final_text = text + links
-                    yield ("content", "\n\n---\n\n*On review I corrected a few unsupported details:*\n\n"
-                           + (summary or "- Tightened to match your source.")
+                    final_text = text + links_str
+                    yield ("content", "\n\n---\n\n*Corrected:*\n\n" + (summary or "- Tightened.")
                            + "\n\n*Corrected version:*\n\n" + final_text)
                 else:
-                    final_text = candidate + links
-                    if links:
-                        yield ("content", links)
+                    final_text = candidate + links_str
+                    if links_str:
+                        yield ("content", links_str)
             else:
-                final_text = text + links
+                final_text = text + links_str
                 yield ("content", final_text)
-            # Store in memory asynchronously (don't block the response). Hold a
-            # strong reference (_track_task): the event loop keeps only a weak ref
-            # to a bare create_task, so an orphan store could be GC'd mid-flight.
+
             if chat_id:
-                user_memory = _consolidated_user_memory(messages)
-                if user_memory:
-                    _track_task(asyncio.create_task(_memory_store(chat_id, "user", user_memory, session)))
+                um = _consolidated_user_memory(messages)
+                if um:
+                    _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
                 _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", final_text, session)))
             return
 
-        # Blocked. If we already streamed the answer, admit it openly and correct;
-        # otherwise repair (re-generate) before showing anything.
+        # Blocked
         if streamed_live:
             yield ("content", "\n\n---\n\n⚠️ " + text)
             return
-
-        if repair_steps < config.GROUNDING_REPAIR_STEPS:
-            repair_steps += 1
-            scratch.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Internal verification gate blocked the previous unshown "
-                        f"draft: {text}\nUse tools to gather evidence or revise "
-                        "so the final answer contains only verified claims. If "
-                        "the issue was citation provenance, remove citations unless "
-                        "they came from actual provided or retrieved sources. Do not "
-                        "show the blocked draft."
-                    ),
-                }
-            )
+        if st.repair_steps < config.GROUNDING_REPAIR_STEPS:
+            st.repair_steps += 1
+            scratch.append({"role": "system", "content": (
+                f"Internal verification gate blocked: {text}\n"
+                "Use tools to gather evidence or revise. Do not show the blocked draft.")})
             continue
-
         yield ("content", text)
         return
 
-    yield (
-        "content",
-        "I could not complete a verified answer within the configured tool budget. "
-        "I am not going to present an unverified factual answer as final.",
-    )
+    yield ("content", "I could not complete a verified answer within the configured tool budget.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# run() — thin phase orchestrator
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
+    """Drive one chat turn through the phase pipeline."""
+    if not messages:
+        yield ("content", "")
+        return
+
+    user_final_model = (user_model or "").strip()
+    is_user_model = bool(user_final_model)
+    had_images = _has_images(messages)
+    req_headers = request_headers or {}
+    chat_id = req_headers.get("x-openwebui-chat-id", "")
+
+    # Phase 1: Vision
+    if had_images:
+        if config.SHOW_WORK:
+            yield ("content", "🖼️ Reading the image…\n\n")
+        messages, image_transcript = await _read_images(messages, user_id, session)
+    else:
+        image_transcript = ""
+
+    # Phase 2: Startup I/O (parallel)
+    profile, prior_doc, gap_note, pending_plan = await _gather_context(user_id, chat_id, session)
+
+    # Phase 3: Plan dispatch
+    handled = False
+    async for kt in _dispatch_plan(messages, pending_plan, chat_id, req_headers, session):
+        handled = True
+        yield kt
+    if handled:
+        return
+
+    # Phase 4: Edit dispatch
+    edit_handled, edit_output, edit_baseline = await _dispatch_edit(
+        messages, prior_doc, chat_id, req_headers, session, config.SHOW_WORK)
+    if edit_handled:
+        yield ("content", edit_output)
+        return
+    edit_directive = edit_output  # when not handled, output is the directive
+
+    # Phase 5: System prompt + context budget
+    agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
+    scratch, recall_context, messages_for_verify = await _build_system_prompt(
+        messages, user_id, chat_id, profile, agent_extra, session)
+
+    # Phase 6: Grounding source
+    user_source = _build_source(messages, image_transcript, edit_baseline)
+    if config.LOG_SOURCE_DIAG:
+        chars_by_role, blocks = {}, 0
+        for m in messages:
+            r = m.get("role", "?")
+            chars_by_role[r] = chars_by_role.get(r, 0) + len(_text_of(m.get("content")))
+            blocks += len(_owui_source_blocks(_text_of(m.get("content"))))
+        log.info(f"[source-diag] user_source_chars={len(user_source)} "
+                 f"owui_source_blocks={blocks} chars_by_role={chars_by_role}")
+
+    # Phase 7: Plain chat fast path
+    handled = False
+    async for kt in _try_plain_chat(messages, scratch, user_source, chat_id,
+                                      session, is_user_model, had_images):
+        handled = True
+        yield kt
+    if handled:
+        return
+
+    # Phase 8: Chunked long-document writer
+    handled = False
+    async for kt in _try_longdoc(messages, user_source, chat_id, session,
+                                   is_user_model, edit_baseline):
+        handled = True
+        yield kt
+    if handled:
+        return
+
+    # Phase 9: Heavy turn preamble
+    if config.SHOW_WORK and config.STREAM_PREAMBLE:
+        yield ("content", "🧭 Working on it…\n\n")
+
+    # Phase 10: Agentic tool loop
+    async for kt in _agent_loop(messages, scratch, messages_for_verify, user_source,
+                                  image_transcript, recall_context, edit_baseline, is_user_model,
+                                  user_final_model, chat_id, req_headers, session):
+        yield kt
 
 
 def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
