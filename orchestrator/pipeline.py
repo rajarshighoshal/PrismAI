@@ -1,8 +1,4 @@
-"""Compatibility wrapper for the model-driven agent harness.
-
-Raw models pass through transparently (stream only, no harness).
-PrismAI/assistant get the full pipeline (tools, verification, polish).
-"""
+"""Compatibility wrapper: raw models get pass-through streaming; PrismAI/assistant get the full pipeline."""
 
 import logging
 import os
@@ -26,8 +22,7 @@ _INTERNAL_NAMES = _configured_internal_names()
 
 
 async def _raw_chat(messages, model, *, session):
-    """Pass-through: stream raw model response, no harness. Use same provider
-    dispatch as the harness (DeepSeek-direct → Fireworks fallback)."""
+    """Pass-through: stream raw model response with the same provider dispatch as the harness."""
     async for kind, text in fireworks.stream(
         messages, model,
         max_tokens=config.AGENT_MAX_TOKENS,

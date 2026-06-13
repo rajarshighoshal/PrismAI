@@ -1,15 +1,4 @@
-"""The can't-lie gate: fact verification for every deliverable.
-
-One fact-integrity check for ANY kind of writing — no document-type branching.
-The auditor sees the request, the FULL source, and the draft side by side and
-flags only unsupported FACTS (motivation/opinion/framing always pass). A flag
-whose exact words sit verbatim in the source is a false positive and is kept
-(_claim_verbatim_in_source — the deterministic backstop). Genuine flags get a
-surgical refine, a recheck, one rewrite, and only then a refuse-AND-help block.
-
-Grounding = uploaded sources + recalled facts + the USER'S OWN statements
-(typo-tolerant; their current word beats an older file) + today's date.
-"""
+"""The can't-lie gate: one fact-integrity check for ANY kind of writing. Audits unsupported FACTS, keeps motivation/opinion/framing, surgically corrects, blocks only if untruthful."""
 import json
 import logging
 import re
@@ -66,9 +55,7 @@ async def _needs_verification(messages, candidate: str, source: str, *, session=
 
 
 async def _refine_complete(prompt: str, user: str, *, prose=None, session=None) -> str:
-    """Run a refine pass on the SAME prose model that wrote the draft when one was
-    used (so paid Opus/GPT prose isn't silently reverted to the open model on a
-    fix); otherwise use the default open REFINE_MODEL."""
+    """Run a refine pass, using the same prose model that wrote the draft when available, otherwise the default open model."""
     msgs = [{"role": "system", "content": prompt}, {"role": "user", "content": user}]
     try:
         if prose is not None:
@@ -121,13 +108,7 @@ def _norm_token_str(text) -> str:
 
 
 def _claim_verbatim_in_source(phrase, source_norm: str) -> bool:
-    """True ONLY when a flagged phrase appears near-verbatim and CONTIGUOUS in the
-    source — the narrow case where the auditor flagged something literally present, so
-    it's a clear false positive to keep. Unlike a word-overlap score this never rescues
-    a semantic inflation ('led' for a sourced 'collaborated', '$1.5M/year' for '/month',
-    'p<0.001' for 'p<0.05'): those are not contiguous spans of the source, so the
-    auditor's flag stands and the claim is stripped. A tight backstop BEHIND the
-    full-source auditor, which makes the real semantic judgement."""
+    """True ONLY when a flagged phrase appears near-verbatim and contiguous in the source — a deterministic backstop for false-positive flags. Never rescues semantic inflations."""
     toks = _WORD_RE.findall(str(phrase).lower())
     if len(toks) < 2:  # too short for a reliable verbatim match — defer to the auditor
         return False
@@ -135,17 +116,7 @@ def _claim_verbatim_in_source(phrase, source_norm: str) -> bool:
 
 
 def _fit_audit_source(source: str, draft: str, budget: int) -> str:
-    """Fit `source` into `budget` chars for the auditor WITHOUT head-truncating.
-
-    Head-truncation was the over-strip bug: a long job posting in front pushed the
-    résumé past the cut, so grounded credentials looked unsupported. Real documents
-    (résumé + posting ~11k) fit the budget whole and return unchanged. Only a
-    genuinely oversized source is trimmed — and then by *relevance to the draft*
-    (keep the paragraphs whose vocabulary the draft actually uses, in original
-    order), so the spans a claim is grounded in survive instead of the tail being
-    silently dropped. For sources far beyond one model's window the correct path is
-    chunk-and-audit (union of supported); this helper covers the realistic middle.
-    """
+    """Fit `source` into `budget` chars by relevance to the draft, not head-truncation — head-truncation was the bug where a long prefix pushed critical content past the cut."""
     source = source.strip()
     if len(source) <= budget:
         return source
@@ -176,14 +147,7 @@ class _AuditUnavailable(Exception):
 
 
 async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
-    """The single fact-integrity verifier for ANY written deliverable. Sees the USER
-    REQUEST, the full SOURCE MATERIAL, and the DRAFT side by side and flags only
-    unsupported FACTUAL claims (against the user's stated facts + SOURCE + common
-    knowledge); motivation, opinion, and framing pass. `raw_source` (if given) mirrors
-    `source` and is used only for the diagnostic.
-    Returns {unsupported, verdict:FABRICATION|CLEAN} on a real verdict, or {verdict:ERROR}
-    when it could NOT get a usable verdict after a retry — a FAIL-CLOSED signal, never a
-    silent CLEAN. An empty draft has no claims -> CLEAN."""
+    """The single fact-integrity verifier. Sees REQUEST, SOURCE, and DRAFT side by side, flags only unsupported FACTS. Returns {unsupported, verdict} or {verdict:ERROR} when the auditor produces no usable verdict — FAILS CLOSED."""
     if not candidate.strip():
         return {"unsupported": [], "verdict": "CLEAN"}
     fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
@@ -238,9 +202,7 @@ async def _fact_audit(full_request: str, source: str, candidate: str, *, session
 
 async def _refine_facts(full_request: str, source: str, candidate: str, unsupported,
                         *, rewrite=False, prose=None, user_said: str = "", session=None) -> str:
-    """Remove the unsupported FACTS the verifier flagged, keeping everything else —
-    motivation, framing, tone, structure — exactly. Surgical by default; full rewrite
-    only when the draft is too wrong to patch."""
+    """Remove the unsupported FACTS the verifier flagged — motivation, framing, tone, structure stay exactly. Surgical by default; full rewrite only when too wrong to patch."""
     listed = "\n".join(f"- {u}" for u in unsupported) if unsupported else "(unsupported factual claims)"
     prompt = (
         _edit_directive(rewrite) + " "
@@ -291,8 +253,7 @@ def _facts_block_msg(unsupported) -> str:
 
 
 async def _summarize_correction(before: str, after: str, *, session=None) -> str:
-    """One cheap call describing WHAT the verifier changed, so the chat can show the
-    correction in a sentence or two instead of re-dumping the whole deliverable."""
+    """One cheap call describing WHAT the verifier changed, so the chat shows the correction in a sentence instead of re-dumping the whole deliverable."""
     if not (before.strip() and after.strip()):
         return ""
     try:
@@ -316,11 +277,7 @@ async def _verified_or_blocked(
     force: bool = False,
     session=None,
 ) -> tuple[str, str]:
-    """ONE fact-integrity check for any kind of writing — email, resume, letter,
-    report, research, chat. No document-type branching: flag only unsupported FACTS,
-    leave motivation / opinion / framing untouched, surgically correct, escalate to a
-    rewrite if a patch can't clear it, and block only if facts still can't be made
-    truthful."""
+    """ONE fact-integrity check for any kind of writing — no document-type branching. Flag only unsupported FACTS, surgically correct, escalate to rewrite if needed, block only if facts can't be made truthful."""
     if not config.ENABLE_VERIFICATION:
         return "ok", candidate
 

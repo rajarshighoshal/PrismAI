@@ -1,26 +1,4 @@
-"""Model-driven agent loop for the orchestrator.
-
-The harness exposes tools and enforces verification. It does not classify the
-turn into prewritten task flows; the model chooses tools, the harness executes
-them, and final output is held until the grounding gate allows it.
-
-The full turn lifecycle (unwrap → startup I/O → vision → edit engine → grounding →
-agent loop → polish/voice → verify → deliver → persist), the model routing table,
-and the standing invariants live in docs/ARCHITECTURE.md — read that first.
-
-Module map (in lifecycle order):
-  owui.py           parsing what OWUI sends: _unwrap_owui, _user_source, source blocks
-  timectx.py        _now_line (what 'now' is), _gap_note (resume-after-gap)
-  memory_client.py  tool-server HTTP: chat memory, deliverable store, last-active
-  style.py          per-user voice profile (read-only, off-thread)
-  verifier.py       the can't-lie gate: _verified_or_blocked, _fact_audit,
-                    _refine_facts, the verbatim backstop
-  THIS FILE         vision (_describe_images_for_agent); the edit engine
-                    (_classify_edit → directed pipeline / _repackage_deliverable);
-                    the agent loop (run(), tool execution, budgets, SYSTEM_TOOL_GUARD);
-                    polish & voice (_prose_provider, _voice_pass); delivery
-                    (_export_final, _same_doc).
-"""
+"""Model-driven agent loop for the orchestrator."""
 
 import asyncio
 import hashlib
@@ -61,10 +39,7 @@ _TEXTUAL_TOOL_BLOCK_RE = re.compile(
 
 
 def _split_vision_output(text: str):
-    """Split the vision model's emission into (evidence_transcript, reading). The transcript is
-    the audit-grade SOURCE (literal, verbatim); the reading is the interpretation for the
-    reasoner. Falls back to using the whole text for both when the model didn't emit the
-    two-part structure (e.g. the kimi fallback produced a flat caption)."""
+    """Split vision emission into (evidence_transcript, reading) for audit-grade grounding. Falls back to whole text when the two-part structure is absent."""
     t = (text or "").strip()
     if not t:
         return "", ""
@@ -96,12 +71,7 @@ def _image_hash(image_parts, user_id: str = "") -> str:
 
 
 async def _describe_images_for_agent(messages, *, user_id="", session=None):
-    """Replace each image with NATIVE-vision text: the model SEES the pixels and emits a
-    structured EVIDENCE TRANSCRIPT (audit-grade source) + a cited READING (context for the
-    text reasoner). Returns (messages, image_transcript): the transcript is surfaced
-    SEPARATELY so run() can route it into the grounding source, where the text auditor can
-    verify image-derived claims against it. Images are read CONCURRENTLY (order preserved),
-    and a previously-read image is served from cache (no repeat M3 call across turns)."""
+    """Replace each image with native-vision text (EVIDENCE TRANSCRIPT + READING). Returns (messages, transcript) for audit routing. Images read concurrently and cached."""
     async def _describe(m):
         content = m.get("content")
         text_parts, image_parts = _split_content_parts(content)
@@ -219,16 +189,10 @@ async def _classify_edit_once(payload, *, session=None) -> dict:
 
 
 async def _classify_edit(last_user: str, prior: dict, *, messages=None, session=None) -> dict:
-    """Classify a follow-up against the chat's last delivered document: rename|reformat|
-    edit|new (reasoning-on; a semantic judgement, not keyword matching).
+    """Classify a follow-up against the last delivered document: rename|reformat|edit|new.
 
-    The judge gets the RECENT CONVERSATION, not just the lone message — follow-ups are
-    anaphoric ("also add…", "connect it to this position") and unclassifiable without
-    their antecedent (live smoke proved a context-starved judge reads them as 'new').
-    And the two misroute directions are NOT symmetric: new-misread-as-edit is
-    self-correcting (the revision fails _same_doc and falls back to the normal flow),
-    while edit-misread-as-new silently drops the user's document — so a 'new' verdict
-    must win TWICE, biasing the rare flake toward the recoverable direction."""
+    The two misroute directions are NOT symmetric: new-misread-as-edit is self-correcting,
+    while edit-misread-as-new silently drops the document — so a 'new' verdict must win TWICE."""
     last_user = (last_user or "").strip()
     if not (last_user and prior and prior.get("content")):
         return {"action": "new"}
@@ -253,9 +217,7 @@ async def _classify_edit(last_user: str, prior: dict, *, messages=None, session=
 
 
 async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_id="", headers=None, session=None) -> str:
-    """Re-export already-verified content under a new name/format with NO writer and NO
-    verifier — the bytes don't change, so there is nothing to write or re-check (the
-    'just rename it' path). Returns a download-link markdown string, or "" on failure."""
+    """Re-export already-verified content under a new name/format — no writer or verifier needed (bytes don't change). Returns download-link markdown."""
     tool = (f"export_{fmt}" if fmt in ("docx", "pdf")
             else "export_markdown" if fmt in ("md", "markdown") else "export_docx")
     try:
@@ -277,8 +239,7 @@ async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_
 
 
 def _edit_inject(prior: dict) -> str:
-    """System directive for a content edit: revise the REAL prior document surgically,
-    changing only what the user asks and leaving everything else identical."""
+    """System directive for a surgical content edit of the prior document."""
     return (
         "REVISION TASK — the user is revising a document you already delivered in this "
         "chat. Here is that document, verbatim:\n\n"
@@ -296,13 +257,7 @@ def _edit_inject(prior: dict) -> str:
 
 
 async def _try_patch_edit(baseline: str, instruction: str, *, session=None):
-    """In-place edit, the Canvas/Artifact way: ask the model for targeted find→replace
-    changes and apply them to the stored document, leaving everything else byte-for-byte
-    identical. Returns the patched text, or None when the change is too broad for clean
-    patches or a 'find' doesn't match exactly once — the caller then falls back to a full
-    re-emit (exactly how Claude/ChatGPT choose targeted-edit vs rewrite). The model emits
-    only the change (~1/40th the tokens of regenerating the whole document), and untouched
-    text cannot drift because the model never re-types it."""
+    """Apply targeted find→replace edits to the stored document. Returns patched text, or None when the change is too broad — caller falls back to a full re-emit."""
     if not baseline.strip():
         return None
     try:
@@ -349,10 +304,7 @@ def _clip_memory_part(text: str, limit: int) -> str:
 
 
 def _consolidated_user_memory(messages) -> str:
-    """The text stored as this turn's user memory for later overflow recall: the
-    raw last user message (clipped), verbatim — no labels or wrapper. Storing it
-    raw means the embedding reflects what the user actually said (better recall),
-    and a recalled turn matches the same turn still verbatim in the kept tail."""
+    """Raw last user message (clipped) for overflow recall. Storing raw means the embedding reflects what the user actually said, and a recalled turn matches the verbatim tail."""
     last_user = next(
         (_text_of(m.get("content")).strip() for m in reversed(messages)
          if m.get("role") == "user" and _text_of(m.get("content")).strip()),
@@ -407,8 +359,7 @@ def _select_model(has_sources: bool) -> str:
 
 
 def _tool_status(name: str, args: dict) -> str:
-    """Human-readable 'show your work' line for a tool call, streamed to the UI
-    as reasoning so the chat visibly narrates what the agent is doing."""
+    """Human-readable action line for a tool call, streamed to the UI as reasoning."""
     q = (args.get("query") or "").strip()
     url = (args.get("url") or "").strip()
     doi = (args.get("doi") or "").strip()
@@ -514,10 +465,7 @@ def _export_download(name: str, result):
 
 
 def _pending_prose_deliverable(pending) -> str:
-    """The markdown of the largest pending prose export (docx/pdf/md). The model
-    typically writes the actual document in the export ARGUMENT and only a summary as
-    its chat message, so this — not the chat content — is the real deliverable to
-    verify, polish, and file."""
+    """Markdown of the largest pending prose export — the model writes the actual document in the export argument, not the chat message."""
     docs = [
         str(e.get("markdown") or "")
         for e in pending
@@ -527,14 +475,7 @@ def _pending_prose_deliverable(pending) -> str:
 
 
 async def _export_final(pending, final_text, prose, messages, source, *, chat_id="", headers=None, session=None):
-    """Build the deferred export files. When the verified chat deliverable IS this
-    document (same text the honesty gate approved), the file carries that verified
-    version — so a surgical correction lands in the file, not the model's raw export
-    argument. When the chat is only a short confirmation and the document lives in the
-    export argument, that argument is used (and polished) instead.
-
-    Returns (links_str, filed_deliverable) — filed_deliverable is True when the file
-    was built from the verified chat body, so the chat must NOT repeat it."""
+    """Build deferred export files from the verified draft or polished export argument. Returns (links_str, filed_deliverable)."""
     deliverable = (final_text or "").strip()
     out, filed_deliverable = [], False
     for exp in pending:
@@ -661,9 +602,7 @@ def _prose_polish_messages(messages, candidate, source):
 
 
 async def _classify_voice_register(request, candidate, *, session=None) -> str:
-    """Pick the voice-pass register (warm/formal/none) for an exported deliverable,
-    naturally from the document — this replaces the model-chosen polish-tool argument
-    so important documents still get the right warmth touch without a confusing tool."""
+    """Pick the voice-pass register (warm/formal/none) for an exported deliverable from the document itself."""
     try:
         raw = await fireworks.complete(
             [{"role": "system", "content": SYSTEM_VOICE_REGISTER},
@@ -708,11 +647,7 @@ def _is_clarification(text: str) -> bool:
 
 
 def _same_doc(a: str, b: str) -> bool:
-    """True when two texts are clearly the same document — used to tell 'the chat body
-    IS the exported deliverable' from 'the chat is a short summary/confirmation while
-    the document lives in the export argument'. Requires BOTH similar length and high
-    word overlap: a summary OF a document shares its vocabulary but is far shorter, so
-    the length gate stops it from being mistaken for the document itself."""
+    """True when two texts are the same document — requires both similar length and high word overlap to avoid mistaking a summary for the document."""
     a, b = (a or "").strip(), (b or "").strip()
     if not a or not b:
         return False
@@ -732,10 +667,7 @@ def _norm_turn(content) -> str:
 
 
 def _split_recent_history(messages, budget_chars: int):
-    """Split a long history into (recent_tail, older_head). The tail is the most
-    recent messages that fit in ~70% of the budget (leaving room for the recall
-    block + the answer); the head is everything older, to be represented by
-    recall. Always keeps at least the final message."""
+    """Split a long history into (recent_tail, older_head) for overflow recall. Always keeps at least the final message."""
     keep = max(1, int(budget_chars * 0.7))
     total, cut = 0, 0
     for i in range(len(messages) - 1, -1, -1):
@@ -798,9 +730,7 @@ def _outline_for_prompt(plan: dict) -> str:
 
 async def _generate_outline(request: str, source: str, *, current_outline: str = "",
                             change: str = "", session=None):
-    """Plan a long document: {title, sections:[{heading,intent}]}. Grounded model at MAX
-    reasoning (label not a gate). For a revision, current_outline + change are supplied so the
-    model adjusts THAT outline in place (positional edits land right). Returns plan or None."""
+    """Plan a long document as {title, sections:[{heading,intent}]}. Returns plan or None."""
     user = f"USER REQUEST:\n{(request or '').strip()[:6000]}"
     if (current_outline or "").strip():
         user += "\n\nCURRENT OUTLINE (apply the requested change to THIS, keep the rest):\n" + current_outline
@@ -874,8 +804,7 @@ async def _classify_plan_intent(latest_user: str, plan: dict, *, session=None) -
 
 async def _write_section(title: str, sections: list, idx: int, prior_recap: str,
                          source: str, *, session=None) -> str:
-    """Write ONE section (focused, bounded, MAX reasoning), aware of the whole outline and
-    what earlier sections covered. Returns the section's Markdown, or '' on failure."""
+    """Write one section of the long document, aware of the whole outline. Returns Markdown, or '' on failure."""
     sec = sections[idx]
     outline_txt = "\n".join(
         f"{i+1}. {s.get('heading','')}" + ("  <- WRITE THIS ONE" if i == idx else "")
@@ -909,8 +838,7 @@ async def _write_section(title: str, sections: list, idx: int, prior_recap: str,
 async def _present_outline(request: str, source: str, *, chat_id: str, filename: str = "",
                            fmt: str = "docx", session=None, revised: bool = False,
                            current_outline: str = "", change: str = "", revise_count: int = 0):
-    """Generate an outline (or revise the current one in place), persist it as the pending
-    plan with a timestamp + revise counter, and yield it for approval. Async gen of (kind, text)."""
+    """Generate or revise an outline, persist it as the pending plan, and yield it for approval."""
     plan = await _generate_outline(request, source, current_outline=current_outline,
                                    change=change, session=session)
     if not plan:
@@ -929,12 +857,7 @@ async def _present_outline(request: str, source: str, *, chat_id: str, filename:
 
 
 async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, headers, session=None):
-    """Build the approved long document SECTION-BY-SECTION with live progress. Each section is
-    verified on its OWN — a small input, so the honesty audit reasons within budget (no
-    dilution across a giant doc) and the refiner re-emits only that section (never the
-    64k-truncation a whole-doc rewrite would hit). If any section can't be written or grounded,
-    NOTHING ships — the plan is kept so the user can add a source / adjust and rebuild.
-    Async generator of (kind, text)."""
+    """Build the approved long document section-by-section with live progress and per-section verification. Async generator of (kind, text)."""
     title = plan.get("title") or "Document"
     sections = plan.get("sections") or []
     source = plan.get("source") or ""
@@ -1513,7 +1436,7 @@ async def run(
     request_headers: Optional[dict] = None,
     user_model: str = "",
 ) -> AsyncGenerator[tuple[str, str], None]:
-    """Drive one chat turn through the phase pipeline."""
+    """Drive one chat turn through the full phase pipeline."""
     if not messages:
         yield ("content", "")
         return

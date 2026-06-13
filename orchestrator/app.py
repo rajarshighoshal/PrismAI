@@ -1,10 +1,4 @@
-"""OpenAI-compatible HTTP surface for the orchestrator.
-
-OWUI registers this as a model connection (base_url = http://owui-orchestrator:8002/v1).
-Exposes GET /v1/models and POST /v1/chat/completions (streaming + non-streaming),
-plus /health. All real work lives in pipeline.run; this file just speaks the
-OpenAI wire format and forwards the logged-in user's id from OWUI's headers.
-"""
+"""OpenAI-compatible HTTP surface for the orchestrator. Exposes /v1/models, /v1/chat/completions, /health."""
 import asyncio
 import json
 import logging

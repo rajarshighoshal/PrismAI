@@ -1,12 +1,4 @@
-"""Fireworks chat client: streaming + non-streaming.
-
-Two hard-won rules baked in:
-- The ANSWER is message.content. DeepSeek V4 / Kimi put chain-of-thought in
-  `reasoning_content`; pipeline logic must never treat that as final output.
-- For user-facing streaming we DO forward reasoning_content separately so OWUI
-  can render it as collapsible "thinking" — but accumulation for the verify
-  loop only ever uses content.
-"""
+"""Fireworks + DeepSeek-direct chat client: streaming + non-streaming. The ANSWER is message.content only — reasoning_content is forwarded for UI but never used as final output."""
 import hashlib
 import json
 import logging
@@ -79,12 +71,7 @@ def _providers(model: str):
 
 
 def _effort_for(label: str, explicit) -> str:
-    """Resolve reasoning effort by ROLE. An explicit value wins. Classifier labels
-    (gate:*, summarize) -> 'none'. CASUAL CHAT (label 'chat', the plain-chat fast path
-    already gated as 'no work needed') -> CHAT_REASONING_EFFORT (default 'none'): measured
-    ~2x faster (1.4s vs 3.0s) on a conversational turn AND it stops max-thinking from eating
-    the token budget and truncating a short reply. Everything SUBSTANTIVE (agent loop,
-    deliverables, audit, grounded, vision, edits) -> config.REASONING_EFFORT ('max')."""
+    """Resolve reasoning effort by role. Classifier labels -> 'none'. Casual chat -> CHAT_REASONING_EFFORT. Everything substantive -> REASONING_EFFORT ('max')."""
     if explicit is not None:
         return explicit
     lbl = label or ""
@@ -134,10 +121,7 @@ def _chat_payload(provider_model, *, messages, max_tokens, temperature, session_
 
 
 async def complete(messages, model, *, max_tokens, temperature=None, session=None, user_id=None, label="", reasoning_effort=None, return_finish=False):
-    """Non-streaming completion. Returns the final answer text (content only) — or, when
-    return_finish=True, the tuple (content, finish_reason) so a caller can tell a complete
-    answer from a TRUNCATED one (finish_reason == 'length'). The honesty auditor needs that:
-    a verdict cut off mid-emit must fail closed, not read as 'clean'."""
+    """Non-streaming completion. Returns answer text, or (text, finish_reason) when return_finish=True — lets callers detect truncation."""
     result = await chat(
         messages,
         model,
@@ -292,11 +276,7 @@ async def stream(messages, model, *, max_tokens, temperature=None, session=None,
 
 async def stream_chat(messages, model, *, max_tokens, temperature=None, session=None,
                       tools=None, tool_choice=None, user_id=None, label=""):
-    """Streaming chat that ALSO surfaces tool calls. Yields ('reasoning', text) and
-    ('content', text) as they arrive, then a final ('final', {content, tool_calls,
-    finish_reason}) once the stream completes — so the agent loop can stream the
-    model's answer live while still acting on any tool calls it made.
-    """
+    """Streaming chat that surfaces tool calls. Yields ('reasoning', text), ('content', text), then ('final', {content, tool_calls, finish_reason})."""
     own = session is None
     if own:
         _require_aiohttp()

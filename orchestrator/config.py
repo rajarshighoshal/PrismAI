@@ -1,9 +1,4 @@
-"""Orchestrator configuration — all env-driven, with sane defaults.
-
-Secrets (FIREWORKS_API_KEY) come from the environment via the deploy --env-file,
-never hard-coded. Defaults mirror the values already proven in router_fn so the
-orchestrator behaves identically out of the box.
-"""
+"""Orchestrator configuration — all env-driven, with defaults mirroring the router_fn behavior."""
 import os
 
 
@@ -336,16 +331,10 @@ DEDUP_WAIT_TIMEOUT = float(os.getenv("DEDUP_WAIT_TIMEOUT", "90"))
 # high-value formal prose (→ Gemini) or casual conversation (→ GLM).
 PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 
-# The honesty / application-claim auditors must see the WHOLE source they judge a
-# draft against. The old hard [:6000] clip silently dropped the tail of a long
-# source — e.g. a job posting (~6k chars) concatenated before a résumé pushed the
-# résumé's later roles past the cut, so real, grounded credentials looked
-# "unsupported" and got stripped. The auditor model has a large context; these
-# budgets only bound pathological inputs, not real documents. If a source ever
-# exceeds this, trim by relevance to the draft (see agent._fit_audit_source), never
-# by head.
+# Source budget for the honesty auditor. The full draft is always sent; only the
+# grounding source is trimmed by relevance when it's pathologically large (never by
+# head — that loses late sections). See agent._fit_audit_source.
 AUDIT_SOURCE_BUDGET = int(os.getenv("AUDIT_SOURCE_BUDGET", "60000"))
-AUDIT_DRAFT_BUDGET = int(os.getenv("AUDIT_DRAFT_BUDGET", "16000"))
 
 # One-line diagnostic: how big the extracted grounding source is vs. the raw chars
 # per role. Decisive for "did the uploaded file even reach `source`?" — if a large

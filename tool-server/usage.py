@@ -51,6 +51,20 @@ USAGE_PRICES: dict = {
     "mixtral-8x22b-instruct": (0.90, 0.90), "cogito-671b-v2-p1": (0.90, 0.90),
     "v4-research-writing": (1.74, 3.48),
 }
+
+# Live-priced overrides from monthly update_prices.py cron job. Read a JSON file
+# of {"model": [input_price, output_price]} from the data volume if present.
+# Deployed prices take precedence over hardcoded defaults.
+_PRICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_prices.json")
+if os.path.exists(_PRICE_FILE):
+    try:
+        with open(_PRICE_FILE) as f:
+            live = {k: tuple(v) for k, v in json.load(f).items()}
+        USAGE_PRICES.update(live)
+        logger.info("Loaded %d live prices from %s", len(live), _PRICE_FILE)
+    except Exception:
+        pass
+
 try:
     USAGE_PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()})
 except Exception:
