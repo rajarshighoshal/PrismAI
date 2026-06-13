@@ -2,9 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 test_*.py
-smoke_*.py
-ab_*.json
-arena/
 *.env
 *.env.bak*
 .git
