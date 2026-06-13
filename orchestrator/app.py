@@ -74,7 +74,6 @@ async def list_models():
     now = int(time.time())
     data = [
         {"id": config.ADVERTISED_CHAT_ID, "object": "model", "created": now, "owned_by": "orchestrator"},
-        {"id": config.ADVERTISED_VISION_ID, "object": "model", "created": now, "owned_by": "orchestrator"},
     ]
     return {"object": "list", "data": data}
 

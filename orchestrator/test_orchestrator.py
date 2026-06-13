@@ -1249,6 +1249,31 @@ async def _run_tests():
     check("guard: a mid-stream crash yields a graceful retry message, not a broken stream",
           "partial answer" in guard_body and "try again" in guard_body)
 
+    # PrismAI is the only advertised orchestrator alias. Image handling is automatic
+    # from attachments, so there is no separate vision model.
+    async def _stub_agent_run(messages, **kw):
+        yield "content", "agent"
+
+    async def _stub_raw_chat(messages, model, *, session=None):
+        yield "content", f"raw:{model}"
+
+    _orig_agent_run = pipeline._agent_run
+    _orig_raw_chat = pipeline._raw_chat
+    pipeline._agent_run = _stub_agent_run
+    pipeline._raw_chat = _stub_raw_chat
+    try:
+        chat_ev = await _collect([{"role": "user", "content": "hi"}],
+                                 user_model=config.ADVERTISED_CHAT_ID)
+        raw_model = "accounts/fireworks/models/kimi-k2p6"
+        raw_ev = await _collect([{"role": "user", "content": "hi"}], user_model=raw_model)
+    finally:
+        pipeline._agent_run = _orig_agent_run
+        pipeline._raw_chat = _orig_raw_chat
+    check("routing: advertised chat model uses the orchestrator path",
+          _content(chat_ev) == "agent")
+    check("routing: real provider model uses raw pass-through",
+          _content(raw_ev) == f"raw:{raw_model}")
+
     # ---- Chat-memory recall as an OVERFLOW handler (not a per-turn feature) ----
     # Realistic auditors: a sentinel fact present in the DRAFT but ABSENT from the
     # text the auditor was handed is treated as a fabrication. This makes the

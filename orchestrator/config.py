@@ -94,7 +94,6 @@ GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/mod
 
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
-ADVERTISED_VISION_ID = os.getenv("ADVERTISED_VISION_ID", "PrismAI Vision")
 
 # Generation knobs — max_tokens caps OUTPUT (reasoning + answer TOGETHER, since MAX
 # reasoning is now default for substantive deepseek calls; see REASONING_EFFORT).

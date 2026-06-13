@@ -12,9 +12,17 @@ from . import fireworks
 
 log = logging.getLogger(__name__)
 
-_INTERNAL_NAMES = frozenset(
-    n.strip() for n in os.getenv("INTERNAL_MODEL_IDS", "PrismAI,assistant,assistant-vision").split(",") if n.strip()
-)
+def _configured_internal_names():
+    names = {
+        config.ADVERTISED_CHAT_ID,
+        "PrismAI",
+        "assistant",
+    }
+    names.update(os.getenv("INTERNAL_MODEL_IDS", "").split(","))
+    return frozenset(n.strip() for n in names if n and n.strip())
+
+
+_INTERNAL_NAMES = _configured_internal_names()
 
 
 async def _raw_chat(messages, model, *, session):
