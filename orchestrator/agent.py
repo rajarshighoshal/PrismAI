@@ -26,8 +26,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import random
 import re
 import time
+from typing import Any, AsyncGenerator, Optional
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
 from .owui import (
@@ -1253,9 +1256,20 @@ async def _regenerate_with_user_model(scratch, user_model, source, session) -> s
 # Agent loop — the heavy path, now driven by AgentState
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _agent_loop(messages, scratch, messages_for_verify, user_source,
-                        image_transcript, recall_context, edit_baseline, is_user_model, user_final_model,
-                        chat_id, request_headers, session):
+async def _agent_loop(
+    messages: list[dict],
+    scratch: list[dict],
+    messages_for_verify: list[dict],
+    user_source: str,
+    image_transcript: str,
+    recall_context: str,
+    edit_baseline: str,
+    is_user_model: bool,
+    user_final_model: str,
+    chat_id: str,
+    request_headers: dict,
+    session,
+) -> AsyncGenerator[tuple[str, str], None]:
     """Model-driven tool loop: calls → execute → verify → deliver."""
     st = AgentState()
     export_links: list = []
@@ -1342,6 +1356,7 @@ async def _agent_loop(messages, scratch, messages_for_verify, user_source,
 
         # Handle textual tool-call leaks (DeepSeek DSML in content)
         if _TEXTUAL_TOOL_CALL_RE.search(candidate):
+            log.warning("[dsml-leak] textual tool-call detected in content channel — nudging model")
             if not st.textual_tool_nudged:
                 st.textual_tool_nudged = True
                 scratch.append({"role": "assistant", "content": candidate})
@@ -1349,6 +1364,7 @@ async def _agent_loop(messages, scratch, messages_for_verify, user_source,
                     "Internal harness note: you wrote a tool call as plain text — it did NOT "
                     "execute. Issue it through the function-calling interface, or answer directly.")})
                 continue
+            log.warning("[dsml-leak] second occurrence — stripping DSML from candidate")
             candidate = _TEXTUAL_TOOL_BLOCK_RE.sub("", candidate).strip()
 
         if not candidate:
@@ -1490,7 +1506,13 @@ async def _agent_loop(messages, scratch, messages_for_verify, user_source,
 # run() — thin phase orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def run(messages, *, user_id="", session=None, request_headers=None, user_model=""):
+async def run(
+    messages: list[dict], *,
+    user_id: str = "",
+    session: Optional[Any] = None,
+    request_headers: Optional[dict] = None,
+    user_model: str = "",
+) -> AsyncGenerator[tuple[str, str], None]:
     """Drive one chat turn through the phase pipeline."""
     if not messages:
         yield ("content", "")

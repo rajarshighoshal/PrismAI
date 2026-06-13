@@ -307,7 +307,15 @@ async def _summarize_correction(before: str, after: str, *, session=None) -> str
         return ""
 
 
-async def _verified_or_blocked(messages, candidate: str, source: str, *, recall_context: str = "", prose=None, force: bool = False, session=None):
+async def _verified_or_blocked(
+    messages: list[dict],
+    candidate: str,
+    source: str, *,
+    recall_context: str = "",
+    prose=None,
+    force: bool = False,
+    session=None,
+) -> tuple[str, str]:
     """ONE fact-integrity check for any kind of writing — email, resume, letter,
     report, research, chat. No document-type branching: flag only unsupported FACTS,
     leave motivation / opinion / framing untouched, surgically correct, escalate to a
