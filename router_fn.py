@@ -287,6 +287,40 @@ def _is_url_fetch_request(query: str) -> bool:
 # Filter class — thin coordinator delegating to extracted modules
 # ---------------------------------------------------------------------------
 
+    # ── Inlet helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _has_images_for_routing(messages: list) -> bool:
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            if any(p.get("type") == "image_url" for p in content if isinstance(p, dict)):
+                return True
+        return False
+
+    @staticmethod
+    def _extract_image_parts(messages: list) -> list[dict]:
+        parts = []
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "image_url":
+                    parts.append(p)
+        return parts
+
+    @staticmethod
+    def _inject_system_block(messages: list, block: str) -> None:
+        existing = next((i for i, m in enumerate(messages) if m.get("role") == "system"), None)
+        if existing is not None:
+            sys_content = _text_of(messages[existing]["content"])
+            messages[existing]["content"] = sys_content + block
+        else:
+            messages.insert(0, {"role": "system", "content": block.strip()})
+
+
 class Filter:
     class Valves(BaseModel):
         FIREWORKS_API_KEY: str = Field(default="", description="Your Fireworks.ai API Key.")
@@ -939,15 +973,50 @@ class Filter:
         messages = body["messages"]
         query_raw = _text_of(messages[-1]["content"]).strip()
         model_id = body.get("model", "")
+        is_raw = model_id not in ORCHESTRATOR_MODEL_IDS
 
-        # Tag as orchestrator-routed
+        # ── Classification + search for raw models ──────────────────
+        searched = False
+        category = "ORCHESTRATOR"
+        if is_raw:
+            # Image caption for routing classification
+            image_caption = ""
+            if self.valves.ENABLE_IMAGE_ROUTING and _has_images_for_routing(messages):
+                image_parts = _extract_image_parts(messages)
+                if image_parts:
+                    caption = await self.vision.caption_for_routing(
+                        image_parts, query_raw, event_emitter=__event_emitter__
+                    )
+                    if caption:
+                        image_caption = caption
+
+            # LLM classifier
+            prompt = self._build_classifier_prompt(messages, image_caption)
+            raw_cat = await self._call_llm(
+                prompt=prompt, model=self.valves.CLASSIFIER_MODEL, max_tokens=20,
+                fallback_chain=CLASSIFIER_FALLBACK_CHAIN, log_role="classifier",
+            )
+            category = self._parse_llm_category(raw_cat) or "CASUAL"
+
+            # Search for factual/research queries
+            if category in ("FACTUAL", "RESEARCH"):
+                await self._emit_status(__event_emitter__, f"🔍 Searching the web ({category})…")
+                max_results = (self.valves.SEARCH_RESULTS_RESEARCH if category == "RESEARCH"
+                               else self.valves.SEARCH_RESULTS_FACTUAL)
+                search_results = await self._search_tavily(query_raw, max_results=max_results)
+                if search_results and "Web Search Failed" not in search_results:
+                    searched = True
+                    block = (f"\n\n{SEARCH_MARKER}\n{search_results}\nEND OF {SEARCH_MARKER}\n")
+                    _inject_system_block(messages, block)
+
+        # Tag in metadata
         body.setdefault("metadata", {})
         body["metadata"]["_router_state"] = {
-            "category": "ORCHESTRATOR", "searched": False,
-            "orch_model": model_id,
+            "category": category, "searched": searched,
+            "orch_model": model_id if not is_raw else "",
         }
 
-        # ── Memory recall ────────────────────────────────────────────
+        # ── Memory recall (all models) ──────────────────────────────
         chat_id = self._extract_chat_id(body)
         if self.valves.ENABLE_CHAT_MEMORY and chat_id:
             exclude_hashes = set()
