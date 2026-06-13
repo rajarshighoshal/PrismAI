@@ -561,6 +561,38 @@ async def _run_tests():
     _oc.available, _oc.complete = _oc_avail, _oc_complete
     config.ENABLE_OPENAI_PROSE = False
 
+    # If verification has to repair a premium-polished deliverable, the repair must stay
+    # on the same prose model instead of falling back to the open refine model.
+    _reset()
+    _oc_avail, _oc_complete = _oc.available, _oc.complete
+    _oc.available = lambda: True
+    async def _fake_prose_repair(messages, model, *, max_tokens, temperature=None, session=None, label=""):
+        if label == "refine":
+            _calls.setdefault("prose_refine", []).append(model)
+            return "[polished] " + letter
+        _calls.setdefault("prose", []).append(model)
+        draft = messages[-1]["content"].split("DRAFT TO POLISH:")[-1].strip()
+        return "[polished] " + draft + " Invented award."
+    _oc.complete = _fake_prose_repair
+    config.ENABLE_OPENAI_PROSE = True
+    _post_queue.append([{"status": "success", "filename": "cl.docx", "download_url": "/api/v1/files/p/content/cl.docx"}])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": letter, "filename": "cl"})),
+        _chat_content("Done — your letter is ready."),
+    ])
+    _honesty_queue.extend([
+        {"unsupported": ["Invented award"], "verdict": "FABRICATION"},
+        {"unsupported": [], "verdict": "CLEAN"},
+    ])
+    await _collect([{"role": "user", "content": "Write a cover letter and export as docx. Facts: 2 years as a data analyst."}])
+    filed = _calls["post"][0][1]["markdown"]
+    check("auto-polish: verifier repair stays on the premium prose model",
+          _calls.get("prose_refine") == [config.OPENAI_PROSE_MODEL_PREMIUM])
+    check("auto-polish: repaired file comes from the premium refine pass",
+          filed.startswith("[polished]") and "Invented award" not in filed)
+    _oc.available, _oc.complete = _oc_avail, _oc_complete
+    config.ENABLE_OPENAI_PROSE = False
+
     # If a model tries factual output with no source, the gate pushes it back
     # into the tool loop instead of showing the unverified draft.
     _reset()

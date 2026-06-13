@@ -37,7 +37,7 @@ _INJECTION_RE = re.compile(
     r"|forget\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions?|prompts?|messages?)"
     r"|new\s+instructions?\s*:"
     r"|system\s+prompt\s*:"
-    r")\b.*"
+    r").*"
 )
 
 
