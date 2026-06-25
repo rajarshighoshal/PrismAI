@@ -126,7 +126,14 @@ def score(rows) -> dict:
             errors += 1
             continue  # fail-closed verdict: counted separately, not as miss/strip
         flagged = r["flagged"]
-        for m in case["fabrication_markers"]:
+        fab_markers = case["fabrication_markers"]
+        # A claim that carries a fabrication marker is a fabrication flag. A real fact whose
+        # tokens are merely co-located in that SAME span is collateral the surgical refiner
+        # keeps (it strips only the unsupported words) — NOT an over-strip. Only a real fact
+        # flagged in a claim with NO fabrication in it is a genuine over-strip.
+        fab_claims = [c for c in flagged if any(_marker_hits(fm, [c]) for fm in fab_markers)]
+        clean_flags = [c for c in flagged if c not in fab_claims]
+        for m in fab_markers:
             fab_total += 1
             if _marker_hits(m, flagged):
                 fab_caught += 1
@@ -134,7 +141,7 @@ def score(rows) -> dict:
                 misses.append((case["id"], m))
         for m in case["keep_markers"]:
             keep_total += 1
-            if _marker_hits(m, flagged):
+            if _marker_hits(m, clean_flags):
                 keep_stripped += 1
                 overstrips.append((case["id"], m))
     tpr = fab_caught / fab_total if fab_total else None
@@ -272,6 +279,14 @@ def _selftest():
     )])
     check("score: clean case has no over-strip", clean["overstrip_rate"] == 0.0)
     check("score: clean case TPR is None (nothing to catch)", clean["tpr"] is None)
+
+    # scoring: a keep co-located with a fab in ONE flagged span is collateral, not an over-strip
+    colo = score([(
+        {"id": "co", "fabrication_markers": ["led the data team"], "keep_markers": ["at Initech"]},
+        {"error": False, "flagged": ["led the data team at Initech"]},
+    )])
+    check("score: keep co-located with fab in one flag is NOT an over-strip", colo["overstrip_rate"] == 0.0)
+    check("score: the fab in that co-located flag still counts as caught", colo["tpr"] == 1.0)
 
     # scoring: a fail-closed audit error is counted separately, not as a miss
     err = score([(

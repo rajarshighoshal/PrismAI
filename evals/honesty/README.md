@@ -33,6 +33,24 @@ Ablation grid (each row = a config comment made measurable):
 - `flash · low` / `flash · none` — is max-reasoning audit actually buying accuracy?
 - `pro · max` — is the heavier auditor worth 5× the cost? (validates the flash default)
 
+## First results (2026-06-25, `deepseek-v4` auditor, 26 cases)
+
+```
+config                     catch(TPR)  over-strip    F1
+flash · max · backstop        94.7%       ~0%*     94.7%   <- production default
+flash · low · backstop        94.7%        0%      97.3%
+flash · none (reasoning off)  84.2%       ~0%*     88.9%
+pro · max · backstop         100.0%        0%     100.0%
+```
+`*` over-strip rows differ by <=1 case across configs — auditor non-determinism at temp 0; treat +/-2% as noise.
+
+Findings on this set:
+- The production default (flash·max) measurably holds the guarantee: ~95% of planted fabrications caught, ~0% of real facts stripped. Asserted -> measured.
+- `pro·max` is perfect (100%), but the entire gap over flash is ONE subtle case — likely not worth 5x cost except on high-stakes turns.
+- Reasoning OFF drops catch to 84%, and all 3 misses are NUMERIC/DATE fabrications — this validates keeping `AUDIT_REASONING_EFFORT` off `none`.
+- LOW reasoning ties MAX (both 94.7%) — a possible cost/latency win, pending a larger/harder set.
+- flash's consistent blind spot: subtle scale inflation ("training over 200 students" beside a real fact), caught only by `pro`.
+
 ## Run
 
 ```bash
