@@ -28,7 +28,6 @@ GEMINI_PROSE_MODEL = os.getenv("GEMINI_PROSE_MODEL", "gemini-3.1-pro-preview")
 # OpenAI API for high-value prose (cover letters, resumes, research papers).
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ENABLE_OPENAI_PROSE = _flag("ENABLE_OPENAI_PROSE", "true")
-OPENAI_PROSE_MODEL = os.getenv("OPENAI_PROSE_MODEL", "gpt-5.5")
 # gpt-5.5, not -pro (-pro is Responses-API only, 404s on chat/completions)
 OPENAI_PROSE_MODEL_PREMIUM = os.getenv("OPENAI_PROSE_MODEL_PREMIUM", "gpt-5.5")
 
@@ -80,8 +79,8 @@ VISION_FORCE_AUDIT = _flag("VISION_FORCE_AUDIT", "true")
 VISION_PRIMARY_TIMEOUT = float(os.getenv("VISION_PRIMARY_TIMEOUT", "40"))
 DRAFT_MODEL = os.getenv("DRAFT_MODEL", CHAT_MODEL)          # deliverable first draft
 REFINE_MODEL = os.getenv("REFINE_MODEL", CHAT_MODEL)        # grounding fix pass
-# Agentic harness model roles. The controller decides tool use; the final model
-# shifts to GLM after source-bearing tools because it measured stronger there.
+# Agentic harness model roles. The controller decides tool use; the grounded turn
+# uses GROUNDED_MODEL (deepseek-v4-pro) after source-bearing tools.
 AGENT_MODEL = os.getenv("AGENT_MODEL", CHAT_MODEL)
 GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/deepseek-v4-pro")
 GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
@@ -112,7 +111,6 @@ ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
 #     toward 120k via env (~40min worst-case stream). Input is NEVER the limit — any paper fits
 #     the 1M context window many times over; only the written-back output is bounded here.
 GENERATION_MAX_TOKENS = int(os.getenv("GENERATION_MAX_TOKENS", "32000"))
-CHAT_MAX_TOKENS = int(os.getenv("CHAT_MAX_TOKENS", str(GENERATION_MAX_TOKENS)))
 DRAFT_MAX_TOKENS = int(os.getenv("DRAFT_MAX_TOKENS", "64000"))
 # Vision now emits a STRUCTURED EVIDENCE TRANSCRIPT (verbatim OCR + markdown tables +
 # region IDs) AND a cited READING, with M3 thinking on — so the budget covers transcript +
@@ -133,9 +131,6 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))
 # Networking. Per-purpose timeouts (seconds). The old single 180s blanket let one
 # stalled upstream hang a whole turn for 3 minutes with no user feedback; each
 # call now carries a budget matched to what it actually does. All env-overridable.
-# HTTP_TIMEOUT stays as a back-compat catch-all default for any caller without a
-# more specific budget.
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "90"))
 STREAM_IDLE_TIMEOUT = float(os.getenv("STREAM_IDLE_TIMEOUT", "90"))
 # Fireworks non-streaming completion: agent steps, gates, query compression.
 GEN_TIMEOUT = float(os.getenv("GEN_TIMEOUT", "90"))
@@ -326,10 +321,6 @@ DEDUP_TTL_SECONDS = float(os.getenv("DEDUP_TTL_SECONDS", "120"))
 # is LOGGED, not silently swallowed. Keep < DEDUP_TTL so a slow lead still
 # populates the cache the follower can use on its own re-run.
 DEDUP_WAIT_TIMEOUT = float(os.getenv("DEDUP_WAIT_TIMEOUT", "90"))
-
-# Prose tier classifier model — cheap, fast model to determine if a request is
-# high-value formal prose (→ Gemini) or casual conversation (→ GLM).
-PROSE_CLASSIFIER_MODEL = os.getenv("PROSE_CLASSIFIER_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 
 # Source budget for the honesty auditor. The full draft is always sent; only the
 # grounding source is trimmed by relevance when it's pathologically large (never by
