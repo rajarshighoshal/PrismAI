@@ -1485,14 +1485,11 @@ async def _fugu_run(
         candidate = await fugu_client.answer(
             messages, source, session=session, ultra=True)
     except Exception:
-        log.exception("[fugu] call failed")
-        yield ("content",
-               "I hit an issue reaching the multi-model system. "
-               "Please try again, or disable Fugu for this turn.")
-        return
+        log.exception("[fugu] call failed — falling back to DeepSeek")
+        return  # silent fallback — caller proceeds to normal agent loop
 
     if not (candidate and candidate.strip()):
-        yield ("content", "The multi-model system returned an empty response. Please try again.")
+        log.info("[fugu] empty response — falling back to DeepSeek")
         return
 
     # Still verify — Fugu's output passes through our honesty gate just like any
@@ -1570,15 +1567,20 @@ async def run(
     # Decide whether this task should use Fugu's learned multi-model coordinator
     # instead of the single-model DeepSeek agent loop. Fugu handles tool use and
     # decomposition internally — we skip the agent loop entirely when routed.
+    # On failure (dead tunnel, 403, timeout), silently falls back to DeepSeek.
     fugu_route = await fugu_router.decide(
         messages, is_edit=bool(edit_baseline),
         is_user_model=is_user_model, session=session)
     if fugu_route == "fugu":
+        fugu_handled = False
         async for kt in _fugu_run(messages, image_transcript, edit_baseline,
                                     chat_id, req_headers, session,
                                     config.SHOW_WORK):
+            fugu_handled = True
             yield kt
-        return
+        if fugu_handled:
+            return
+        # Fugu failed silently — fall through to normal DeepSeek agent loop
 
     # Phase 5: System prompt + context budget
     agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
