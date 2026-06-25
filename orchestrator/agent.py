@@ -1451,13 +1451,26 @@ async def _fugu_run(
     if show_work:
         yield ("reasoning", "🧭 Routing to Fugu multi-model orchestrator…\n")
 
+    # Run Fugu as a task and heartbeat while it orchestrates (often minutes): keeps OWUI's
+    # connection alive past its idle timeout and shows the user progress instead of a blank
+    # screen. We deliberately do NOT stream Fugu's raw tokens — the answer must clear the
+    # honesty gate below before the user sees a word — so the heartbeats are progress, not
+    # unverified content. shield() keeps the in-flight orchestra alive across each tick.
+    fugu_task = asyncio.create_task(
+        fugu_client.answer(messages, source, session=session, ultra=True))
+    t0 = time.monotonic()
     candidate = ""
-    try:
-        candidate = await fugu_client.answer(
-            messages, source, session=session, ultra=True)
-    except Exception:
-        log.exception("[fugu] call failed — falling back to DeepSeek")
-        return  # silent fallback — caller proceeds to normal agent loop
+    while True:
+        try:
+            candidate = await asyncio.wait_for(asyncio.shield(fugu_task), timeout=15)
+            break
+        except asyncio.TimeoutError:
+            if show_work:
+                yield ("reasoning", f"🐡 Fugu still orchestrating… {int(time.monotonic() - t0)}s\n")
+            continue
+        except Exception:
+            log.exception("[fugu] call failed — falling back to DeepSeek")
+            return  # silent fallback — caller proceeds to normal agent loop
 
     if not (candidate and candidate.strip()):
         log.info("[fugu] empty response — falling back to DeepSeek")
