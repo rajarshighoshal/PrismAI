@@ -37,9 +37,12 @@ def _require_aiohttp():
 
 
 def _headers() -> dict:
+    """Build request headers. Always sets Host: api.sakana.ai so the
+    request works through a proxy/tunnel that rewrites the URL hostname."""
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {config.FUGU_API_KEY}",
+        "Host": "api.sakana.ai",
     }
 
 
