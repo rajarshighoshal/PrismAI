@@ -9,6 +9,10 @@ Ultra is strictly better and is the default. Under PAYG ($5/$30 per M for
 Ultra, model-rate for standard), standard is cheaper but at that point you're
 better off on subscription anyway at any real volume.
 
+IMPORTANT: The base URL is NOT a public constant — it's shown in your Sakana
+console (console.sakana.ai) and varies per account. Set FUGU_BASE_URL in
+orchestrator.env from the console. The default below is a guess and WILL fail.
+
 Ref: https://sakana.ai/fugu/
 """
 import json
@@ -24,7 +28,7 @@ from . import perf as _perf
 
 log = logging.getLogger(__name__)
 
-FUGU_BASE_URL = "https://api.sakana.ai/v1"
+FUGU_BASE_URL = config.FUGU_BASE_URL.rstrip("/")
 
 
 def _require_aiohttp():

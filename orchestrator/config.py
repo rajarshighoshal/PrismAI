@@ -373,6 +373,10 @@ USAGE_PANEL_URL = os.getenv("USAGE_PANEL_URL", "http://localhost:8001/usage")
 # checks every Fugu output before the user sees it.
 # Ref: https://sakana.ai/fugu/
 FUGU_API_KEY = os.getenv("FUGU_API_KEY", "")
+# IMPORTANT: the base URL is NOT a public constant. Get yours from:
+#   https://console.sakana.ai  →  API → copy the base URL
+# The default below is a placeholder and WILL fail with 403.
+FUGU_BASE_URL = os.getenv("FUGU_BASE_URL", "https://api.sakana.ai/v1")
 ENABLE_FUGU = _flag("ENABLE_FUGU", "false")     # inert until key + env set
 FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra-20260615")  # Ultra = full agent pool; same cost under subscription
 FUGU_TIMEOUT = float(os.getenv("FUGU_TIMEOUT", "300"))  # multi-model orchestration is slow
