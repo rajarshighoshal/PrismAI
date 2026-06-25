@@ -378,7 +378,7 @@ FUGU_API_KEY = os.getenv("FUGU_API_KEY", "")
 # The default below is a placeholder and WILL fail with 403.
 FUGU_BASE_URL = os.getenv("FUGU_BASE_URL", "https://api.sakana.ai/v1")
 ENABLE_FUGU = _flag("ENABLE_FUGU", "false")     # inert until key + env set
-FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra-20260615")  # Ultra = full agent pool; same cost under subscription
+FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra")  # "fugu" or "fugu-ultra" (console-confirmed names)
 FUGU_TIMEOUT = float(os.getenv("FUGU_TIMEOUT", "300"))  # multi-model orchestration is slow
 # Auto-escalate to Fugu when the verifier blocks a DeepSeek answer with unsupported
 # claims — gives the committee a chance on genuinely hard tasks instead of blocking.

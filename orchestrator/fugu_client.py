@@ -1,8 +1,8 @@
 """Sakana Fugu API client — OpenAI-compatible, mirrors openai_client.py pattern.
 
 Fugu is a learned multi-model orchestrator behind one endpoint. Two models:
-  fugu                  — balanced, opt-out agents configurable (subset of models)
-  fugu-ultra-20260615   — max-quality, full agent pool (the default)
+  fugu        — balanced, opt-out agents configurable (subset of models)
+  fugu-ultra  — max-quality, full agent pool (the default)
 
 Under Sakana's subscription plans ($20-$200/mo), both models cost the same —
 Ultra is strictly better and is the default. Under PAYG ($5/$30 per M for
@@ -48,7 +48,7 @@ def available() -> bool:
 
 
 def _fugu_model(ultra: bool = False) -> str:
-    return "fugu-ultra-20260615" if ultra else config.FUGU_MODEL
+    return "fugu-ultra" if ultra else config.FUGU_MODEL
 
 
 async def complete(
