@@ -65,7 +65,6 @@ async def _tavily(query, n, session):
         "include_answer": True,
         "max_results": n,
     }
-    last_exc = None
     for attempt in range(3):
         try:
             async with session.post(
@@ -79,7 +78,6 @@ async def _tavily(query, n, session):
                 data = await resp.json()
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            last_exc = e
             if attempt < 2:
                 await asyncio.sleep(0.5 * (attempt + 1))
             else:

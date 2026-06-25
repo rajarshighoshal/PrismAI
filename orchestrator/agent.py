@@ -4,8 +4,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
-import random
 import re
 import time
 from typing import Any, AsyncGenerator, Optional
@@ -13,7 +11,7 @@ from typing import Any, AsyncGenerator, Optional
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, fugu_client, fugu_router
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
-    _same_message_source, _SOURCE_BLOCK_RE, _owui_source_blocks, _user_source, _all_user_text,
+    _owui_source_blocks, _user_source, _all_user_text,
 )
 from .memory_client import (
     _memory_recall, _memory_store, _deliverable_store, _deliverable_get, _last_active,
@@ -22,8 +20,8 @@ from .memory_client import (
 from .timectx import _now_line, _gap_note
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers, _fit_audit_source
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_GATE, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
-    SYSTEM_FACT_AUDIT, SYSTEM_TOOL_GUARD, SYSTEM_CHANGE_SUMMARY, SYSTEM_VOICE_REGISTER,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_VISION, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
+    SYSTEM_TOOL_GUARD, SYSTEM_VOICE_REGISTER,
     SYSTEM_LONGDOC_GATE, SYSTEM_OUTLINE, SYSTEM_PLAN_INTENT, SYSTEM_SECTION_WRITER,
     _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
@@ -1148,34 +1146,7 @@ async def _try_longdoc(messages, user_source, chat_id, session, is_user_model, e
         yield kt
 
 
-def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
-    tool_outputs = []
-    for m in scratch:
-        if m.get("role") == "tool":
-            tool_outputs.append(f"[{m.get('name', 'tool')}]: {(m.get('content') or '')[:2000]}")
-    tool_text = "\n\n".join(tool_outputs)
-    if tool_text:
-        return [
-            {"role": "system", "content": (
-                "You have gathered information using tools. Answer the user's original "
-                "question using ONLY the evidence below. Cite source URLs where available.")},
-            {"role": "user", "content": f"Tool results:\n\n{tool_text}\n\nOriginal question:\n{source[:4000]}"},
-        ]
-    user_texts = [_text_of(m.get("content")) for m in scratch if m.get("role") == "user"]
-    last_user = user_texts[-1] if user_texts else source[:2000]
-    return [{"role": "user", "content": last_user.strip()}]
-
-
-async def _regenerate_with_user_model(scratch, user_model, source, session) -> str:
-    if not user_model.startswith("accounts/fireworks/"):
-        return ""
-    messages = _build_regeneration_context(scratch, source)
-    result = await fireworks.chat(messages, user_model, max_tokens=config.AGENT_MAX_TOKENS,
-                                  temperature=config.WRITER_TEMPERATURE, session=session)
-    return (result.get("message") or {}).get("content", "") or ""
-
-
-# ═══════════════════════════════════════════════════════════════════════════
+#═══════════════════════════════════════════════════════════════════════════
 # Agent loop — the heavy path, now driven by AgentState
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1497,7 +1468,6 @@ async def _fugu_run(
     if show_work:
         yield ("reasoning", "✍️ Verifying Fugu's answer…\n")
 
-    header_extra = (request_headers or {})
     status, text = await _verified_or_blocked(
         messages, candidate, source,
         recall_context="",

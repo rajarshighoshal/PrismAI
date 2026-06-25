@@ -125,20 +125,12 @@ async def decide(
     if len(q) < 80:
         return "deepseek"
 
-    # Statically high-signal candidates
-    if _maybe_fugu_candidate(messages):
-        result = await _classify_hardness(messages, session=session)
-        if result and result["benefits_from_multi_model"]:
-            log.info(f"[fugu-router] routing to fugu: confidence={result['confidence']:.2f} "
-                     f"why={result['why'][:100]}")
-            return "fugu"
-
-    # Classifier-driven routing for everything else
+    # Classify hardness ONCE. A statically high-signal cue (research paper, thesis, …) routes
+    # on benefit alone; everything else also needs the confidence threshold to clear.
     result = await _classify_hardness(messages, session=session)
-    if not result:
+    if not result or not result["benefits_from_multi_model"]:
         return "deepseek"
-
-    if result["benefits_from_multi_model"] and result["confidence"] >= config.FUGU_HARDNESS_THRESHOLD:
+    if _maybe_fugu_candidate(messages) or result["confidence"] >= config.FUGU_HARDNESS_THRESHOLD:
         log.info(f"[fugu-router] routing to fugu: confidence={result['confidence']:.2f} "
                  f"why={result['why'][:100]}")
         return "fugu"

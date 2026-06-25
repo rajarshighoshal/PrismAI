@@ -110,7 +110,7 @@ async def chat(
 
         usage = data.get("usage", {})
         _perf.trace(label, model, t0=t0,
-                    in_tok=usage.get("input_tokens"),
+                    in_tok=usage.get("prompt_tokens"),
                     out_tok=usage.get("completion_tokens"))
 
         choice = data["choices"][0]
