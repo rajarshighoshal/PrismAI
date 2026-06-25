@@ -35,3 +35,4 @@ class AgentState:
     # ── Delivery tracking ────────────────────────────────────────────
     streamed_live: bool = False       # was content already sent to user?
     filed_deliverable: bool = False   # does the file carry the deliverable body?
+    fugu_escalated: bool = False     # already tried Fugu escalation this turn?

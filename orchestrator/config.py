@@ -365,3 +365,20 @@ ENABLE_GROUNDED_VERIFY = _flag("ENABLE_GROUNDED_VERIFY", "false")
 # Where the spend panel lives (the tool-server's /usage page). Set the real
 # browser-reachable URL in orchestrator.env; shows on the OWUI model card.
 USAGE_PANEL_URL = os.getenv("USAGE_PANEL_URL", "http://localhost:8001/usage")
+
+# --- Sakana Fugu integration (multi-model orchestrator backend) ---
+# Fugu is a learned multi-model coordinator (ICLR 2026: TRINITY + Conductor) that
+# assigns Thinker/Worker/Verifier roles to a pool of frontier LLMs. Use it as an
+# ALTERNATIVE to DeepSeek for hard tasks, NOT a replacement — the verifier still
+# checks every Fugu output before the user sees it.
+# Ref: https://sakana.ai/fugu/
+FUGU_API_KEY = os.getenv("FUGU_API_KEY", "")
+ENABLE_FUGU = _flag("ENABLE_FUGU", "false")     # inert until key + env set
+FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra-20260615")  # Ultra = full agent pool; same cost under subscription
+FUGU_TIMEOUT = float(os.getenv("FUGU_TIMEOUT", "300"))  # multi-model orchestration is slow
+# Auto-escalate to Fugu when the verifier blocks a DeepSeek answer with unsupported
+# claims — gives the committee a chance on genuinely hard tasks instead of blocking.
+FUGU_ESCALATE_ON_BLOCK = _flag("FUGU_ESCALATE_ON_BLOCK", "false")
+# Hardness threshold: how confident the classifier must be to route to Fugu upfront
+# (pre-emptively, before DeepSeek even runs). Higher = fewer Fugu calls, lower cost.
+FUGU_HARDNESS_THRESHOLD = float(os.getenv("FUGU_HARDNESS_THRESHOLD", "0.65"))

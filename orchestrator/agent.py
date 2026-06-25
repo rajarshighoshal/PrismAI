@@ -10,7 +10,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver
+from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, fugu_client, fugu_router
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
     _same_message_source, _SOURCE_BLOCK_RE, _owui_source_blocks, _user_source, _all_user_text,
@@ -1409,7 +1409,41 @@ async def _agent_loop(
                 _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", final_text, session)))
             return
 
-        # Blocked
+        # Blocked by verifier — try Fugu escalation before repair/block.
+        if (status == "unsupported_claims"
+                and await fugu_router.should_escalate(status, st.repair_steps, session=session)
+                and not st.fugu_escalated):
+            st.fugu_escalated = True
+            log.info("[fugu-escalation] DeepSeek blocked with unsupported claims — trying Fugu")
+            if config.SHOW_WORK:
+                yield ("reasoning", "🔄 Trying Fugu multi-model system…\n")
+            escalate_source = _combined_source(user_source, st.tool_sources)
+            try:
+                fugu_answer = await fugu_client.answer(
+                    messages_for_verify, escalate_source,
+                    session=session, ultra=True)
+                if fugu_answer and fugu_answer.strip():
+                    fugu_status, fugu_text = await _verified_or_blocked(
+                        messages_for_verify, fugu_answer, escalate_source,
+                        recall_context=recall_context, prose=None,
+                        force=True, session=session)
+                    if fugu_status == "ok":
+                        yield ("content", fugu_text)
+                        if chat_id:
+                            um = _consolidated_user_memory(messages)
+                            if um:
+                                _track_task(asyncio.create_task(
+                                    _memory_store(chat_id, "user", um, session)))
+                            _track_task(asyncio.create_task(
+                                _memory_store(chat_id, "assistant", fugu_text.strip(), session)))
+                        return
+                    log.info("[fugu-escalation] Fugu also blocked — falling through to normal handling")
+                    text = fugu_text  # show the Fugu block message, which may be more helpful
+                else:
+                    log.info("[fugu-escalation] Fugu returned empty — falling through")
+            except Exception as e:
+                log.warning(f"[fugu-escalation] Fugu call failed: {e}")
+
         if streamed_live:
             yield ("content", "\n\n---\n\n⚠️ " + text)
             return
@@ -1428,6 +1462,64 @@ async def _agent_loop(
 # ═══════════════════════════════════════════════════════════════════════════
 # run() — thin phase orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
+
+async def _fugu_run(
+    messages: list[dict],
+    image_transcript: str,
+    edit_baseline: str,
+    chat_id: str,
+    request_headers: dict,
+    session,
+    show_work: bool,
+) -> AsyncGenerator[tuple[str, str], None]:
+    """Fugu path: skip the agent loop entirely. Fugu's learned TRINITY coordinator
+    handles tool use, decomposition, and multi-model reasoning internally. We still
+    verify the output — Fugu has no honesty auditor, so our verifier is the gate."""
+    source = _build_source(messages, image_transcript, edit_baseline)
+
+    if show_work:
+        yield ("reasoning", "🧭 Routing to Fugu multi-model orchestrator…\n")
+
+    candidate = ""
+    try:
+        candidate = await fugu_client.answer(
+            messages, source, session=session, ultra=True)
+    except Exception:
+        log.exception("[fugu] call failed")
+        yield ("content",
+               "I hit an issue reaching the multi-model system. "
+               "Please try again, or disable Fugu for this turn.")
+        return
+
+    if not (candidate and candidate.strip()):
+        yield ("content", "The multi-model system returned an empty response. Please try again.")
+        return
+
+    # Still verify — Fugu's output passes through our honesty gate just like any
+    # other model's. The verifier checks against the user's sources + statements.
+    if show_work:
+        yield ("reasoning", "✍️ Verifying Fugu's answer…\n")
+
+    header_extra = (request_headers or {})
+    status, text = await _verified_or_blocked(
+        messages, candidate, source,
+        recall_context="",
+        prose=None,
+        force=True,  # always verify Fugu — no classifier gate
+        session=session)
+
+    if status == "ok":
+        yield ("content", text)
+        if chat_id:
+            um = _consolidated_user_memory(messages)
+            if um:
+                _track_task(asyncio.create_task(
+                    _memory_store(chat_id, "user", um, session)))
+            _track_task(asyncio.create_task(
+                _memory_store(chat_id, "assistant", text.strip(), session)))
+    else:
+        yield ("content", text)  # the block message
+
 
 async def run(
     messages: list[dict], *,
@@ -1473,6 +1565,20 @@ async def run(
         yield ("content", edit_output)
         return
     edit_directive = edit_output  # when not handled, output is the directive
+
+    # Phase 4.5: Fugu multi-model routing
+    # Decide whether this task should use Fugu's learned multi-model coordinator
+    # instead of the single-model DeepSeek agent loop. Fugu handles tool use and
+    # decomposition internally — we skip the agent loop entirely when routed.
+    fugu_route = await fugu_router.decide(
+        messages, is_edit=bool(edit_baseline),
+        is_user_model=is_user_model, session=session)
+    if fugu_route == "fugu":
+        async for kt in _fugu_run(messages, image_transcript, edit_baseline,
+                                    chat_id, req_headers, session,
+                                    config.SHOW_WORK):
+            yield kt
+        return
 
     # Phase 5: System prompt + context budget
     agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
