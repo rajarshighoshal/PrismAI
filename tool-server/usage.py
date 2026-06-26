@@ -52,26 +52,39 @@ USAGE_PRICES: dict = {
     "v4-research-writing": (1.74, 3.48),
 }
 
-# Live-priced overrides from monthly update_prices.py cron job. Read a JSON file
-# of {"model": [input_price, output_price]} from the data volume if present.
-# Deployed prices take precedence over hardcoded defaults.
-_PRICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_prices.json")
-if os.path.exists(_PRICE_FILE):
+# Live-priced overrides from monthly update_prices.py cron job. The updater writes
+# to the persistent data volume; reload on mtime change so a cron refresh takes
+# effect without restarting the tool-server.
+_PRICE_FILE = os.getenv("USAGE_PRICE_FILE", "/app/backend/data/usage_prices.json")
+_PRICE_FILE_MTIME: Optional[float] = None
+
+
+def _load_price_file() -> None:
+    global _PRICE_FILE_MTIME
     try:
+        mtime = os.path.getmtime(_PRICE_FILE)
+        if _PRICE_FILE_MTIME == mtime:
+            return
         with open(_PRICE_FILE) as f:
             live = {k: tuple(v) for k, v in json.load(f).items()}
         USAGE_PRICES.update(live)
+        USAGE_PRICES.update(_ENV_PRICE_OVERRIDES)
+        _PRICE_FILE_MTIME = mtime
         logger.info("Loaded %d live prices from %s", len(live), _PRICE_FILE)
-    except Exception:
-        pass
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        logger.warning("Could not load live prices from %s: %s", _PRICE_FILE, e)
 
 try:
-    USAGE_PRICES.update({k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()})
+    _ENV_PRICE_OVERRIDES = {k: tuple(v) for k, v in json.loads(os.getenv("USAGE_PRICES", "{}")).items()}
+    USAGE_PRICES.update(_ENV_PRICE_OVERRIDES)
 except Exception:
-    pass
+    _ENV_PRICE_OVERRIDES = {}
 
 
 def _usage_cost(model: str, in_tok: int, out_tok: int) -> float:
+    _load_price_file()
     m = (model or "").split("/")[-1]
     for key, (pi, po) in USAGE_PRICES.items():
         if key in m:

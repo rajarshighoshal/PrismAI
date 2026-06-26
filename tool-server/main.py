@@ -552,17 +552,6 @@ def fetch_url(req: FetchUrlRequest) -> dict:
     }
 
 
-@app.post(
-    "/lookup_doi_citation",
-    summary="Look up a DOI on CrossRef and return an APA citation",
-    description=(
-        "Query CrossRef for a DOI and return the work as an APA-formatted "
-        "citation string plus structured metadata (authors, year, title, "
-        "journal). Use when the user gives a DOI and wants the formatted "
-        "reference, or when verifying a citation they plan to use."
-    ),
-    operation_id="lookup_doi_citation",
-)
 def _title_similarity(a: str, b: str) -> float:
     """Token-overlap ratio (Jaccard) between two titles, case/punct-insensitive."""
     def toks(s: str) -> set:
@@ -644,6 +633,17 @@ def _fetch_crossref_work(doi: str) -> dict:
         raise HTTPException(status_code=502, detail=f"CrossRef lookup failed: {e}")
 
 
+@app.post(
+    "/lookup_doi_citation",
+    summary="Look up a DOI on CrossRef and return an APA citation",
+    description=(
+        "Query CrossRef for a DOI and return the work as an APA-formatted "
+        "citation string plus structured metadata (authors, year, title, "
+        "journal). Use when the user gives a DOI and wants the formatted "
+        "reference, or when verifying a citation they plan to use."
+    ),
+    operation_id="lookup_doi_citation",
+)
 def lookup_doi_citation(req: CitationRequest) -> dict:
     doi = req.doi.strip()
     for prefix in ("doi:", "https://doi.org/", "http://doi.org/", "https://dx.doi.org/"):

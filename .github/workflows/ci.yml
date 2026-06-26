@@ -28,3 +28,6 @@ jobs:
       - name: Orchestrator contract tests
         # Exits non-zero on any failed assertion (test_orchestrator raises SystemExit(1)).
         run: python -m orchestrator.test_orchestrator
+
+      - name: Tool-server static route checks
+        run: python tool-server/test_routes_static.py
