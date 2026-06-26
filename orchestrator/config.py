@@ -216,6 +216,8 @@ CHUNKED_MAX_REVISES = int(os.getenv("CHUNKED_MAX_REVISES", "6"))
 # Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
 # to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
 SHOW_WORK = _flag("SHOW_WORK", "true")
+ENABLE_MODEL_PROGRESS = _flag("ENABLE_MODEL_PROGRESS", "true")
+PROGRESS_MODEL = os.getenv("PROGRESS_MODEL", GROUNDING_GATE_MODEL)
 
 # The current date/time injected into the agent prompt is formatted in this local
 # timezone (the request itself carries none). Default = IST (+05:30), no DST.
@@ -369,6 +371,7 @@ FUGU_API_KEY = os.getenv("FUGU_API_KEY", "")
 # The default below is a placeholder and WILL fail with 403.
 FUGU_BASE_URL = os.getenv("FUGU_BASE_URL", "https://api.sakana.ai/v1")
 ENABLE_FUGU = _flag("ENABLE_FUGU", "false")     # inert until key + env set
+ALLOW_FUGU_TEST_RELAY = _flag("ALLOW_FUGU_TEST_RELAY", "false")
 FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra")  # "fugu" or "fugu-ultra" (console-confirmed names)
 FUGU_TIMEOUT = float(os.getenv("FUGU_TIMEOUT", "300"))  # multi-model orchestration is slow
 # Auto-escalate to Fugu when the verifier blocks a DeepSeek answer with unsupported
@@ -377,3 +380,26 @@ FUGU_ESCALATE_ON_BLOCK = _flag("FUGU_ESCALATE_ON_BLOCK", "false")
 # Hardness threshold: how confident the classifier must be to route to Fugu upfront
 # (pre-emptively, before DeepSeek even runs). Higher = fewer Fugu calls, lower cost.
 FUGU_HARDNESS_THRESHOLD = float(os.getenv("FUGU_HARDNESS_THRESHOLD", "0.65"))
+
+
+def _private_or_test_relay_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(x in u for x in (
+        "localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal",
+        "172.16.", "172.17.", "172.18.", "172.19.", "10.", "192.168.",
+    ))
+
+
+if ENABLE_FUGU and _private_or_test_relay_url(FUGU_BASE_URL) and not ALLOW_FUGU_TEST_RELAY:
+    raise RuntimeError(
+        "Refusing to enable Fugu through a private/test relay URL. Use an official "
+        "Sakana endpoint, or set ALLOW_FUGU_TEST_RELAY=true only for short-lived manual tests."
+    )
+
+
+# Instruction adherence / output quality gates. These are separate from the honesty
+# verifier: honesty checks truth; this checks whether the draft followed the user's ask.
+ENABLE_ADHERENCE_GATE = _flag("ENABLE_ADHERENCE_GATE", "true")
+ADHERENCE_MAX_DRAFT_CHARS = int(os.getenv("ADHERENCE_MAX_DRAFT_CHARS", "30000"))
+ADHERENCE_REPAIR_STEPS = int(os.getenv("ADHERENCE_REPAIR_STEPS", "1"))
+SHOW_SOURCE_COVERAGE = _flag("SHOW_SOURCE_COVERAGE", "true")

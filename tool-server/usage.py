@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from typing import Optional
 
@@ -224,6 +225,39 @@ class UsageLogRequest(BaseModel):
 async def usage_log(req: UsageLogRequest) -> dict:
     # Called only on the internal docker network by the orchestrator (not proxied out).
     return {"ok": await memory.log_usage(req.model, req.label, req.in_tok, req.out_tok, req.user_id)}
+
+
+@router.get("/ops/status", operation_id="ops_status")
+async def ops_status_api(request: Request) -> dict:
+    if not await _owui_admin(_bearer(request)):
+        raise HTTPException(status_code=403, detail="admin only")
+    backup_path = os.getenv("BACKUP_STATUS_FILE", "/owui/backup_status.json")
+    backup = {"ok": False, "status_file": backup_path}
+    try:
+        with open(backup_path) as f:
+            backup.update(json.load(f))
+    except FileNotFoundError:
+        backup["error"] = "backup status file not found"
+    except Exception as e:
+        backup["error"] = str(e)
+    try:
+        total, used, free = shutil.disk_usage("/app/backend/data")
+        disk = {"data_total": total, "data_used": used, "data_free": free,
+                "data_used_pct": round(used * 100 / total, 1) if total else 0}
+    except Exception as e:
+        disk = {"error": str(e)}
+    price_file = {"path": _PRICE_FILE, "exists": os.path.exists(_PRICE_FILE)}
+    if price_file["exists"]:
+        price_file["mtime"] = os.path.getmtime(_PRICE_FILE)
+        price_file["bytes"] = os.path.getsize(_PRICE_FILE)
+    return {
+        "service": "tool-server",
+        "time": time.time(),
+        "backup": backup,
+        "disk": disk,
+        "price_file": price_file,
+        "fugu_policy": "production should keep ENABLE_FUGU=false until official EU/GDPR endpoint",
+    }
 
 
 @router.get("/usage/summary", operation_id="usage_summary")

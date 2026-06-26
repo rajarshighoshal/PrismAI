@@ -254,6 +254,24 @@ def _edit_inject(prior: dict) -> str:
     )
 
 
+def _is_doc_status_request(text: str) -> bool:
+    t = (text or "").lower()
+    return bool(re.search(r"\b(current|latest|this)\s+(doc|document|file)\s+(status|info|state)\b", t)
+                or re.search(r"\b(show|what'?s|what is)\s+.*\b(doc|document|file)\s+status\b", t))
+
+
+def _doc_status(prior: dict) -> str:
+    content = prior.get("content") or ""
+    return (
+        "Current document:\n"
+        f"- filename: {prior.get('filename') or 'document'}\n"
+        f"- format: {(prior.get('fmt') or 'docx').upper()}\n"
+        f"- version: {prior.get('version') or '?'}\n"
+        f"- words: {len(_WORD_RE.findall(content)):,}\n"
+        "\nYou can ask me to rename it, export it in another format, or revise a specific part."
+    )
+
+
 async def _try_patch_edit(baseline: str, instruction: str, *, session=None):
     """Apply targeted find→replace edits to the stored document. Returns patched text, or None when the change is too broad — caller falls back to a full re-emit."""
     if not baseline.strip():
@@ -372,6 +390,56 @@ def _tool_status(name: str, args: dict) -> str:
         "export_markdown": "📝 Exporting a markdown file…",
         "export_csv": "📊 Exporting a CSV…",
     }.get(name, f"🔧 Using {name}…")
+
+
+_PROGRESS_FALLBACK = {
+    "start": "🧭 I’m setting up the work now: reading your request, checking the available sources, and deciding the safest path.\n\n",
+    "drafted": "✓ Draft written. Next I’m checking whether it follows your request and stays grounded.\n",
+    "polish": "✨ The factual draft is ready; I’m polishing the wording now without changing the facts.\n\n",
+    "voice": "✨ The content is polished; I’m doing a light voice pass now so it reads naturally.\n",
+    "verify": "🔍 Now I’m verifying the factual claims against your sources before anything gets finalized.\n",
+    "export": "📦 Verification passed; I’m building the downloadable file now.\n",
+}
+
+
+async def _progress_note(stage: str, messages, *, detail: str = "", session=None) -> str:
+    """One short user-visible progress sentence for serious/buffered work.
+
+    The model is allowed to vary wording like Claude/ChatGPT, but not to invent
+    task-specific facts or expose internals. If it fails, use the deterministic
+    fallback so the user still sees movement.
+    """
+    fallback = _PROGRESS_FALLBACK.get(stage, "Working…\n")
+    if not (config.SHOW_WORK and getattr(config, "ENABLE_MODEL_PROGRESS", True)):
+        return fallback
+    try:
+        raw = await fireworks.complete(
+            [
+                {"role": "system", "content": (
+                    "Write ONE brief, natural progress update for the user. "
+                    "Explain what is happening now and, if useful, what comes next. "
+                    "Do not mention model names, APIs, prompts, hidden chain-of-thought, "
+                    "or internal implementation. Do not assert facts about the user's "
+                    "document; this is only a process update. Max 22 words.")},
+                {"role": "user", "content": json.dumps({
+                    "stage": stage,
+                    "detail": detail[:300],
+                    "latest_user_request": _last_user_text(messages)[:600],
+                }, ensure_ascii=True)},
+            ],
+            config.PROGRESS_MODEL,
+            max_tokens=60,
+            temperature=0.4,
+            session=session,
+            label="gate:progress",
+        )
+        note = " ".join((raw or "").strip().split())
+        if not note:
+            return fallback
+        note = re.sub(r"(?i)\b(api|prompt|chain.of.thought|hidden|system message)\b", "", note).strip()
+        return note.rstrip(".!?") + "…\n"
+    except Exception:
+        return fallback
 
 
 def _tool_path(name: str) -> str:
@@ -656,6 +724,46 @@ def _same_doc(a: str, b: str) -> bool:
     if not wa or not wb:
         return False
     return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
+
+
+async def _adherence_check(messages, candidate: str, *, session=None) -> dict:
+    """Check task-contract adherence, separate from truth/grounding."""
+    if not (config.ENABLE_ADHERENCE_GATE and candidate.strip()):
+        return {"followed": True, "severity": "none", "misses": []}
+    draft = candidate
+    if len(draft) > config.ADHERENCE_MAX_DRAFT_CHARS:
+        draft = draft[:config.ADHERENCE_MAX_DRAFT_CHARS] + "\n...[truncated]"
+    try:
+        raw = await fireworks.complete(
+            [
+                {"role": "system", "content": (
+                    "You are an instruction-adherence checker. Compare the user's request "
+                    "to the draft. Check only whether the draft followed the requested task, "
+                    "format, sections, length, file/export intent, and explicit must/avoid "
+                    "constraints. Do NOT judge factual truth; another verifier handles that. "
+                    "Return strict JSON only: {\"followed\": boolean, \"severity\": "
+                    "\"none\"|\"minor\"|\"major\", \"misses\": [\"brief issue\", ...]}. "
+                    "Use severity=major only when the output clearly fails the user's core ask.")},
+                {"role": "user", "content": json.dumps({
+                    "request": _all_user_text(messages)[:6000],
+                    "draft": draft,
+                }, ensure_ascii=True)},
+            ],
+            config.GROUNDING_GATE_MODEL,
+            max_tokens=300,
+            temperature=0.0,
+            session=session,
+            label="gate:adherence",
+        )
+        m = re.search(r"\{.*\}", raw, flags=re.S)
+        data = json.loads(m.group(0) if m else raw)
+        misses = data.get("misses") if isinstance(data.get("misses"), list) else []
+        sev = str(data.get("severity") or "none").lower()
+        return {"followed": bool(data.get("followed", True)),
+                "severity": sev if sev in ("none", "minor", "major") else "none",
+                "misses": [str(x)[:180] for x in misses[:5]]}
+    except Exception:
+        return {"followed": True, "severity": "none", "misses": []}
 
 
 def _norm_turn(content) -> str:
@@ -1002,6 +1110,9 @@ async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_wo
     if not (prior and prior.get("content")):
         return False, "", ""
 
+    if _is_doc_status_request(_last_user_text(messages)):
+        return True, _doc_status(prior), ""
+
     intent = await _classify_edit(_last_user_text(messages), prior, messages=messages, session=session)
 
     if intent["action"] in ("rename", "reformat"):
@@ -1069,6 +1180,15 @@ def _build_source(messages, image_transcript, edit_baseline):
     if edit_baseline:
         src = (src + "\n\n" + edit_baseline).strip() if src.strip() else edit_baseline
     return src
+
+
+def _source_coverage_note(messages, source: str) -> str:
+    if not (config.SHOW_SOURCE_COVERAGE and (source or "").strip()):
+        return ""
+    blocks = sum(len(_owui_source_blocks(_text_of(m.get("content")))) for m in messages)
+    if blocks:
+        return f"\n\n_Checked against {blocks} attached source block{'s' if blocks != 1 else ''}._"
+    return "\n\n_Checked against the source material you provided in chat._"
 
 
 async def _build_system_prompt(messages, user_id, chat_id, profile, extra, session):
@@ -1290,6 +1410,9 @@ async def _agent_loop(
             doc = _pending_prose_deliverable(st.pending_exports)
             if doc and len(doc) >= config.POLISH_MIN_CHARS:
                 candidate = doc
+                if config.SHOW_WORK:
+                    yield ("content" if st.pending_exports else "reasoning",
+                           await _progress_note("drafted", messages, session=session))
                 if not edit_baseline:
                     st.polish_voice = st.polish_voice or config.AUTO_POLISH_MODEL
                     if st.polish_voice_pass is None:
@@ -1297,14 +1420,15 @@ async def _agent_loop(
                             _all_user_text(messages), candidate, session=session)
 
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
+        visible_progress = bool(st.pending_exports and substantial)
         prose = _prose_provider(st.polish_voice) if (st.polish_voice and not is_clar and substantial and not is_user_model) else None
 
         # Premium prose polish
         if prose is not None:
             pclient, pmodel = prose
             if config.SHOW_WORK:
-                yield ("content" if st.pending_exports else "reasoning",
-                       f"✨ Polishing the document ({pmodel.split('/')[-1]})…\n\n")
+                yield ("content" if visible_progress else "reasoning",
+                       await _progress_note("polish", messages, detail=pmodel.split("/")[-1], session=session))
             pmsgs = _prose_polish_messages(messages_for_verify, candidate, source)
             to_chat = not st.pending_exports
             try:
@@ -1332,11 +1456,28 @@ async def _agent_loop(
         if (not streamed_live and st.polish_voice_pass and st.polish_voice_pass != "none"
                 and not is_clar and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
             if config.SHOW_WORK:
-                yield ("reasoning", f"✨ Voice pass ({st.polish_voice_pass})…\n")
+                yield ("content" if visible_progress else "reasoning",
+                       await _progress_note("voice", messages, detail=st.polish_voice_pass, session=session))
             candidate = await _voice_pass(candidate, st.polish_voice_pass, session=session)
 
+        if visible_progress:
+            if config.SHOW_WORK:
+                yield ("reasoning", "📋 Checking that the draft follows your requested format and constraints…\n")
+            adherence = await _adherence_check(messages_for_verify, candidate, session=session)
+            if (adherence.get("severity") == "major" or not adherence.get("followed", True)):
+                if st.adherence_steps < config.ADHERENCE_REPAIR_STEPS:
+                    st.adherence_steps += 1
+                    misses = "\n".join(f"- {m}" for m in adherence.get("misses") or ["missed the user's requested format/constraints"])
+                    scratch.append({"role": "assistant", "content": candidate})
+                    scratch.append({"role": "system", "content": (
+                        "Internal instruction-adherence gate blocked the draft. Fix these issues "
+                        "and produce the complete corrected answer/export argument; do not mention "
+                        "the gate to the user:\n" + misses)})
+                    continue
+
         if config.SHOW_WORK and not streamed_live:
-            yield ("reasoning", "✍️ Verifying the answer…\n")
+            yield ("content" if visible_progress else "reasoning",
+                   await _progress_note("verify", messages, session=session))
         status, text = await _verified_or_blocked(
             messages_for_verify, candidate, source,
             recall_context=recall_context, prose=prose,
@@ -1346,6 +1487,8 @@ async def _agent_loop(
         links_str = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in export_links)) if export_links else ""
 
         if status == "ok":
+            if config.SHOW_WORK and visible_progress:
+                yield ("content", await _progress_note("export", messages, session=session))
             file_links, filed = await _export_final(
                 st.pending_exports, text, prose, messages_for_verify, source,
                 chat_id=chat_id, headers=request_headers, session=session)
@@ -1356,9 +1499,10 @@ async def _agent_loop(
                 summary = await _summarize_correction(candidate, text, session=session) or ""
 
             if filed:
+                coverage = _source_coverage_note(messages_for_verify, source) if visible_progress else ""
                 yield ("content", ("\n\n---\n\n*Corrected before saving:*\n\n"
-                       + (summary or "- Tightened to match your source.") + links_str) if changed
-                       else (("\n\n" if streamed_live else "") + "📄 Your file is ready — download below." + links_str))
+                       + (summary or "- Tightened to match your source.") + coverage + links_str) if changed
+                       else (("\n\n" if streamed_live else "") + "📄 Your file is ready — download below." + coverage + links_str))
                 final_text = text
             elif streamed_live:
                 if changed:
@@ -1601,7 +1745,7 @@ async def run(
 
     # Phase 9: Heavy turn preamble
     if config.SHOW_WORK and config.STREAM_PREAMBLE:
-        yield ("content", "🧭 Working on it…\n\n")
+        yield ("content", await _progress_note("start", messages, session=session))
 
     # Phase 10: Agentic tool loop
     async for kt in _agent_loop(messages, scratch, messages_for_verify, user_source,

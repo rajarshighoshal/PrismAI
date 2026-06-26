@@ -25,6 +25,7 @@ DATA_DIR="${OWUI_DATA_DIR:-${SCRIPT_DIR}/data/owui}"
 OWUI_CONTAINER="${OWUI_CONTAINER:-open-webui}"
 TOOL_CONTAINER="${TOOL_CONTAINER:-owui-tool-server}"
 SNAPSHOT_RETENTION_DAYS="${SNAPSHOT_RETENTION_DAYS:-14}"
+STATUS_FILE="${BACKUP_STATUS_FILE:-${DATA_DIR}/backup_status.json}"
 
 log() { echo "$(date -Iseconds) $*"; }
 die() { echo "$(date -Iseconds) ERROR: $*" >&2; exit 1; }
@@ -102,3 +103,16 @@ if [ "${SNAPSHOT_RETENTION_DAYS}" -gt 0 ] 2>/dev/null; then
 fi
 
 log "backup complete"
+
+python3 - "$STATUS_FILE" "$DATE_UTC" <<'PY'
+import json, os, sys, time
+path, date_utc = sys.argv[1], sys.argv[2]
+data = {
+    "ok": True,
+    "finished_at": time.time(),
+    "finished_at_utc_date": date_utc,
+}
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY

@@ -168,6 +168,10 @@ async def _fc_body(messages, model, *, max_tokens, temperature=None, session=Non
     _calls["complete_models"].append(model)
     _calls.setdefault("labels", []).append(label)
     sys = messages[0]["content"] if messages else ""
+    if label == "gate:progress":
+        return "Working on it"
+    if label == "gate:adherence":
+        return json.dumps({"followed": True, "severity": "none", "misses": []})
     if model in (config.VISION_MODEL, config.VISION_FALLBACK_MODEL):
         _calls.setdefault("vision_models", []).append(model)
         _calls.setdefault("vision_msgs", []).append(messages)

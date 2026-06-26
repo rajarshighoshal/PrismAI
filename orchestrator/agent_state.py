@@ -17,6 +17,7 @@ class AgentState:
     tool_call_count: int = 0
     web_search_count: int = 0
     repair_steps: int = 0
+    adherence_steps: int = 0
 
     # ── Collected outputs ────────────────────────────────────────────
     tool_sources: list[str] = field(default_factory=list)
