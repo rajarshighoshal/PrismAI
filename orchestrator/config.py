@@ -1,5 +1,7 @@
 """Orchestrator configuration — all env-driven, with defaults mirroring the router_fn behavior."""
+import ipaddress
 import os
+from urllib.parse import urlparse
 
 
 def _flag(name: str, default: str = "true") -> bool:
@@ -383,11 +385,16 @@ FUGU_HARDNESS_THRESHOLD = float(os.getenv("FUGU_HARDNESS_THRESHOLD", "0.65"))
 
 
 def _private_or_test_relay_url(url: str) -> bool:
-    u = (url or "").lower()
-    return any(x in u for x in (
-        "localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal",
-        "172.16.", "172.17.", "172.18.", "172.19.", "10.", "192.168.",
-    ))
+    raw = (url or "").strip()
+    parsed = urlparse(raw if "://" in raw else "http://" + raw)
+    host = (parsed.hostname or raw.split("/", 1)[0]).lower().strip("[]")
+    if host in {"localhost", "host.docker.internal", "docker.for.mac.localhost"}:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    except ValueError:
+        return False
 
 
 if ENABLE_FUGU and _private_or_test_relay_url(FUGU_BASE_URL) and not ALLOW_FUGU_TEST_RELAY:

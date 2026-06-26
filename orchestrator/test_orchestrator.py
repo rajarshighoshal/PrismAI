@@ -1467,6 +1467,10 @@ async def _run_tests():
           and config.MODEL_CONTEXT_TOKENS == 1_000_000)
     check("ctx: vision model (kimi) is NOT in the binding set",
           config.VISION_MODEL not in config._BINDING_MODELS)
+    check("fugu guard: private relay URLs are caught precisely",
+          config._private_or_test_relay_url("http://172.18.0.1:8080/v1")
+          and config._private_or_test_relay_url("http://localhost:8080/v1")
+          and not config._private_or_test_relay_url("https://api.sakana.ai/v1"))
 
     # e2e fallback driving the REAL chat/stream with a fake HTTP session.
     _fakes = (fireworks.complete, fireworks.chat, fireworks.stream)
