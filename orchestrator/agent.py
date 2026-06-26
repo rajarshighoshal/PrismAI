@@ -726,7 +726,7 @@ def _same_doc(a: str, b: str) -> bool:
     return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
 
 
-async def _adherence_check(messages, candidate: str, *, session=None) -> dict:
+async def _adherence_check(messages, candidate: str, *, export_pending: bool = False, session=None) -> dict:
     """Check task-contract adherence, separate from truth/grounding."""
     if not (config.ENABLE_ADHERENCE_GATE and candidate.strip()):
         return {"followed": True, "severity": "none", "misses": []}
@@ -741,12 +741,16 @@ async def _adherence_check(messages, candidate: str, *, session=None) -> dict:
                     "to the draft. Check only whether the draft followed the requested task, "
                     "format, sections, length, file/export intent, and explicit must/avoid "
                     "constraints. Do NOT judge factual truth; another verifier handles that. "
+                    "If export_pending=true, do NOT flag the absence of a download link, file "
+                    "attachment, or docx/pdf packaging in the draft itself; the surrounding "
+                    "system handles the actual file export after this check. "
                     "Return strict JSON only: {\"followed\": boolean, \"severity\": "
                     "\"none\"|\"minor\"|\"major\", \"misses\": [\"brief issue\", ...]}. "
                     "Use severity=major only when the output clearly fails the user's core ask.")},
                 {"role": "user", "content": json.dumps({
                     "request": _all_user_text(messages)[:6000],
                     "draft": draft,
+                    "export_pending": bool(export_pending),
                 }, ensure_ascii=True)},
             ],
             config.GROUNDING_GATE_MODEL,
@@ -1463,7 +1467,7 @@ async def _agent_loop(
         if visible_progress:
             if config.SHOW_WORK:
                 yield ("reasoning", "📋 Checking that the draft follows your requested format and constraints…\n")
-            adherence = await _adherence_check(messages_for_verify, candidate, session=session)
+            adherence = await _adherence_check(messages_for_verify, candidate, export_pending=bool(st.pending_exports), session=session)
             if (adherence.get("severity") == "major" or not adherence.get("followed", True)):
                 if st.adherence_steps < config.ADHERENCE_REPAIR_STEPS:
                     st.adherence_steps += 1
