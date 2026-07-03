@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 
-from orchestrator import agent, config, dedup, fireworks, pipeline, search, toolserver, verifier
+from orchestrator import agent, config, dedup, fireworks, metadata, pipeline, search, toolserver, verifier
 
 # Real Fireworks fns captured BEFORE the per-test monkeypatching, so the provider-chain
 # tests can drive the ACTUAL fallback logic (real chat/stream) with a fake HTTP session.
@@ -348,6 +348,16 @@ async def _run_tests():
           agent._last_user_text(wrapped_prepend) == "cna you add my geometric probes work to the letter?")
     check("unwrap: a plain message passes through unchanged",
           agent._last_user_text([{"role": "user", "content": "hello there"}]) == "hello there")
+    title_task = [{"role": "user", "content": (
+        "### Task:\nGenerate a concise, 3-5 word title with an emoji summarizing "
+        "the chat history.\n\n### Chat History:\nUser: explain JAMOVI regression")}]
+    tags_task = [{"role": "user", "content": (
+        "### Task:\nGenerate 1-3 broad tags categorizing the main themes of the "
+        "chat history.\n\n### Chat History:\nUser: explain JAMOVI regression")}]
+    check("owui metadata: title prompt detected", metadata.owui_metadata_task(title_task) == "title")
+    check("owui metadata: tag prompt detected", metadata.owui_metadata_task(tags_task) == "tags")
+    check("owui metadata: normal user ask not detected",
+          metadata.owui_metadata_task([{"role": "user", "content": "give me a short title for my essay"}]) == "")
     check("source: short resume lines survive (no >=120 drop)", "Globex | Search relevance across 13 services" in owui_src)
     check("source: <source> wrapper tags stripped", "<source" not in owui_src and "</source>" not in owui_src)
     sys_inject = [
@@ -417,6 +427,7 @@ async def _run_tests():
     # Fast preamble: a heavy turn shows an INSTANT deterministic status line as reasoning
     # (no LLM call) before the real answer, so the user sees activity immediately.
     _reset()
+    config.SHOW_WORK = True
     config.STREAM_PREAMBLE = True
     _chat_queue.append(_chat_content("Plain answer."))
     _gate_queue.append(False)
@@ -425,6 +436,7 @@ async def _run_tests():
     check("preamble: instant status is VISIBLE chat content, not thinking", "Working on it" in _content(ev))
     check("preamble: answer still produced", _content(ev).endswith("Plain answer."))
     config.STREAM_PREAMBLE = False
+    config.SHOW_WORK = False
 
     # Optimistic streaming: the open-model answer streams live; a clean turn shows
     # it as-is, a flagged turn shows it then openly self-corrects.

@@ -9,7 +9,7 @@ import aiohttp
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config, dedup, pipeline
+from . import config, dedup, fireworks, metadata, pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +38,40 @@ def _user_id(request: Request) -> str:
 
 def _request_headers(request: Request) -> dict:
     return {k.lower(): v for k, v in request.headers.items()}
+
+
+def _internal_model(model: str) -> bool:
+    return (model or "").strip() in {
+        config.ADVERTISED_CHAT_ID,
+        "PrismAI",
+        "assistant",
+    }
+
+
+async def _metadata_completion(messages: list[dict], kind: str, *, session) -> str:
+    """Cheap fast path for OWUI title/tag jobs."""
+    prompt = [
+        {"role": "system", "content": (
+            "You handle only OpenWebUI background metadata generation. "
+            "Follow the user's requested output schema exactly. Return only the "
+            "title/tags result, with no markdown fence, explanation, sources, "
+            "tool calls, or preamble. Keep titles short and tags broad.")},
+        *messages,
+    ]
+    try:
+        out = await fireworks.complete(
+            prompt,
+            config.TASK_MODEL,
+            max_tokens=config.TASK_MAX_TOKENS,
+            temperature=config.TASK_TEMPERATURE,
+            session=session,
+            label="gate:metadata",
+            reasoning_effort="none",
+        )
+        return (out or "").strip() or metadata.metadata_fallback(kind)
+    except Exception as exc:
+        log.info(f"[metadata] cheap task generation failed: {type(exc).__name__}: {exc}")
+        return metadata.metadata_fallback(kind)
 
 
 def _chunk(cid, model, *, role=None, content=None, reasoning=None, finish=None) -> str:
@@ -85,6 +119,34 @@ async def chat_completions(request: Request):
 
     owui_headers = {k: v for k, v in request_headers.items() if "openwebui" in k}
     log.info(f"[request] user={user_id} model={model} messages={len(messages)} owui_headers={owui_headers}")
+
+    metadata_kind = metadata.owui_metadata_task(messages) if _internal_model(model) else ""
+    if metadata_kind:
+        async with aiohttp.ClientSession() as session:
+            content = await _metadata_completion(messages, metadata_kind, session=session)
+        if want_stream:
+            async def metadata_stream():
+                yield _chunk(cid, model, role="assistant")
+                yield _chunk(cid, model, content=content)
+                yield _chunk(cid, model, finish="stop")
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(metadata_stream(), media_type="text/event-stream")
+        return JSONResponse(
+            {
+                "id": cid,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
 
     # The chat id is part of the key: identical text in a DIFFERENT chat must run fresh —
     # its side effects (deliverable store, memory) belong to that chat, and a cached
@@ -138,7 +200,8 @@ async def chat_completions(request: Request):
                         parts.append(text)
                         yield _chunk(cid, model, content=text)
                     elif kind == "reasoning":
-                        yield _chunk(cid, model, reasoning=text)
+                        if config.SHOW_REASONING_CONTENT:
+                            yield _chunk(cid, model, reasoning=text)
                 done_ok = True
                 yield _chunk(cid, model, finish="stop")
                 yield "data: [DONE]\n\n"

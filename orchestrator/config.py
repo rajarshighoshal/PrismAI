@@ -88,6 +88,13 @@ GROUNDED_MODEL = os.getenv("GROUNDED_MODEL", "accounts/fireworks/models/deepseek
 GROUNDING_GATE_MODEL = os.getenv("GROUNDING_GATE_MODEL", "accounts/fireworks/models/deepseek-v4-flash")
 # The auditor model lives in the tool-server (deepseek-v4-flash, thinking off).
 
+# OpenWebUI metadata tasks (chat title / tags) are tiny summarization jobs. They must
+# NOT enter the full PrismAI agent loop: no tools, no verifier, no memory writes, no
+# progress narration. Keep them on the cheap/fast flash model.
+TASK_MODEL = os.getenv("TASK_MODEL", GROUNDING_GATE_MODEL)
+TASK_MAX_TOKENS = int(os.getenv("TASK_MAX_TOKENS", "180"))
+TASK_TEMPERATURE = float(os.getenv("TASK_TEMPERATURE", "0.2"))
+
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
 
@@ -215,9 +222,13 @@ CHUNKED_MAX_SECTIONS = int(os.getenv("CHUNKED_MAX_SECTIONS", "20"))
 CHUNKED_PLAN_TTL_SECONDS = int(os.getenv("CHUNKED_PLAN_TTL_SECONDS", "86400"))
 CHUNKED_MAX_REVISES = int(os.getenv("CHUNKED_MAX_REVISES", "6"))
 
-# Show-your-work: stream tool-step narration ("Searching… Reading… Verifying…")
-# to the UI as reasoning_content so the chat visibly acts agentic, like claude.ai.
-SHOW_WORK = _flag("SHOW_WORK", "true")
+# Show-your-work: optional tool-step narration ("Searching… Reading… Verifying…").
+# Default OFF for ChatGPT-style UX: the user should see clean answers, not internal
+# thinking panels. Enable explicitly for debugging / Claude-like progress.
+SHOW_WORK = _flag("SHOW_WORK", "false")
+# Extra safety: even if internal code yields reasoning/progress events, do not forward
+# them to OpenWebUI's <details type="reasoning"> panel unless explicitly requested.
+SHOW_REASONING_CONTENT = _flag("SHOW_REASONING_CONTENT", "false")
 ENABLE_MODEL_PROGRESS = _flag("ENABLE_MODEL_PROGRESS", "true")
 PROGRESS_MODEL = os.getenv("PROGRESS_MODEL", GROUNDING_GATE_MODEL)
 
