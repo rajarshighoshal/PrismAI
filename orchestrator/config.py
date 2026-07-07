@@ -107,9 +107,14 @@ INTERACTION_MODE_CONTEXT_CHARS = int(os.getenv("INTERACTION_MODE_CONTEXT_CHARS",
 # Fail open fast; this classifier is UX polish, never worth delaying a turn.
 INTERACTION_MODE_TIMEOUT = float(os.getenv("INTERACTION_MODE_TIMEOUT", "2.5"))
 # Max extra time the MAIN turn will wait for the classifier once startup I/O is
-# done. Kept tiny on purpose: if the classifier isn't ready by now, the turn
-# proceeds without a persona note rather than stalling the user.
-INTERACTION_MODE_ONPATH_BUDGET = float(os.getenv("INTERACTION_MODE_ONPATH_BUDGET", "0.3"))
+# done, before proceeding WITHOUT a persona note. This is a balance: the persona
+# note is the feature's whole point, so the budget must be long enough for the
+# cheap flash classifier (~1s) to actually land on fast paths (e.g. a fresh chat
+# with no chat_id, where startup I/O returns almost instantly). It still fails
+# open if the provider stalls beyond this, so a turn is never held for the full
+# INTERACTION_MODE_TIMEOUT. On slower paths (real chat_id → deliverable/plan I/O)
+# the classifier overlaps startup work and this residual is rarely spent.
+INTERACTION_MODE_ONPATH_BUDGET = float(os.getenv("INTERACTION_MODE_ONPATH_BUDGET", "1.5"))
 
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
