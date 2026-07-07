@@ -1,6 +1,7 @@
 """Model-driven agent loop for the orchestrator."""
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, fugu_client, fugu_router
+from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, fugu_client, fugu_router, interaction_mode
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
     _owui_source_blocks, _user_source, _all_user_text,
@@ -310,6 +311,16 @@ def _track_task(task):
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return task
+
+
+async def _cancel_mode_task(task) -> None:
+    """Cancel the interaction-mode classifier when an early path handles the turn.
+    Awaits the cancellation so no dangling task/exception is left behind."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 def _clip_memory_part(text: str, limit: int) -> str:
@@ -1676,6 +1687,15 @@ async def run(
         image_transcript = ""
 
     # Phase 2: Startup I/O (parallel)
+    # Interaction mode is only UX polish. Start it alongside context I/O so it
+    # does not add a serial round trip to ordinary chat turns — this overlap is
+    # what lets the tiny on-path budget (below) catch the result on normal turns.
+    # Tradeoff (intentional): on plan/edit/Fugu early-return turns the call is
+    # started then cancelled, so a few cheap flash calls are wasted. That is
+    # observable via label=gate:interaction (traces + usage ledger) and fully
+    # disabled by ENABLE_INTERACTION_MODE=false. Starting later instead would
+    # make the note miss its budget and rarely fire on the common chat path.
+    mode_task = asyncio.create_task(interaction_mode.classify(messages, session=session))
     profile, prior_doc, gap_note, pending_plan = await _gather_context(user_id, chat_id, session)
 
     # Phase 3: Plan dispatch
@@ -1684,12 +1704,14 @@ async def run(
         handled = True
         yield kt
     if handled:
+        await _cancel_mode_task(mode_task)
         return
 
     # Phase 4: Edit dispatch
     edit_handled, edit_output, edit_baseline = await _dispatch_edit(
         messages, prior_doc, chat_id, req_headers, session, config.SHOW_WORK)
     if edit_handled:
+        await _cancel_mode_task(mode_task)
         yield ("content", edit_output)
         return
     edit_directive = edit_output  # when not handled, output is the directive
@@ -1710,11 +1732,30 @@ async def run(
             fugu_handled = True
             yield kt
         if fugu_handled:
+            await _cancel_mode_task(mode_task)
             return
         # Fugu failed silently — fall through to normal DeepSeek agent loop
 
     # Phase 5: System prompt + context budget
-    agent_extra = "\n\n".join(x for x in (gap_note, edit_directive) if x)
+    # Cheap style/persona adapter: helps the assistant behave like the right kind
+    # of helper for this turn (student tutor, practical tech support, creative
+    # brainstormer, etc.). It is deliberately style-only and does not affect
+    # source/tool/verification policy. It is pure UX polish, so it never delays
+    # the turn: consume it only if it is already done, otherwise allow a tiny
+    # residual budget and then drop it (fail open).
+    mode_note = ""
+    if mode_task.done():
+        with contextlib.suppress(Exception):
+            mode_note = mode_task.result() or ""
+    else:
+        try:
+            mode_note = await asyncio.wait_for(
+                asyncio.shield(mode_task), timeout=config.INTERACTION_MODE_ONPATH_BUDGET)
+            mode_note = mode_note or ""
+        except Exception:
+            mode_note = ""
+            await _cancel_mode_task(mode_task)
+    agent_extra = "\n\n".join(x for x in (gap_note, edit_directive, mode_note) if x)
     scratch, recall_context, messages_for_verify = await _build_system_prompt(
         messages, user_id, chat_id, profile, agent_extra, session)
 

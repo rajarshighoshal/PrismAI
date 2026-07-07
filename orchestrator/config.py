@@ -95,6 +95,22 @@ TASK_MODEL = os.getenv("TASK_MODEL", GROUNDING_GATE_MODEL)
 TASK_MAX_TOKENS = int(os.getenv("TASK_MAX_TOKENS", "180"))
 TASK_TEMPERATURE = float(os.getenv("TASK_TEMPERATURE", "0.2"))
 
+# Per-turn interaction-mode planner: cheap style/persona adaptation so PrismAI behaves
+# like the right kind of helper (student tutor, practical tech support, creative
+# brainstormer, coding debugger, grounded writer, etc.) without hard-coding use cases.
+# It is style-only and never overrides truth/source/tool/verification rules.
+ENABLE_INTERACTION_MODE = _flag("ENABLE_INTERACTION_MODE", "true")
+INTERACTION_MODE_MODEL = os.getenv("INTERACTION_MODE_MODEL", GROUNDING_GATE_MODEL)
+INTERACTION_MODE_MAX_TOKENS = int(os.getenv("INTERACTION_MODE_MAX_TOKENS", "300"))
+INTERACTION_MODE_TEMPERATURE = float(os.getenv("INTERACTION_MODE_TEMPERATURE", "0.0"))
+INTERACTION_MODE_CONTEXT_CHARS = int(os.getenv("INTERACTION_MODE_CONTEXT_CHARS", "4000"))
+# Fail open fast; this classifier is UX polish, never worth delaying a turn.
+INTERACTION_MODE_TIMEOUT = float(os.getenv("INTERACTION_MODE_TIMEOUT", "2.5"))
+# Max extra time the MAIN turn will wait for the classifier once startup I/O is
+# done. Kept tiny on purpose: if the classifier isn't ready by now, the turn
+# proceeds without a persona note rather than stalling the user.
+INTERACTION_MODE_ONPATH_BUDGET = float(os.getenv("INTERACTION_MODE_ONPATH_BUDGET", "0.3"))
+
 # Advertised model ids — what OWUI shows in this connection's model list.
 ADVERTISED_CHAT_ID = os.getenv("ADVERTISED_CHAT_ID", "PrismAI")
 
