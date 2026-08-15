@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, interaction_mode
+from . import config, escalation, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, interaction_mode
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
     _owui_source_blocks, _user_source, _all_user_text,
@@ -1550,6 +1550,26 @@ async def _agent_loop(
                 f"Internal verification gate blocked: {text}\n"
                 "Use tools to gather evidence or revise. Do not show the blocked draft.")})
             continue
+        # Repair budget exhausted — a genuine capability shortfall. Optionally escalate ONCE
+        # to a stronger model and re-verify (inert unless ESCALATION_MODEL is set; hardness-
+        # gated). Never fires on a first block or a transient error. Non-Fireworks targets
+        # no-op here until provider routing is added in Phase 2.
+        if not st.escalated and await escalation.should_escalate(
+                status, st.repair_steps, messages=messages, session=session):
+            st.escalated = True
+            if config.SHOW_WORK:
+                yield ("reasoning",
+                       f"🔼 Escalating to {config.ESCALATION_MODEL.split('/')[-1]} and re-verifying…\n")
+            regen = await _regenerate_with_user_model(scratch, config.ESCALATION_MODEL, source, session)
+            if regen and regen.strip():
+                esc_status, esc_text = await _verified_or_blocked(
+                    messages_for_verify, regen, source,
+                    recall_context=recall_context, prose=None, force=True, session=session)
+                if esc_status == "ok":
+                    yield ("content", esc_text)
+                    _persist_turn(chat_id, messages, esc_text, session)
+                    return
+                text = esc_text  # escalated draft still blocked — surface its (often clearer) message
         yield ("content", text)
         return
 

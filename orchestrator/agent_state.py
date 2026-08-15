@@ -36,3 +36,4 @@ class AgentState:
     # ── Delivery tracking ────────────────────────────────────────────
     streamed_live: bool = False       # was content already sent to user?
     filed_deliverable: bool = False   # does the file carry the deliverable body?
+    escalated: bool = False           # already tried a stronger-model escalation this turn?

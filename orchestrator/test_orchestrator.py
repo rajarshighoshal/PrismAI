@@ -1587,6 +1587,35 @@ async def _run_tests():
     check("ctx: vision model (kimi) is NOT in the binding set",
           config.VISION_MODEL not in config._BINDING_MODELS)
 
+    # ── Escalation gate (Fugu's replacement): hard AND repair-exhausted AND target set ──
+    from orchestrator import escalation, hardness
+    _esc_saved = (config.ESCALATION_MODEL, config.ESCALATION_HARDNESS_THRESHOLD,
+                  hardness.classify, hardness.obvious_candidate)
+    config.ESCALATION_HARDNESS_THRESHOLD = 0.65
+    hardness.obvious_candidate = lambda _m: False
+    async def _hard_classify(_m, *, session=None):
+        return {"benefits_from_escalation": True, "confidence": 0.9, "why": "structured"}
+    async def _soft_classify(_m, *, session=None):
+        return {"benefits_from_escalation": False, "confidence": 0.0, "why": "simple"}
+    _emsgs = [{"role": "user", "content": "write a competitive analysis of three firms"}]
+    _RB = config.GROUNDING_REPAIR_STEPS
+    config.ESCALATION_MODEL = ""
+    hardness.classify = _hard_classify
+    check("escalation: off by default (no target) never escalates",
+          (await escalation.should_escalate("unsupported_claims", _RB, messages=_emsgs)) is False)
+    config.ESCALATION_MODEL = "accounts/fireworks/models/strong-x"
+    check("escalation: never on a transient/non-capability status",
+          (await escalation.should_escalate("audit_unavailable", _RB, messages=_emsgs)) is False)
+    check("escalation: never before the repair budget is exhausted",
+          (await escalation.should_escalate("unsupported_claims", max(_RB - 1, 0), messages=_emsgs)) is False)
+    check("escalation: hard + exhausted + target -> escalate",
+          (await escalation.should_escalate("unsupported_claims", _RB, messages=_emsgs)) is True)
+    hardness.classify = _soft_classify
+    check("escalation: a not-hard task never escalates, even when exhausted",
+          (await escalation.should_escalate("unsupported_claims", _RB, messages=_emsgs)) is False)
+    (config.ESCALATION_MODEL, config.ESCALATION_HARDNESS_THRESHOLD,
+     hardness.classify, hardness.obvious_candidate) = _esc_saved
+
     # e2e fallback driving the REAL chat/stream with a fake HTTP session.
     _fakes = (fireworks.complete, fireworks.chat, fireworks.stream)
     fireworks.complete, fireworks.chat, fireworks.stream = _REAL_FW_COMPLETE, _REAL_FW_CHAT, _REAL_FW_STREAM

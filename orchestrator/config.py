@@ -227,6 +227,15 @@ GROUNDING_REPAIR_STEPS = int(os.getenv("GROUNDING_REPAIR_STEPS", "2"))
 MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "10"))
 MAX_WEB_SEARCHES_PER_TURN = int(os.getenv("MAX_WEB_SEARCHES_PER_TURN", "4"))
 
+# Escalation on a genuine capability shortfall: when the honesty verifier still blocks a
+# deliverable AFTER the repair budget is exhausted AND the task is genuinely hard/structured
+# (see hardness.py), re-solve ONCE with a stronger model and re-verify. OFF by default (empty
+# target) so today's behavior is unchanged — a block stays an honest block. The target model
+# is chosen in Phase 2 via the eval bake-off. Never fires on a first block or a transient
+# error (those retry/fall back within the same provider tier).
+ESCALATION_MODEL = os.getenv("ESCALATION_MODEL", "")
+ESCALATION_HARDNESS_THRESHOLD = float(os.getenv("ESCALATION_HARDNESS_THRESHOLD", "0.65"))
+
 # Chunked section-writer: a long/multi-section document (paper, thesis, report) is
 # OUTLINED -> approved -> written one section at a time -> assembled -> verified -> exported,
 # instead of emitted in one capped shot. Each section is its own focused generation (full
