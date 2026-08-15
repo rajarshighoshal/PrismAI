@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 
-from orchestrator import agent, config, dedup, fireworks, interaction_mode, metadata, pipeline, search, toolserver, verifier
+from orchestrator import agent, config, dedup, fireworks, interaction_mode, memory_client, metadata, pipeline, search, toolserver, verifier
 
 # Real Fireworks fns captured BEFORE the per-test monkeypatching, so the provider-chain
 # tests can drive the ACTUAL fallback logic (real chat/stream) with a fake HTTP session.
@@ -385,12 +385,12 @@ async def _run_tests():
     fireworks.stream = _fake_stream
     search.search = _fake_search
     toolserver.post = _fake_post
-    agent._deliverable_get = _fake_deliverable_get
-    agent._deliverable_store = _fake_deliverable_store
-    agent._last_active = _fake_last_active
-    agent._plan_get = _fake_plan_get
-    agent._plan_store = _fake_plan_store
-    agent._plan_clear = _fake_plan_clear
+    memory_client._deliverable_get = _fake_deliverable_get
+    memory_client._deliverable_store = _fake_deliverable_store
+    memory_client._last_active = _fake_last_active
+    memory_client._plan_get = _fake_plan_get
+    memory_client._plan_store = _fake_plan_store
+    memory_client._plan_clear = _fake_plan_clear
     toolserver.verify_grounding = _fake_verify
     config.ENABLE_VERIFICATION = True
     config.ENABLE_GROUNDING_GATE = True
@@ -1404,8 +1404,8 @@ async def _run_tests():
     # verifier, a correctly recalled fact looks invented and gets stripped, so the
     # positive assertion FAILS — which is exactly the memory-vs-verifier bug.
     _SENTINELS = ["Helios", "March 3rd", "$5 million", "$9,000"]
-    _orig_fact, _orig_recall = verifier._fact_audit, agent._memory_recall
-    _orig_store = agent._memory_store
+    _orig_fact, _orig_recall = verifier._fact_audit, memory_client._memory_recall
+    _orig_store = memory_client._memory_store
     _audit_inputs = []  # every request+source the unified verifier actually receives
 
     async def _realistic_fact(full_request, source, candidate, *, session=None, raw_source=None):
@@ -1424,8 +1424,8 @@ async def _run_tests():
         return True
 
     verifier._fact_audit = _realistic_fact
-    agent._memory_recall = _fake_recall
-    agent._memory_store = _noop_store
+    memory_client._memory_recall = _fake_recall
+    memory_client._memory_store = _noop_store
 
     # Size filler to the configured budget so the test triggers overflow no matter
     # what the threshold is set to (~1.3x budget per block -> history >> budget).
@@ -1510,8 +1510,8 @@ async def _run_tests():
     )
     check("memory/normal: no recall on a short chat (native history used)", _recall_calls == [])
 
-    verifier._fact_audit, agent._memory_recall = _orig_fact, _orig_recall
-    agent._memory_store = _orig_store
+    verifier._fact_audit, memory_client._memory_recall = _orig_fact, _orig_recall
+    memory_client._memory_store = _orig_store
 
     # ---- Request de-duplication (idempotency on retries) -----------------------
     dedup._results.clear(); dedup._inflight.clear()

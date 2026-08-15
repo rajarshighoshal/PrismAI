@@ -13,10 +13,7 @@ from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images,
     _owui_source_blocks, _user_source, _all_user_text,
 )
-from .memory_client import (
-    _memory_recall, _memory_store, _deliverable_store, _deliverable_get, _last_active,
-    _plan_store, _plan_get, _plan_clear,
-)
+from . import memory_client
 from .timectx import _now_line, _gap_note
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers, _fit_audit_source
 from .prompts import (
@@ -123,7 +120,7 @@ async def _repackage_deliverable(content: str, filename: str, fmt: str, *, chat_
         return ""
     fn, url = dl
     if chat_id:
-        _track_task(asyncio.create_task(_deliverable_store(chat_id, content, filename or fn, fmt)))
+        _track_task(asyncio.create_task(memory_client._deliverable_store(chat_id, content, filename or fn, fmt)))
     return f"\n\n📎 [Download {fn}]({url})"
 
 
@@ -238,9 +235,9 @@ def _persist_turn(chat_id: str, messages: list[dict], assistant_text: str, sessi
         return
     um = _consolidated_user_memory(messages)
     if um:
-        _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
+        _track_task(asyncio.create_task(memory_client._memory_store(chat_id, "user", um, session)))
     if assistant_text:
-        _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", assistant_text, session)))
+        _track_task(asyncio.create_task(memory_client._memory_store(chat_id, "assistant", assistant_text, session)))
 
 
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
@@ -365,7 +362,7 @@ async def _export_final(pending, final_text, prose, messages, source, *, chat_id
         # (not a reconstruction). Fire-and-forget; never blocks the response.
         if chat_id and md.strip():
             fmt = "docx" if "docx" in exp["tool"] else "pdf" if "pdf" in exp["tool"] else "md"
-            _track_task(asyncio.create_task(_deliverable_store(chat_id, md, exp["filename"], fmt)))
+            _track_task(asyncio.create_task(memory_client._deliverable_store(chat_id, md, exp["filename"], fmt)))
     links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
     return links, filed_deliverable
 
@@ -655,7 +652,7 @@ async def _present_outline(request: str, source: str, *, chat_id: str, filename:
     plan["created_at"] = time.time()       # TTL anchor so a never-approved plan expires
     plan["revise_count"] = revise_count
     if chat_id:
-        await _plan_store(chat_id, plan)   # awaited: the NEXT turn reads this
+        await memory_client._plan_store(chat_id, plan)   # awaited: the NEXT turn reads this
     yield ("content", _render_outline(plan, revised=revised))
 
 
@@ -718,10 +715,10 @@ async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, hea
     if chat_id and not link:
         # Export failed AFTER the doc verified — don't lose the verified bytes: store them as
         # the deliverable so a 'export it as docx' (reformat path) recovers the file, no rebuild.
-        await _deliverable_store(chat_id, full_doc, filename, fmt)
+        await memory_client._deliverable_store(chat_id, full_doc, filename, fmt)
     if chat_id:
-        await _plan_clear(chat_id)
-        _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", full_doc[:4000], session)))
+        await memory_client._plan_clear(chat_id)
+        _track_task(asyncio.create_task(memory_client._memory_store(chat_id, "assistant", full_doc[:4000], session)))
     words = len(_WORD_RE.findall(full_doc))
     if link:
         yield ("content", f"\n\n📄 **{title}** is ready — {len(assembled)} sections, {words:,} words. "
@@ -746,10 +743,10 @@ async def _gather_context(user_id, chat_id, session):
     profile, prior, active, plan = "", None, None, None
     tasks = [asyncio.ensure_future(style.get_style_profile(user_id))]
     if chat_id:
-        tasks.append(asyncio.ensure_future(_deliverable_get(chat_id)))
-        tasks.append(asyncio.ensure_future(_last_active(chat_id)))
+        tasks.append(asyncio.ensure_future(memory_client._deliverable_get(chat_id)))
+        tasks.append(asyncio.ensure_future(memory_client._last_active(chat_id)))
         if config.ENABLE_CHUNKED_WRITER:
-            tasks.append(asyncio.ensure_future(_plan_get(chat_id)))
+            tasks.append(asyncio.ensure_future(memory_client._plan_get(chat_id)))
     results = await asyncio.gather(*tasks)
     profile = results[0]
     idx = 1
@@ -769,7 +766,7 @@ async def _dispatch_plan(messages, plan, chat_id, req_headers, session):
     age = (time.time() - created) if created else 0
     revises = int(plan.get("revise_count") or 0)
     if age > config.CHUNKED_PLAN_TTL_SECONDS or revises > config.CHUNKED_MAX_REVISES:
-        await _plan_clear(chat_id)
+        await memory_client._plan_clear(chat_id)
         return
     intent = await _classify_plan_intent(_last_user_text(messages), plan, session=session)
     if intent["action"] == "approve":
@@ -790,7 +787,7 @@ async def _dispatch_plan(messages, plan, chat_id, req_headers, session):
             yield ("content", _render_outline(plan)
                    + "\n\n*(Say \"write it\" to build, name a change, or \"never mind\" to drop it.)*")
         return
-    await _plan_clear(chat_id)
+    await memory_client._plan_clear(chat_id)
 
 
 async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_work):
@@ -894,7 +891,7 @@ async def _build_system_prompt(messages, user_id, chat_id, profile, extra, sessi
     )[:2000]
     user_lines, asst_lines, seen = [], [], set()
     if recall_query.strip():
-        for role, content in await _memory_recall(chat_id, recall_query, session):
+        for role, content in await memory_client._memory_recall(chat_id, recall_query, session):
             c = _norm_turn(content)[:500]
             if not c or c in recent_norm or c in seen:
                 continue
