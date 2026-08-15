@@ -340,6 +340,19 @@ def _consolidated_user_memory(messages) -> str:
     return _clip_memory_part(last_user, 3000)
 
 
+def _persist_turn(chat_id: str, messages: list[dict], assistant_text: str, session) -> None:
+    """Persist one turn to chat memory: the consolidated user message + the assistant
+    answer, fire-and-forget. Single home for what was duplicated across the plain-chat,
+    edit, and agent-loop success paths (no-op without a chat_id)."""
+    if not chat_id:
+        return
+    um = _consolidated_user_memory(messages)
+    if um:
+        _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
+    if assistant_text:
+        _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", assistant_text, session)))
+
+
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
     system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY + "\n\n" + _now_line()
     if profile:
@@ -1176,11 +1189,7 @@ async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_wo
         summary = await _summarize_correction(baseline, text, session=session)
         output = ("📄 Updated — download below." + (("\n\n" + summary) if summary else "") + link) if link \
                  else "I couldn't rebuild the file — want me to try again?"
-        if chat_id:
-            um = _consolidated_user_memory(messages)
-            if um:
-                _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
-            _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", text, session)))
+        _persist_turn(chat_id, messages, text, session)
         return True, output, ""
     # Fell through — inject prior doc as context for normal agent loop
     return False, _edit_inject(prior), baseline
@@ -1260,11 +1269,8 @@ async def _try_plain_chat(messages, scratch, user_source, chat_id, session, is_u
             streamed.append(tok)
         yield (kind, tok)
     answer = "".join(streamed).strip()
-    if answer and chat_id:
-        um = _consolidated_user_memory(messages)
-        if um:
-            _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
-        _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", answer, session)))
+    if answer:
+        _persist_turn(chat_id, messages, answer, session)
 
 
 async def _try_longdoc(messages, user_source, chat_id, session, is_user_model, edit_baseline):
@@ -1532,11 +1538,7 @@ async def _agent_loop(
                 final_text = text + links_str
                 yield ("content", final_text)
 
-            if chat_id:
-                um = _consolidated_user_memory(messages)
-                if um:
-                    _track_task(asyncio.create_task(_memory_store(chat_id, "user", um, session)))
-                _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", final_text, session)))
+            _persist_turn(chat_id, messages, final_text, session)
             return
 
         if streamed_live:
@@ -1557,8 +1559,6 @@ async def _agent_loop(
 # ═══════════════════════════════════════════════════════════════════════════
 # run() — thin phase orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
-
-  # the block message
 
 
 async def run(
