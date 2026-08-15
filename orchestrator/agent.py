@@ -8,7 +8,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from . import config, escalation, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, interaction_mode
+from . import config, escalation, fireworks, prompt_security, search, style, toolserver, interaction_mode
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images,
     _owui_source_blocks, _user_source, _all_user_text,
@@ -21,13 +21,14 @@ from .timectx import _now_line, _gap_note
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers, _fit_audit_source
 from .prompts import (
     TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
-    SYSTEM_TOOL_GUARD, SYSTEM_VOICE_REGISTER,
+    SYSTEM_TOOL_GUARD,
     SYSTEM_LONGDOC_GATE, SYSTEM_OUTLINE, SYSTEM_PLAN_INTENT, SYSTEM_SECTION_WRITER,
-    _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS,
 )
 # Vision phase lives in its own module now; re-exported names keep agent.run() and the
 # existing tests (agent._VISION_CACHE, agent._split_vision_output) working unchanged.
 from .vision import _read_images, _split_vision_output, _VISION_CACHE  # noqa: F401
+# Prose polish + voice pass live in their own module; imported for use in the agent loop.
+from .prose import _prose_provider, _prose_polish_messages, _classify_voice_register, _voice_pass  # noqa: F401
 
 log = logging.getLogger(__name__)
 
@@ -537,74 +538,6 @@ async def _request_needs_work(messages, *, session=None) -> bool:
         return bool(json.loads(match.group(0) if match else raw).get("needs_work", True))
     except Exception:
         return True
-
-
-def _prose_provider(voice):
-    """Map the agent-chosen polish voice to (client, model), honoring availability
-    with graceful fallback. None if no provider is usable (stay on the open draft)."""
-    if voice == "gpt-5.5" and openai_client.available():
-        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
-    if voice == "opus" and anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if voice == "sonnet" and anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_STANDARD_MODEL
-    # requested provider unavailable — fall back to any usable prose model
-    if anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if openai_client.available():
-        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
-    if gemini.available():
-        return gemini, config.GEMINI_PROSE_MODEL
-    return None
-
-
-def _prose_polish_messages(messages, candidate, source):
-    """Build the polish request: the user's ask + (optional) source as untrusted
-    reference + the open model's draft to rewrite. No tool-role messages /
-    tool_calls (OpenAI-compat endpoints, esp. Gemini, choke on those)."""
-    user_req = _all_user_text(messages)
-    parts = [f"USER REQUEST:\n{user_req}"]
-    if source.strip():
-        parts.append(prompt_security.wrap_untrusted("gathered source material", source[:12000]))
-    parts.append(f"DRAFT TO POLISH:\n{candidate}")
-    # The polisher gets today's date too — without it, gpt-5.5 letterheads a formal
-    # document with a "[Date]" placeholder (it can't know the date, so it blanks it).
-    return [
-        {"role": "system", "content": _PROSE_POLISH_SYS + "\n\n" + _now_line()},
-        {"role": "user", "content": "\n\n".join(parts)},
-    ]
-
-
-async def _classify_voice_register(request, candidate, *, session=None) -> str:
-    """Pick the voice-pass register (warm/formal/none) for an exported deliverable from the document itself."""
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_VOICE_REGISTER},
-             {"role": "user", "content": f"REQUEST:\n{request[:1500]}\n\nDELIVERABLE (excerpt):\n{candidate[:1500]}"}],
-            config.GROUNDING_GATE_MODEL, max_tokens=30, temperature=0.0,
-            session=session, label="gate:voice")
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        reg = str(json.loads(m.group(0) if m else raw).get("register", "none")).lower()
-        return reg if reg in ("warm", "formal") else "none"
-    except Exception:
-        return "none"
-
-
-async def _voice_pass(candidate, register, *, session=None):
-    """Optional sonnet voice-only pass at a register (warm/formal). Never alters facts."""
-    if not anthropic_client.available():
-        return candidate
-    sys = _VOICE_PASS_SYS.replace("{register}", _VOICE_REGISTER.get(register, _VOICE_REGISTER["formal"]))
-    try:
-        out = await anthropic_client.complete(
-            [{"role": "system", "content": sys}, {"role": "user", "content": f"DRAFT:\n{candidate}"}],
-            config.ANTHROPIC_STANDARD_MODEL,
-            max_tokens=config.AGENT_MAX_TOKENS, temperature=config.WRITER_TEMPERATURE, session=session,
-            label="voice")
-        return out.strip() if (out and out.strip()) else candidate
-    except Exception as e:
-        log.warning(f"[voice_pass] {register} failed, keeping draft: {e}")
-        return candidate
 
 
 def _is_clarification(text: str) -> bool:
