@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, AsyncGenerator, Optional
 
-from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, fugu_client, fugu_router, interaction_mode
+from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security, search, style, toolserver, interaction_mode
 from .owui import (
     _text_of, _unwrap_owui, _last_user_text, _has_images, _split_content_parts,
     _owui_source_blocks, _user_source, _all_user_text,
@@ -1539,41 +1539,6 @@ async def _agent_loop(
                 _track_task(asyncio.create_task(_memory_store(chat_id, "assistant", final_text, session)))
             return
 
-        # Blocked by verifier — try Fugu escalation before repair/block.
-        if (status == "unsupported_claims"
-                and await fugu_router.should_escalate(status, st.repair_steps, session=session)
-                and not st.fugu_escalated):
-            st.fugu_escalated = True
-            log.info("[fugu-escalation] DeepSeek blocked with unsupported claims — trying Fugu")
-            if config.SHOW_WORK:
-                yield ("reasoning", "🔄 Trying Fugu multi-model system…\n")
-            escalate_source = _combined_source(user_source, st.tool_sources)
-            try:
-                fugu_answer = await fugu_client.answer(
-                    messages_for_verify, escalate_source,
-                    session=session, ultra=True)
-                if fugu_answer and fugu_answer.strip():
-                    fugu_status, fugu_text = await _verified_or_blocked(
-                        messages_for_verify, fugu_answer, escalate_source,
-                        recall_context=recall_context, prose=None,
-                        force=True, session=session)
-                    if fugu_status == "ok":
-                        yield ("content", fugu_text)
-                        if chat_id:
-                            um = _consolidated_user_memory(messages)
-                            if um:
-                                _track_task(asyncio.create_task(
-                                    _memory_store(chat_id, "user", um, session)))
-                            _track_task(asyncio.create_task(
-                                _memory_store(chat_id, "assistant", fugu_text.strip(), session)))
-                        return
-                    log.info("[fugu-escalation] Fugu also blocked — falling through to normal handling")
-                    text = fugu_text  # show the Fugu block message, which may be more helpful
-                else:
-                    log.info("[fugu-escalation] Fugu returned empty — falling through")
-            except Exception as e:
-                log.warning(f"[fugu-escalation] Fugu call failed: {e}")
-
         if streamed_live:
             yield ("content", "\n\n---\n\n⚠️ " + text)
             return
@@ -1593,71 +1558,7 @@ async def _agent_loop(
 # run() — thin phase orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def _fugu_run(
-    messages: list[dict],
-    image_transcript: str,
-    edit_baseline: str,
-    chat_id: str,
-    request_headers: dict,
-    session,
-    show_work: bool,
-) -> AsyncGenerator[tuple[str, str], None]:
-    """Fugu path: skip the agent loop entirely. Fugu's learned TRINITY coordinator
-    handles tool use, decomposition, and multi-model reasoning internally. We still
-    verify the output — Fugu has no honesty auditor, so our verifier is the gate."""
-    source = _build_source(messages, image_transcript, edit_baseline)
-
-    if show_work:
-        yield ("reasoning", "🧭 Routing to Fugu multi-model orchestrator…\n")
-
-    # Run Fugu as a task and heartbeat while it orchestrates (often minutes): keeps OWUI's
-    # connection alive past its idle timeout and shows the user progress instead of a blank
-    # screen. We deliberately do NOT stream Fugu's raw tokens — the answer must clear the
-    # honesty gate below before the user sees a word — so the heartbeats are progress, not
-    # unverified content. shield() keeps the in-flight orchestra alive across each tick.
-    fugu_task = asyncio.create_task(
-        fugu_client.answer(messages, source, session=session, ultra=True))
-    t0 = time.monotonic()
-    candidate = ""
-    while True:
-        try:
-            candidate = await asyncio.wait_for(asyncio.shield(fugu_task), timeout=15)
-            break
-        except asyncio.TimeoutError:
-            if show_work:
-                yield ("reasoning", f"🐡 Fugu still orchestrating… {int(time.monotonic() - t0)}s\n")
-            continue
-        except Exception:
-            log.exception("[fugu] call failed — falling back to DeepSeek")
-            return  # silent fallback — caller proceeds to normal agent loop
-
-    if not (candidate and candidate.strip()):
-        log.info("[fugu] empty response — falling back to DeepSeek")
-        return
-
-    # Still verify — Fugu's output passes through our honesty gate just like any
-    # other model's. The verifier checks against the user's sources + statements.
-    if show_work:
-        yield ("reasoning", "✍️ Verifying Fugu's answer…\n")
-
-    status, text = await _verified_or_blocked(
-        messages, candidate, source,
-        recall_context="",
-        prose=None,
-        force=True,  # always verify Fugu — no classifier gate
-        session=session)
-
-    if status == "ok":
-        yield ("content", text)
-        if chat_id:
-            um = _consolidated_user_memory(messages)
-            if um:
-                _track_task(asyncio.create_task(
-                    _memory_store(chat_id, "user", um, session)))
-            _track_task(asyncio.create_task(
-                _memory_store(chat_id, "assistant", text.strip(), session)))
-    else:
-        yield ("content", text)  # the block message
+  # the block message
 
 
 async def run(
@@ -1690,7 +1591,7 @@ async def run(
     # Interaction mode is only UX polish. Start it alongside context I/O so it
     # does not add a serial round trip to ordinary chat turns — this overlap is
     # what lets the tiny on-path budget (below) catch the result on normal turns.
-    # Tradeoff (intentional): on plan/edit/Fugu early-return turns the call is
+    # Tradeoff (intentional): on plan/edit early-return turns the call is
     # started then cancelled, so a few cheap flash calls are wasted. That is
     # observable via label=gate:interaction (traces + usage ledger) and fully
     # disabled by ENABLE_INTERACTION_MODE=false. Starting later instead would
@@ -1715,26 +1616,6 @@ async def run(
         yield ("content", edit_output)
         return
     edit_directive = edit_output  # when not handled, output is the directive
-
-    # Phase 4.5: Fugu multi-model routing
-    # Decide whether this task should use Fugu's learned multi-model coordinator
-    # instead of the single-model DeepSeek agent loop. Fugu handles tool use and
-    # decomposition internally — we skip the agent loop entirely when routed.
-    # On failure (dead tunnel, 403, timeout), silently falls back to DeepSeek.
-    fugu_route = await fugu_router.decide(
-        messages, is_edit=bool(edit_baseline),
-        is_user_model=is_user_model, session=session)
-    if fugu_route == "fugu":
-        fugu_handled = False
-        async for kt in _fugu_run(messages, image_transcript, edit_baseline,
-                                    chat_id, req_headers, session,
-                                    config.SHOW_WORK):
-            fugu_handled = True
-            yield kt
-        if fugu_handled:
-            await _cancel_mode_task(mode_task)
-            return
-        # Fugu failed silently — fall through to normal DeepSeek agent loop
 
     # Phase 5: System prompt + context budget
     # Cheap style/persona adapter: helps the assistant behave like the right kind

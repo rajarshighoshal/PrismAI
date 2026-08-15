@@ -256,7 +256,6 @@ async def ops_status_api(request: Request) -> dict:
         "backup": backup,
         "disk": disk,
         "price_file": price_file,
-        "fugu_policy": "production should keep ENABLE_FUGU=false until official EU/GDPR endpoint",
     }
 
 

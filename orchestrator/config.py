@@ -1,7 +1,5 @@
 """Orchestrator configuration — all env-driven, with defaults mirroring the router_fn behavior."""
-import ipaddress
 import os
-from urllib.parse import urlparse
 
 
 def _flag(name: str, default: str = "true") -> bool:
@@ -392,49 +390,6 @@ ENABLE_GROUNDED_VERIFY = _flag("ENABLE_GROUNDED_VERIFY", "false")
 # Where the spend panel lives (the tool-server's /usage page). Set the real
 # browser-reachable URL in orchestrator.env; shows on the OWUI model card.
 USAGE_PANEL_URL = os.getenv("USAGE_PANEL_URL", "http://localhost:8001/usage")
-
-# --- Sakana Fugu integration (multi-model orchestrator backend) ---
-# Fugu is a learned multi-model coordinator (ICLR 2026: TRINITY + Conductor) that
-# assigns Thinker/Worker/Verifier roles to a pool of frontier LLMs. Use it as an
-# ALTERNATIVE to DeepSeek for hard tasks, NOT a replacement — the verifier still
-# checks every Fugu output before the user sees it.
-# Ref: https://sakana.ai/fugu/
-FUGU_API_KEY = os.getenv("FUGU_API_KEY", "")
-# IMPORTANT: the base URL is NOT a public constant. Get yours from:
-#   https://console.sakana.ai  →  API → copy the base URL
-# The default below is a placeholder and WILL fail with 403.
-FUGU_BASE_URL = os.getenv("FUGU_BASE_URL", "https://api.sakana.ai/v1")
-ENABLE_FUGU = _flag("ENABLE_FUGU", "false")     # inert until key + env set
-ALLOW_FUGU_TEST_RELAY = _flag("ALLOW_FUGU_TEST_RELAY", "false")
-FUGU_MODEL = os.getenv("FUGU_MODEL", "fugu-ultra")  # "fugu" or "fugu-ultra" (console-confirmed names)
-FUGU_TIMEOUT = float(os.getenv("FUGU_TIMEOUT", "300"))  # multi-model orchestration is slow
-# Auto-escalate to Fugu when the verifier blocks a DeepSeek answer with unsupported
-# claims — gives the committee a chance on genuinely hard tasks instead of blocking.
-FUGU_ESCALATE_ON_BLOCK = _flag("FUGU_ESCALATE_ON_BLOCK", "false")
-# Hardness threshold: how confident the classifier must be to route to Fugu upfront
-# (pre-emptively, before DeepSeek even runs). Higher = fewer Fugu calls, lower cost.
-FUGU_HARDNESS_THRESHOLD = float(os.getenv("FUGU_HARDNESS_THRESHOLD", "0.65"))
-
-
-def _private_or_test_relay_url(url: str) -> bool:
-    raw = (url or "").strip()
-    parsed = urlparse(raw if "://" in raw else "http://" + raw)
-    host = (parsed.hostname or raw.split("/", 1)[0]).lower().strip("[]")
-    if host in {"localhost", "host.docker.internal", "docker.for.mac.localhost"}:
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
-    except ValueError:
-        return False
-
-
-if ENABLE_FUGU and _private_or_test_relay_url(FUGU_BASE_URL) and not ALLOW_FUGU_TEST_RELAY:
-    raise RuntimeError(
-        "Refusing to enable Fugu through a private/test relay URL. Use an official "
-        "Sakana endpoint, or set ALLOW_FUGU_TEST_RELAY=true only for short-lived manual tests."
-    )
-
 
 # Instruction adherence / output quality gates. These are separate from the honesty
 # verifier: honesty checks truth; this checks whether the draft followed the user's ask.

@@ -1,22 +1,5 @@
 # PrismAI server ops notes
 
-## Production Fugu policy
-
-Keep `ENABLE_FUGU=false` in production until Sakana has an explicit EU/GDPR-supported
-path for this account.
-
-The previous `FUGU_BASE_URL=http://172.18.0.1:8080/v1` setup depended on a laptop
-SSH reverse tunnel into the EU server. It was useful for testing, but it is fragile
-and should not be a production dependency:
-
-- if the laptop, network, or SSH session drops, Fugu drops;
-- the listener is owned by `sshd`, not by a supervised service;
-- the relay may be interpreted as avoiding the provider's regional controls.
-
-If Fugu is re-enabled later, prefer an official Sakana EU/GDPR endpoint. If a relay
-is used for testing, make it temporary and keep PrismAI's honesty verifier enabled
-on every Fugu response.
-
 ## R2 backups
 
 `backup-r2.sh` is committed because it contains no secrets. It reads credentials from
