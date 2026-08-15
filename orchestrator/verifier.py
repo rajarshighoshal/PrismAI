@@ -7,15 +7,17 @@ from . import config, fireworks
 from .owui import _SOURCE_BLOCK_RE, _all_user_text, _last_user_text
 from .timectx import _now_line
 from .prompts import SYSTEM_FACT_AUDIT, SYSTEM_GATE, SYSTEM_CHANGE_SUMMARY
+from .core.verifier import (
+    WORD_RE as _WORD_RE,
+    AUDIT_ERROR as _AUDIT_ERROR,
+    AuditUnavailable as _AuditUnavailable,
+    has_citation_markers as _has_citation_markers,
+    norm_token_str as _norm_token_str,
+    claim_verbatim_in_source as _claim_verbatim_in_source,
+    fit_audit_source as _fit_audit_source,
+)
 
 log = logging.getLogger(__name__)
-
-
-def _has_citation_markers(text: str) -> bool:
-    return bool(
-        re.search(r"\[[1-9][0-9]*\]", text or "")
-        or re.search(r"(?im)^\s*(?:sources?|references?)\s*:", text or "")
-    )
 
 
 async def _needs_verification(messages, candidate: str, source: str, *, session=None) -> bool:
@@ -96,54 +98,6 @@ _REWRITE_DIRECTIVE = (
 
 def _edit_directive(rewrite: bool) -> str:
     return _REWRITE_DIRECTIVE if rewrite else _SURGICAL_DIRECTIVE
-
-
-_WORD_RE = re.compile(r"[a-z0-9]+")
-
-
-def _norm_token_str(text) -> str:
-    """Lowercase, reduce to [a-z0-9] tokens joined by single spaces and wrapped in
-    spaces, so a substring test matches only on whole-token boundaries."""
-    return " " + " ".join(_WORD_RE.findall(str(text).lower())) + " "
-
-
-def _claim_verbatim_in_source(phrase, source_norm: str) -> bool:
-    """True ONLY when a flagged phrase appears near-verbatim and contiguous in the source — a deterministic backstop for false-positive flags. Never rescues semantic inflations."""
-    toks = _WORD_RE.findall(str(phrase).lower())
-    if len(toks) < 2:  # too short for a reliable verbatim match — defer to the auditor
-        return False
-    return (" " + " ".join(toks) + " ") in source_norm
-
-
-def _fit_audit_source(source: str, draft: str, budget: int) -> str:
-    """Fit `source` into `budget` chars by relevance to the draft, not head-truncation — head-truncation was the bug where a long prefix pushed critical content past the cut."""
-    source = source.strip()
-    if len(source) <= budget:
-        return source
-    draft_words = set(_WORD_RE.findall(draft.lower()))
-    paras = [p for p in re.split(r"\n\s*\n", source) if p.strip()]
-    scored = [
-        (i, len(draft_words & set(_WORD_RE.findall(p.lower()))), p)
-        for i, p in enumerate(paras)
-    ]
-    kept, used = [], 0
-    for i, _score, p in sorted(scored, key=lambda t: t[1], reverse=True):
-        if used + len(p) > budget:
-            continue
-        kept.append((i, p))
-        used += len(p) + 2
-    kept.sort()
-    return "\n\n".join(p for _i, p in kept) or source[:budget]
-
-
-# The auditor could NOT return a usable verdict (call failed / empty / unparseable /
-# truncated). This is NOT 'clean' — the can't-lie layer FAILS CLOSED on it.
-_AUDIT_ERROR = "ERROR"
-
-
-class _AuditUnavailable(Exception):
-    """Raised when the honesty auditor can't produce a usable verdict, so the draft must
-    not be certified. The verify flow catches it and blocks (fail closed)."""
 
 
 async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
