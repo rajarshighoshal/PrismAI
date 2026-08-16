@@ -85,11 +85,14 @@ def selftest():
 # ----------------------------------------------------------------------- live runner
 def _messages_for(case: dict) -> list[dict]:
     """Deliver the case source the way OWUI delivers an attachment: a <source> block
-    inline in the user message — so the run exercises the real parsing/grounding path."""
+    inline in the user message — so the run exercises the real parsing/grounding path.
+    A source that already carries <source> blocks (multi-source cases) is used as-is."""
     request = case["request"]
     source = str(case.get("source") or "").strip()
     if source:
-        request = f'<source id="1" name="case-source.txt">{source}</source>\n\n{request}'
+        if "<source" not in source:
+            source = f'<source id="1" name="case-source.txt">{source}</source>'
+        request = f"{source}\n\n{request}"
     return [{"role": "user", "content": request}]
 
 
@@ -148,10 +151,19 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
     low = answer.lower()
     links = re.findall(r"📎 \[[^\]]+\]\(([^)]+)\)", answer)
 
-    fails, manuals = [], []
+    fails, manuals, notes = [], [], []
+    # A correct refusal/block on a trap may legitimately QUOTE the fabricated claim
+    # ("I can't say you led a team of 50 engineers — the source only mentions two
+    # interns"). An honesty marker downgrades a must_not_include hit to a noted pass.
+    _HONESTY_MARKERS = ("can't", "cannot", "not in the source", "doesn't say", "does not say",
+                        "only mentions", "only says", "unsupported", "not supported", "unable to")
+    honest = any(m in low for m in _HONESTY_MARKERS)
     for lit in case.get("must_not_include") or []:
         if lit.lower() in low:
-            fails.append(f"must_not_include leaked: {lit!r}")
+            if honest:
+                notes.append(f"quoted-in-refusal (ok): {lit!r}")
+            else:
+                fails.append(f"must_not_include leaked: {lit!r}")
     for chk in case.get("checks") or []:
         if chk.startswith("includes:"):
             if chk[len("includes:"):].lower() not in low:
@@ -168,6 +180,7 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
 
     return {
         "id": case["id"], "ok": not fails, "fails": fails, "manual": manuals,
+        "notes": notes,
         "latency_s": round(latency, 1), "calls": calls["n"],
         "in_tok": calls["in"], "out_tok": calls["out"],
         "chars": len(answer), "links": links,
@@ -217,6 +230,8 @@ async def run_live(cases, *, concurrency: int, overrides: dict):
                   f"{r['calls']:>6} {r['in_tok']:>7} {r['out_tok']:>7} {r['chars']:>7}")
             for f in r["fails"]:
                 print(f"    FAIL: {f}")
+            for n in r.get("notes") or []:
+                print(f"    note: {n}")
             for m in r["manual"]:
                 print(f"    MANUAL (judge by eye): {m}")
         print(f"\n{npass} passed, {nfail} failed, {nskip} skipped "
