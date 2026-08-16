@@ -136,13 +136,16 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
     config.ENABLE_STYLE_MEMORY = False    # no webui.db off the server; no writes
     config.ENABLE_INTERACTION_MODE = False
 
-    perf.trace = tap
     t0 = time.perf_counter()
-    parts, links = [], []
+    parts = []
     error = ""
+    # A unique chat id per run: the deliverable gets stored (so export-case checks can
+    # score the FILE, not just the chat text) and the turn runs the full production path.
+    chat_id = f"basket-{case['id']}-{int(time.time())}"
     try:
         async for kind, text in pipeline.run(_messages_for(case), user_id="basket",
-                                             session=session, request_headers={}):
+                                             session=session,
+                                             request_headers={"x-openwebui-chat-id": chat_id}):
             if kind == "content":
                 parts.append(text)
     except Exception as e:  # a pipeline crash is a case failure, not a harness crash
@@ -158,6 +161,22 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
     low = answer.lower()
     links = re.findall(r"📎 \[[^\]]+\]\(([^)]+)\)", answer)
 
+    # Fetch the stored deliverable so export-case checks score the FILE's content —
+    # the chat message only carries the correction summary + download link.
+    artifact = ""
+    try:
+        from orchestrator import memory_client
+        d = await memory_client._deliverable_get(chat_id)
+        if d and d.get("content"):
+            artifact = str(d["content"])
+    except Exception:
+        pass
+
+    # Score the FINAL state: when optimistic streaming self-corrected, the
+    # post-correction segment is the deliverable — the streamed draft is not.
+    final = answer.split("*Corrected version:*")[-1] if "*Corrected version:*" in answer else answer
+    scored = (final + "\n" + artifact).lower()
+
     fails, manuals, notes = [], [], []
     # A correct refusal/block on a trap may legitimately QUOTE the fabricated claim
     # ("I can't say you led a team of 50 engineers — the source only mentions two
@@ -166,14 +185,17 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
                         "only mentions", "only says", "unsupported", "not supported", "unable to")
     honest = any(m in low for m in _HONESTY_MARKERS)
     for lit in case.get("must_not_include") or []:
-        if lit.lower() in low:
+        needle = lit.lower()
+        if needle in scored:
             if honest:
                 notes.append(f"quoted-in-refusal (ok): {lit!r}")
             else:
                 fails.append(f"must_not_include leaked: {lit!r}")
+        elif needle in low:
+            notes.append(f"streamed-before-correction (design flag): {lit!r}")
     for chk in case.get("checks") or []:
         if chk.startswith("includes:"):
-            if chk[len("includes:"):].lower() not in low:
+            if chk[len("includes:"):].lower() not in scored:
                 fails.append(f"missing: {chk[len('includes:'):]!r}")
         elif chk == "docx export":  # known mechanical shorthand
             if not any(".docx" in u for u in links):
