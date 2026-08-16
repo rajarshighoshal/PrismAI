@@ -1,0 +1,26 @@
+# Build context = repo root (used by orchestrator/deploy.sh). tool-server keeps its
+# own context + .dockerignore. Keep the image lean and secret-free:
+.git
+.venv
+.serena
+.opencode-memory
+.claude
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.env
+**/*.env.bak*
+
+# other services / non-runtime repo content
+tool-server/
+owui-patches/
+deploy/
+docs/
+eval/
+evals/
+
+# orchestrator-local exclusions (previously orchestrator/.dockerignore)
+orchestrator/test_*.py
+orchestrator/smoke_*.py
+orchestrator/ab_*.json
+orchestrator/arena/

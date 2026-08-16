@@ -7,7 +7,7 @@ from . import config, fireworks
 from .owui import _SOURCE_BLOCK_RE, _all_user_text, _last_user_text
 from .timectx import _now_line
 from .prompts import SYSTEM_FACT_AUDIT, SYSTEM_GATE, SYSTEM_CHANGE_SUMMARY
-from .core.verifier import (
+from prism_core.verifier import (
     WORD_RE as _WORD_RE,
     AUDIT_ERROR as _AUDIT_ERROR,
     AuditUnavailable as _AuditUnavailable,

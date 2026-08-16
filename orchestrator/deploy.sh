@@ -43,8 +43,9 @@ if docker image inspect "$IMAGE" >/dev/null 2>&1; then
     docker tag "$IMAGE" "$BACKUP_IMAGE"
 fi
 
-echo "--- Building image ---"
-docker build -t "$IMAGE" "$ORCH_DIR"
+echo "--- Building image (context: repo root, for prism_core) ---"
+REPO_ROOT="$(dirname "$ORCH_DIR")"
+docker build -t "$IMAGE" -f "${ORCH_DIR}/Dockerfile" "$REPO_ROOT"
 
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "--- Stopping + removing old container ---"
