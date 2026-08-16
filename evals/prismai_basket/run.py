@@ -112,14 +112,20 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
     from orchestrator import config, perf, pipeline
 
     # Tap perf.trace for per-case call count + token usage (restored after the case).
+    # fireworks.py from-imports it (trace as _perf_trace), so patch that binding too.
+    from orchestrator import fireworks as _fw
     calls = {"n": 0, "in": 0, "out": 0}
     real_trace = perf.trace
+    real_fw_trace = _fw._perf_trace
 
     def tap(label, model, *, t0, ttft=None, in_tok=None, out_tok=None):
         calls["n"] += 1
         calls["in"] += int(in_tok or 0)
         calls["out"] += int(out_tok or 0)
         return real_trace(label, model, t0=t0, ttft=ttft, in_tok=in_tok, out_tok=out_tok)
+
+    perf.trace = tap
+    _fw._perf_trace = tap
 
     saved = {k: getattr(config, k) for k in
              ("CHAT_MODEL", "AGENT_MODEL", "GROUNDED_MODEL", "GROUNDING_GATE_MODEL",
@@ -143,6 +149,7 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
         error = repr(e)
     finally:
         perf.trace = real_trace
+        _fw._perf_trace = real_fw_trace
         for k, v in saved.items():
             setattr(config, k, v)
     latency = time.perf_counter() - t0
@@ -180,14 +187,14 @@ async def run_case(case: dict, *, session, overrides: dict) -> dict:
 
     return {
         "id": case["id"], "ok": not fails, "fails": fails, "manual": manuals,
-        "notes": notes,
+        "notes": notes, "answer": answer,
         "latency_s": round(latency, 1), "calls": calls["n"],
         "in_tok": calls["in"], "out_tok": calls["out"],
         "chars": len(answer), "links": links,
     }
 
 
-async def run_live(cases, *, concurrency: int, overrides: dict):
+async def run_live(cases, *, concurrency: int, overrides: dict, dump: bool = False):
     try:
         import aiohttp
     except ImportError:
@@ -206,6 +213,7 @@ async def run_live(cases, *, concurrency: int, overrides: dict):
         async def one(case):
             if case["kind"] in _TOOL_KINDS and not tools_up:
                 return {"id": case["id"], "ok": None, "fails": [], "manual": [],
+                        "notes": [], "answer": "",
                         "latency_s": 0, "calls": 0, "in_tok": 0, "out_tok": 0,
                         "chars": 0, "links": [], "skip": "tool-server down"}
             async with sem:
@@ -236,6 +244,10 @@ async def run_live(cases, *, concurrency: int, overrides: dict):
                 print(f"    MANUAL (judge by eye): {m}")
         print(f"\n{npass} passed, {nfail} failed, {nskip} skipped "
               f"({len(results)} live cases)")
+        if dump:
+            for r in results:
+                print(f"\n===== {r['id']} answer =====")
+                print(r.get("answer") or "(empty)")
 
 
 def main():
@@ -249,6 +261,7 @@ def main():
     ap.add_argument("--agent-model", default="", help="override config.AGENT_MODEL for the run")
     ap.add_argument("--grounded-model", default="", help="override config.GROUNDED_MODEL for the run")
     ap.add_argument("--gate-model", default="", help="override config.GROUNDING_GATE_MODEL for the run")
+    ap.add_argument("--dump", action="store_true", help="print each case's full answer after the table")
     args = ap.parse_args()
 
     if args.selftest:
@@ -280,7 +293,7 @@ def main():
             "note": "pass --live to run (needs provider keys); flip case live flags as you fill them out.",
         }, indent=2))
         return
-    asyncio.run(run_live(cases, concurrency=args.concurrency, overrides=overrides))
+    asyncio.run(run_live(cases, concurrency=args.concurrency, overrides=overrides, dump=args.dump))
 
 
 if __name__ == "__main__":
