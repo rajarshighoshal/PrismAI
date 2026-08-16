@@ -61,15 +61,27 @@ chunked response.
 
 ## Files
 
+The repo is split into a channel-neutral core and the OWUI-facing service:
+
 | File | Role |
 |---|---|
+| `prism_core/` | channel-neutral, provider-agnostic package (stdlib only; publish-ready): `verifier.py` (verbatim backstop, source-fit, fail-closed sentinel), `messages.py` (generic message helpers) |
+| `orchestrator/` | the OWUI channel adapter + turn engine (one of two deployables) |
 | `orchestrator/app.py` | FastAPI shell, OpenAI-compatible endpoints |
 | `orchestrator/pipeline.py` | entry + streaming crash guard |
-| `orchestrator/agent.py` | the lifecycle above: edit engine, agent loop, verification, delivery |
-| `orchestrator/owui.py` | parsing what OWUI sends (unwrap, `<source>` blocks, user source) |
+| `orchestrator/agent.py` | turn engine only: phase sequencing + the agent loop (carved from the old 1850-line god module) |
+| `orchestrator/vision.py` | image transcription phase (cache, describe, split) |
+| `orchestrator/prose.py` | export polish + voice pass (provider per vibe) |
+| `orchestrator/tools.py` | tool layer: schemas, guard gate, execution, result shaping |
+| `orchestrator/delivery.py` | persist-turn, background-task tracking, re-export, `_same_doc` |
+| `orchestrator/editing.py` | multi-turn edit: intent classify, patch-in-place, re-deliver |
+| `orchestrator/longdoc.py` | chunked long-doc writer: outline plan → per-section build |
+| `orchestrator/hardness.py` / `escalation.py` | task-structure classifier + the gated stronger-model escalation (off by default: `ESCALATION_MODEL=""`) |
+| `orchestrator/ports.py` | structural Protocols for the provider/tool/memory/style/artifact/event seams (additive; wired in later) |
+| `orchestrator/owui.py` | OWUI adapter parsing only: RAG-template unwrap, `<source>` blocks, user source |
 | `orchestrator/memory_client.py` | tool-server HTTP: chat memory, deliverables, last-active |
 | `orchestrator/timectx.py` | current-time line + resume-after-gap note |
-| `orchestrator/verifier.py` | the can't-lie gate: audit, verbatim backstop, refine, block |
+| `orchestrator/verifier.py` | the can't-lie gate: audit, refine, block (pure pieces live in `prism_core/verifier.py`) |
 | `orchestrator/prompts.py` | every system prompt + tool schemas |
 | `orchestrator/config.py` | env-tunable knobs (models, budgets, timezone) |
 | `orchestrator/fireworks.py` / `openai_client.py` / `anthropic_client.py` / `gemini.py` | model clients, all traced (`[trace] label=… ttft=… ttlt=…`) |
@@ -77,6 +89,7 @@ chunked response.
 | `orchestrator/dedup.py` | identical concurrent requests share one run |
 | `tool-server/main.py` | exports, search, scrape, deliverable + memory endpoints |
 | `tool-server/memory.py` | sqlite (single worker thread, WAL): chat turns, FTS, deliverables |
+| `owui-patches/` + `router_fn.py` | OWUI-v0.9.5 shims owned by the adapter boundary: patch OWUI's `routers/openai.py` + `utils/middleware.py` at deploy time (re-applied by `update.sh` after every container recreate — they do not survive one) |
 
 ## Model routing (who does what)
 
