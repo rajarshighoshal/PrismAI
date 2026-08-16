@@ -8,7 +8,7 @@ import contextlib
 import logging
 
 from . import memory_client, toolserver
-from .owui import _text_of
+from prism_core.messages import _text_of
 from .verifier import _WORD_RE
 from .tools import _tool_path, _export_download
 

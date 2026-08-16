@@ -7,30 +7,9 @@ wrapping. Pure functions: regex + string work only.
 """
 import re
 
+from prism_core.messages import _text_of, _same_message_source
 
-def _text_of(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return " ".join(
-            p.get("text", "")
-            for p in content
-            if isinstance(p, dict) and p.get("type") == "text"
-        )
-    return ""
-
-
-# OWUI's RAG path wraps its template around the user's real message EVEN with "Bypass
-# Embedding and Retrieval" enabled (open-webui issues #19281, #17720). Verified against
-# this instance's OWUI code (utils/middleware.py + utils/task.py rag_template):
-#   - newer default templates embed the query in <user_query>…</user_query> tags;
-#   - a template WITHOUT a {{QUERY}} placeholder (this instance's saved default) is
-#     PREPENDED to the original message (add_or_update_user_message append=False), so the
-#     user's real text is everything AFTER the last </context>.
-# These are machine-generated structural delimiters from OWUI's renderer — parse them so
-# the edit classifier, gates, and verifier see what the USER said, not boilerplate.
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
-
 
 def _unwrap_owui(text: str) -> str:
     if not text:
@@ -44,69 +23,13 @@ def _unwrap_owui(text: str) -> str:
             return tail
     return text
 
-
 def _last_user_text(messages) -> str:
     for m in reversed(messages):
         if m.get("role") == "user":
             return _unwrap_owui(_text_of(m.get("content")).strip())
     return ""
 
-
-def _has_images(messages) -> bool:
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and p.get("type") == "image_url":
-                    return True
-    return False
-
-
-def _split_content_parts(content):
-    if not isinstance(content, list):
-        return [], []
-    text_parts = [
-        p.get("text", "")
-        for p in content
-        if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
-    ]
-    image_parts = [
-        p
-        for p in content
-        if isinstance(p, dict) and p.get("type") == "image_url"
-    ]
-    return text_parts, image_parts
-
-
-def _same_message_source(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    parts = []
-    for match in re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.S):
-        parts.append(match.strip())
-    for match in re.findall(r"(?m)((?:^>.*(?:\n|$))+)", text):
-        parts.append(re.sub(r"(?m)^>\s?", "", match).strip())
-    for match in re.findall(
-        r"(?is)(?:^|\n)\s*(?:sources?|notes?|context|references?|resume|job posting)\s*[:\-]\s*(.+?)(?:\n\s*\n|$)",
-        text,
-    ):
-        parts.append(match.strip())
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    for paragraph in paragraphs[1:]:
-        if len(paragraph) >= 120:
-            parts.append(paragraph)
-    seen = set()
-    out = []
-    for part in parts:
-        if part and part not in seen:
-            seen.add(part)
-            out.append(part)
-    return "\n\n".join(out).strip()
-
-
 _SOURCE_BLOCK_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S | re.I)
-
 
 def _owui_source_blocks(text: str) -> list[str]:
     """OpenWebUI injects an attached file's text (paperclip upload) into the chat
@@ -117,7 +40,6 @@ def _owui_source_blocks(text: str) -> list[str]:
     user touching the RAG / full-context toggle — the file's own content, not a
     fragile ≥120-char paragraph guess that drops short résumé lines."""
     return [m.strip() for m in _SOURCE_BLOCK_RE.findall(text or "") if m.strip()]
-
 
 def _user_source(messages) -> str:
     # Grounding "source" has two origins, in priority order:
@@ -146,7 +68,6 @@ def _user_source(messages) -> str:
             seen.add(part)
             out.append(part)
     return "\n\n".join(out).strip()
-
 
 def _all_user_text(messages) -> str:
     """Every user turn joined — facts AND instructions. The honesty auditor needs

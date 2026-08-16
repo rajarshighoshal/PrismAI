@@ -6,7 +6,8 @@ import re
 import logging
 
 from . import config, fireworks
-from .owui import _last_user_text, _text_of, _unwrap_owui, _user_source
+from .owui import _last_user_text, _unwrap_owui, _user_source
+from prism_core.messages import _text_of
 from .timectx import _now_line
 from .prompts import SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE

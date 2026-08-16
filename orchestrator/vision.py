@@ -11,7 +11,7 @@ import logging
 import re
 
 from . import config, fireworks
-from .owui import _has_images, _split_content_parts
+from prism_core.messages import _has_images, _split_content_parts
 from .prompts import SYSTEM_VISION
 
 log = logging.getLogger(__name__)

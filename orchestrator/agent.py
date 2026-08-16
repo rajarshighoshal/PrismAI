@@ -10,9 +10,10 @@ from typing import Any, AsyncGenerator, Optional
 
 from . import config, escalation, fireworks, prompt_security, style, toolserver, interaction_mode
 from .owui import (
-    _text_of, _unwrap_owui, _last_user_text, _has_images,
+    _unwrap_owui, _last_user_text,
     _owui_source_blocks, _user_source, _all_user_text,
 )
+from prism_core.messages import _text_of, _has_images
 from . import memory_client
 from .agent_state import AgentState
 from .timectx import _now_line, _gap_note
