@@ -24,7 +24,10 @@ are real (a paraphrase that drops the marker tokens reads as a miss); see README
 
   python -m evals.honesty.harness --selftest      # validate scoring math, NO API/keys
   python -m evals.honesty.harness --quick         # base config only (cheapest live run)
-  python -m evals.honesty.harness                 # full ablation grid
+  python -m evals.honesty.harness                 # full ablation grid (default: deepseek pro/flash)
+  python -m evals.honesty.harness --models flash,glm-5p2,kimi-k3 --efforts max,none
+                                                  # cross-family bake-off: any model IDs the
+                                                  # provider accepts; flash/pro resolve via config
 
 Live runs need an auditor key in env (FIREWORKS_API_KEY and/or DEEPSEEK_API_KEY). Easiest
 on the server where keys + deps already live:
@@ -44,6 +47,17 @@ from orchestrator import config, verifier  # noqa: E402
 CASES_PATH = Path(__file__).with_name("cases.jsonl")
 
 _PRO_MODEL = "accounts/fireworks/models/deepseek-v4-pro"
+
+
+def _resolve_model(name: str) -> str:
+    """'flash'/'pro' resolve against the current config pin; anything else is passed
+    through as a provider model ID (e.g. accounts/fireworks/models/glm-5p2)."""
+    flash = config.HONESTY_MODEL
+    if name == "flash":
+        return flash
+    if name == "pro":
+        return flash.replace("flash", "pro") if "flash" in flash else _PRO_MODEL
+    return name
 
 
 def load_cases(path=CASES_PATH):
@@ -162,17 +176,32 @@ def score(rows) -> dict:
     }
 
 
-def grid():
-    """Ablation configs. Each row turns a current config COMMENT into a measured number."""
+def grid(models=None, efforts=None, include_no_backstop=False):
+    """Ablation configs. Each row turns a current config COMMENT into a measured number.
+
+    No args -> the legacy deepseek-only grid (unchanged). With --models/--efforts the
+    grid becomes a cross-family bake-off: one row per model x effort, plus an optional
+    no-backstop ablation per model."""
     flash = config.HONESTY_MODEL
-    pro = flash.replace("flash", "pro") if "flash" in flash else _PRO_MODEL
-    return [
-        {"name": "flash · max · backstop",    "model": flash, "effort": "max",  "backstop": True},
-        {"name": "flash · max · NO backstop", "model": flash, "effort": "max",  "backstop": False},
-        {"name": "flash · low · backstop",    "model": flash, "effort": "low",  "backstop": True},
-        {"name": "flash · none · backstop",   "model": flash, "effort": "none", "backstop": True},
-        {"name": "pro · max · backstop",      "model": pro,   "effort": "max",  "backstop": True},
-    ]
+    pro = _resolve_model("pro")
+    if not models and not efforts and not include_no_backstop:
+        return [
+            {"name": "flash · max · backstop",    "model": flash, "effort": "max",  "backstop": True},
+            {"name": "flash · max · NO backstop", "model": flash, "effort": "max",  "backstop": False},
+            {"name": "flash · low · backstop",    "model": flash, "effort": "low",  "backstop": True},
+            {"name": "flash · none · backstop",   "model": flash, "effort": "none", "backstop": True},
+            {"name": "pro · max · backstop",      "model": pro,   "effort": "max",  "backstop": True},
+        ]
+    rows = []
+    for m in (models or ["flash"]):
+        model = _resolve_model(m)
+        short = model.split("/")[-1]
+        for e in (efforts or ["max"]):
+            rows.append({"name": f"{short} · {e} · backstop", "model": model, "effort": e, "backstop": True})
+        if include_no_backstop:
+            rows.append({"name": f"{short} · {(efforts or ['max'])[0]} · NO backstop",
+                         "model": model, "effort": (efforts or ["max"])[0], "backstop": False})
+    return rows
 
 
 def _pct(x):
@@ -310,6 +339,20 @@ def _selftest():
             check(f"data {case['id']}: keep marker {m!r} grounded in source/request",
                   _marker_hits(m, [_grounding_for(case)]))
 
+    # grid: no-args keeps the legacy deepseek-only rows; parametrized grid expands per model.
+    legacy = [(r["name"], r["effort"], r["backstop"]) for r in grid()]
+    check("grid: no-args keeps the legacy 5-row grid",
+          [r[0] for r in legacy] == ["flash · max · backstop", "flash · max · NO backstop",
+                                     "flash · low · backstop", "flash · none · backstop",
+                                     "pro · max · backstop"])
+    g = grid(models=["flash", "accounts/fireworks/models/glm-5p2"], efforts=["max", "none"])
+    check("grid: cross-family expands to model x effort rows", len(g) == 4)
+    check("grid: shorthand + full-ID models resolve",
+          g[0]["model"] == config.HONESTY_MODEL and g[2]["model"].endswith("glm-5p2"))
+    g2 = grid(models=["pro"], include_no_backstop=True)
+    check("grid: no-backstop row appended per model",
+          len(g2) == 2 and g2[1]["backstop"] is False)
+
     print(f"\n{'ALL SELFTESTS PASSED' if not failures else f'{len(failures)} FAILED: {failures}'}")
     return 1 if failures else 0
 
@@ -318,6 +361,9 @@ def main():
     ap = argparse.ArgumentParser(description="PrismAI honesty eval harness")
     ap.add_argument("--selftest", action="store_true", help="validate scoring math (no API)")
     ap.add_argument("--quick", action="store_true", help="run only the base (flash·max·backstop) config")
+    ap.add_argument("--models", default="", help="comma-separated auditor models: flash/pro shorthands or full provider IDs (cross-family bake-off)")
+    ap.add_argument("--efforts", default="", help="comma-separated reasoning efforts (default: max)")
+    ap.add_argument("--no-backstop-row", action="store_true", help="add a no-backstop ablation per model")
     ap.add_argument("--limit", type=int, default=0, help="cap number of cases (smoke a live run cheaply)")
     ap.add_argument("--concurrency", type=int, default=5)
     args = ap.parse_args()
@@ -328,7 +374,12 @@ def main():
     cases = load_cases()
     if args.limit:
         cases = cases[:args.limit]
-    configs = grid()[:1] if args.quick else grid()
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    efforts = [e.strip() for e in args.efforts.split(",") if e.strip()]
+    configs = grid(models=models or None, efforts=efforts or None,
+                   include_no_backstop=args.no_backstop_row)
+    if args.quick:
+        configs = configs[:1]
     asyncio.run(run(configs, cases, concurrency=args.concurrency))
 
 
