@@ -14,11 +14,11 @@ from .owui import (
     _owui_source_blocks, _user_source, _all_user_text,
 )
 from . import memory_client
+from .agent_state import AgentState
 from .timectx import _now_line, _gap_note
-from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE, _has_citation_markers, _fit_audit_source
+from .verifier import _verified_or_blocked, _summarize_correction
 from .prompts import (
-    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_REQUEST_GATE, SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH,
-    SYSTEM_LONGDOC_GATE, SYSTEM_OUTLINE, SYSTEM_PLAN_INTENT, SYSTEM_SECTION_WRITER,
+    TOOL_SCHEMAS, SYSTEM_AGENT, SYSTEM_REQUEST_GATE,
 )
 # Vision phase lives in its own module now; re-exported names keep agent.run() and the
 # existing tests (agent._VISION_CACHE, agent._split_vision_output) working unchanged.
@@ -35,7 +35,14 @@ from .tools import (  # noqa: F401
 # re-exported (same set object) because the tests drain it via agent._BG_TASKS.
 from .delivery import (  # noqa: F401
     _BG_TASKS, _track_task, _cancel_mode_task, _persist_turn,
-    _repackage_deliverable, _pending_prose_deliverable,
+    _same_doc, _pending_prose_deliverable,
+)
+# Multi-turn editing and the chunked long-doc writer live in their own modules; the
+# longdoc names are re-exported because the tests drive them via agent.*.
+from .editing import _dispatch_edit  # noqa: F401
+from .longdoc import (  # noqa: F401
+    _dispatch_plan, _try_longdoc,
+    _maybe_longdoc, _classify_longdoc, _generate_outline, _render_outline,
 )
 
 log = logging.getLogger(__name__)
@@ -47,7 +54,6 @@ _TEXTUAL_TOOL_BLOCK_RE = re.compile(
     r"<\s*[｜|]?\s*(?:tool_calls?|invoke|DSML)\b.*?(?:</\s*[｜|]?\s*(?:tool_calls?|invoke|DSML)\s*>|$)",
     re.I | re.S)
 
-
 def _with_system(messages, system_text):
     out = [dict(m) for m in messages]
     for m in out:
@@ -56,128 +62,6 @@ def _with_system(messages, system_text):
             m["content"] = (base + "\n\n" + system_text).strip() if base else system_text
             return out
     return [{"role": "system", "content": system_text}] + out
-
-
-async def _classify_edit_once(payload, *, session=None) -> dict:
-    # The PRO model judges this gate: flash-at-low-reasoning misread even "can you
-    # update the doc?" as 'new' (live smoke, repeatedly, regardless of prompt wording).
-    # The gate only fires in chats that already delivered a document — pennies, and a
-    # wrong verdict here silently drops the user's document.
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_EDIT_INTENT},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
-            config.GROUNDED_MODEL, max_tokens=600, temperature=0.0,
-            session=session, label="gate:edit",
-        )
-        data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
-        a = str(data.get("action", "new")).lower()
-        if a in ("rename", "reformat", "edit"):
-            return {"action": a, "filename": (data.get("filename") or "").strip(),
-                    "format": (data.get("format") or "").strip().lower()}
-    except Exception:
-        pass
-    return {"action": "new", "filename": "", "format": ""}
-
-
-async def _classify_edit(last_user: str, prior: dict, *, messages=None, session=None) -> dict:
-    """Classify a follow-up against the last delivered document: rename|reformat|edit|new.
-
-    The two misroute directions are NOT symmetric: new-misread-as-edit is self-correcting,
-    while edit-misread-as-new silently drops the document — so a 'new' verdict must win TWICE."""
-    last_user = (last_user or "").strip()
-    if not (last_user and prior and prior.get("content")):
-        return {"action": "new"}
-    recent = ""
-    if messages:
-        turns = [f"[{m.get('role')}]: {_unwrap_owui(_text_of(m.get('content')))[:200]}"
-                 for m in messages[:-1] if m.get("role") in ("user", "assistant")]
-        recent = "\n".join(turns[-4:])
-    payload = {
-        "recent_conversation": recent,
-        "latest_user": last_user[:1500],
-        "current_filename": prior.get("filename") or "document",
-        "current_format": prior.get("fmt") or "docx",
-    }
-    result = await _classify_edit_once(payload, session=session)
-    if result["action"] == "new":
-        second = await _classify_edit_once(payload, session=session)
-        if second["action"] != "new":
-            result = second
-    log.info(f"[edit-intent] action={result['action']} msg={last_user[:80]!r}")
-    return result
-
-
-
-def _edit_inject(prior: dict) -> str:
-    """System directive for a surgical content edit of the prior document."""
-    return (
-        "REVISION TASK — the user is revising a document you already delivered in this "
-        "chat. Here is that document, verbatim:\n\n"
-        "--- CURRENT DOCUMENT ---\n" + (prior.get("content") or "").strip()
-        + "\n--- END CURRENT DOCUMENT ---\n\n"
-        "Make the change the user asks for — their INTENT, not a literal find-and-replace "
-        "of their words. A 'fix this line' touches one line; a 'review and make X "
-        "consistent' means reading the whole document and rewording every passage the "
-        "intent genuinely covers, with judgment. Leave everything the request does not "
-        "cover exactly as it is — never rewrite, re-order, or 'improve' beyond the ask. "
-        "If the instruction is ambiguous or you are unsure what they want, output ONLY a "
-        "short clarifying question (no document) — the user explicitly prefers being "
-        "asked over being guessed at, and their answer comes straight back to you."
-    )
-
-
-def _is_doc_status_request(text: str) -> bool:
-    t = (text or "").lower()
-    return bool(re.search(r"\b(current|latest|this)\s+(doc|document|file)\s+(status|info|state)\b", t)
-                or re.search(r"\b(show|what'?s|what is)\s+.*\b(doc|document|file)\s+status\b", t))
-
-
-def _doc_status(prior: dict) -> str:
-    content = prior.get("content") or ""
-    return (
-        "Current document:\n"
-        f"- filename: {prior.get('filename') or 'document'}\n"
-        f"- format: {(prior.get('fmt') or 'docx').upper()}\n"
-        f"- version: {prior.get('version') or '?'}\n"
-        f"- words: {len(_WORD_RE.findall(content)):,}\n"
-        "\nYou can ask me to rename it, export it in another format, or revise a specific part."
-    )
-
-
-async def _try_patch_edit(baseline: str, instruction: str, *, session=None):
-    """Apply targeted find→replace edits to the stored document. Returns patched text, or None when the change is too broad — caller falls back to a full re-emit."""
-    if not baseline.strip():
-        return None
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_EDIT_PATCH + "\n\n--- DOCUMENT ---\n" + baseline},
-             {"role": "user", "content": instruction}],
-            config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS, temperature=0.0,
-            session=session, label="edit:patch")
-        data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
-    except Exception:
-        return None
-    edits = data.get("edits")
-    if data.get("broad") or not isinstance(edits, list) or not edits:
-        return None
-    text = baseline
-    for e in edits:
-        if not isinstance(e, dict):
-            return None
-        find = e.get("find") or ""
-        repl = "" if e.get("replace") is None else str(e.get("replace"))
-        if not find or text.count(find) != 1:   # must match exactly once, else fall back
-            return None
-        text = text.replace(find, repl, 1)
-    return text if (text.strip() and text != baseline) else None
-
-
-
-
-
-
-
 
 def _initial_messages(messages, user_id: str, profile: str = "", extra_system: str = ""):
     system = SYSTEM_AGENT + "\n\n" + prompt_security.UNTRUSTED_CONTEXT_POLICY + "\n\n" + _now_line()
@@ -190,15 +74,8 @@ def _initial_messages(messages, user_id: str, profile: str = "", extra_system: s
         system += "\n\n" + extra_system
     return _with_system(messages, system)
 
-
-
-
-
-
 def _select_model(has_sources: bool) -> str:
     return config.GROUNDED_MODEL if has_sources else config.AGENT_MODEL
-
-
 
 _PROGRESS_FALLBACK = {
     "start": "🧭 I’m setting up the work now: reading your request, checking the available sources, and deciding the safest path.\n\n",
@@ -208,7 +85,6 @@ _PROGRESS_FALLBACK = {
     "verify": "🔍 Now I’m verifying the factual claims against your sources before anything gets finalized.\n",
     "export": "📦 Verification passed; I’m building the downloadable file now.\n",
 }
-
 
 async def _progress_note(stage: str, messages, *, detail: str = "", session=None) -> str:
     """One short user-visible progress sentence for serious/buffered work.
@@ -248,8 +124,6 @@ async def _progress_note(stage: str, messages, *, detail: str = "", session=None
         return note.rstrip(".!?") + "…\n"
     except Exception:
         return fallback
-
-
 
 async def _export_final(pending, final_text, prose, messages, source, *, chat_id="", headers=None, session=None):
     """Build deferred export files from the verified draft or polished export argument. Returns (links_str, filed_deliverable)."""
@@ -291,10 +165,6 @@ async def _export_final(pending, final_text, prose, messages, source, *, chat_id
     links = ("\n\n" + "\n".join(f"📎 [Download {fn}]({url})" for fn, url in out)) if out else ""
     return links, filed_deliverable
 
-
-
-
-
 async def _request_needs_work(messages, *, session=None) -> bool:
     """Plain-chat gate: does this turn need the agentic loop (tools/source/verify)?
     Uncertain -> True (use the safe buffered loop, never stream a risky turn)."""
@@ -313,7 +183,6 @@ async def _request_needs_work(messages, *, session=None) -> bool:
     except Exception:
         return True
 
-
 def _is_clarification(text: str) -> bool:
     """Detect a clarifying-question turn (the agent asked the user for info rather
     than producing a deliverable) — these must NOT be prose-polished or treated as
@@ -325,21 +194,6 @@ def _is_clarification(text: str) -> bool:
     cues = ("i need to know", "before i write", "could you clarify", "a few questions",
             "to write this", "which of", "can you tell me", "what is the", "let me know")
     return len(t) < 1200 and (t.count("?") >= 2 or any(c in t for c in cues))
-
-
-def _same_doc(a: str, b: str) -> bool:
-    """True when two texts are the same document — requires both similar length and high word overlap to avoid mistaking a summary for the document."""
-    a, b = (a or "").strip(), (b or "").strip()
-    if not a or not b:
-        return False
-    lo, hi = sorted((len(a), len(b)))
-    if lo / hi < 0.6:  # very different lengths -> one is a summary/note, not the doc
-        return False
-    wa, wb = set(_WORD_RE.findall(a.lower())), set(_WORD_RE.findall(b.lower()))
-    if not wa or not wb:
-        return False
-    return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
-
 
 async def _adherence_check(messages, candidate: str, *, export_pending: bool = False, session=None) -> dict:
     """Check task-contract adherence, separate from truth/grounding."""
@@ -384,12 +238,10 @@ async def _adherence_check(messages, candidate: str, *, export_pending: bool = F
     except Exception:
         return {"followed": True, "severity": "none", "misses": []}
 
-
 def _norm_turn(content) -> str:
     """Collapse whitespace so a recalled turn (now stored verbatim) can be deduped
     against the same turn still verbatim in the kept tail."""
     return " ".join((content or "").split())
-
 
 def _split_recent_history(messages, budget_chars: int):
     """Split a long history into (recent_tail, older_head) for overflow recall. Always keeps at least the final message."""
@@ -402,266 +254,10 @@ def _split_recent_history(messages, budget_chars: int):
             break
     return messages[cut:], messages[:cut]
 
-
 # ── Chunked section-writer ───────────────────────────────────────────────────────
 # A long, multi-section document is OUTLINED -> approved -> written section-by-section ->
 # assembled -> verified -> exported, instead of emitted in one capped shot. The outline is
 # held as a pending PLAN (kv, per chat) between the propose-turn and the build-turn.
-def _slug(title: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9]+", "_", (title or "document")).strip("_").lower()
-    return (s or "document")[:60]
-
-
-_LONGDOC_CUES = (
-    "paper", "thesis", "dissertation", "report", "essay", "review", "chapter", "white paper",
-    "whitepaper", "case study", "proposal", "study guide", "manuscript", "literature review",
-    "section", "comprehensive", "in-depth", "in depth", "detailed", "multi-part",
-)
-
-
-def _maybe_longdoc(messages) -> bool:
-    """Cheap deterministic PREFILTER before the (flash) long-doc classifier: only spend the
-    gate on plausibly-long requests. A short ask with no doc cues is never a long document,
-    so skip the model call entirely (most heavy turns — short edits, summaries — land here)."""
-    t = _last_user_text(messages).strip().lower()
-    return len(t) > 140 or any(c in t for c in _LONGDOC_CUES)
-
-
-async def _classify_longdoc(messages, *, session=None) -> dict:
-    """Is this a request to WRITE a long, multi-section document (-> outline-first chunked
-    writer)? One cheap flash gate; uncertain / parse failure -> not a long doc (normal flow)."""
-    q = _last_user_text(messages).strip()[:2000]
-    if not q:
-        return {"longdoc": False, "doc_type": ""}
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_LONGDOC_GATE},
-             {"role": "user", "content": q}],
-            config.GROUNDING_GATE_MODEL, max_tokens=60, temperature=0.0, session=session,
-            label="gate:longdoc",
-        )
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        d = json.loads(m.group(0) if m else raw)
-        return {"longdoc": bool(d.get("longdoc", False)), "doc_type": str(d.get("doc_type") or "").strip()}
-    except Exception:
-        return {"longdoc": False, "doc_type": ""}
-
-
-def _outline_for_prompt(plan: dict) -> str:
-    """The current sections, compactly, to hand back for an in-place revision."""
-    return "\n".join(f"{i}. {s.get('heading','')}: {s.get('intent','')}"
-                     for i, s in enumerate(plan.get("sections") or [], 1))
-
-
-async def _generate_outline(request: str, source: str, *, current_outline: str = "",
-                            change: str = "", session=None):
-    """Plan a long document as {title, sections:[{heading,intent}]}. Returns plan or None."""
-    user = f"USER REQUEST:\n{(request or '').strip()[:6000]}"
-    if (current_outline or "").strip():
-        user += "\n\nCURRENT OUTLINE (apply the requested change to THIS, keep the rest):\n" + current_outline
-    if (change or "").strip():
-        user += "\n\nREQUESTED CHANGE: " + change.strip()[:1000]
-    if (source or "").strip():
-        user += "\n\nSOURCE MATERIAL:\n" + source[:20000]
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_OUTLINE},
-             {"role": "user", "content": user}],
-            config.GROUNDED_MODEL, max_tokens=config.OUTLINE_MAX_TOKENS,
-            temperature=0.0, session=session, label="outline",
-        )
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        data = json.loads(m.group(0) if m else raw)
-        title = str(data.get("title") or "").strip()
-        sections = []
-        for s in (data.get("sections") or [])[:config.CHUNKED_MAX_SECTIONS]:
-            heading = str((s or {}).get("heading") or "").strip()
-            intent = str((s or {}).get("intent") or "").strip()
-            if heading:
-                sections.append({"heading": heading, "intent": intent})
-        if title and sections:
-            return {"title": title, "sections": sections}
-    except Exception as e:
-        log.warning(f"[outline] generation failed: {e}")
-    return None
-
-
-def _render_outline(plan: dict, *, revised: bool = False) -> str:
-    """The outline shown to the user for approval before any prose is written."""
-    title = plan.get("title") or "Document"
-    head = (f"Here's the proposed structure for **{title}**:" if not revised
-            else f"Updated outline for **{title}**:")
-    lines = [head, ""]
-    for i, s in enumerate(plan.get("sections") or [], 1):
-        heading = s.get("heading") or f"Section {i}"
-        intent = s.get("intent") or ""
-        lines.append(f"{i}. **{heading}**" + (f" — {intent}" if intent else ""))
-    lines += ["", "Want me to **write it**? Or tell me what to change "
-              "(add / remove / reorder a section, adjust the scope)."]
-    return "\n".join(lines)
-
-
-async def _classify_plan_intent(latest_user: str, plan: dict, *, session=None) -> dict:
-    """Classify the user's reply to a shown outline: approve | revise | abandon. On a parse
-    failure default to a no-op 'revise' (re-show the outline) — never silently build or drop."""
-    latest = (latest_user or "").strip()
-    if not latest:
-        return {"action": "revise", "revision": ""}
-    outline_txt = "\n".join(f"{i}. {s.get('heading','')}: {s.get('intent','')}"
-                            for i, s in enumerate(plan.get("sections") or [], 1))
-    payload = {"title": plan.get("title", ""), "outline": outline_txt, "user_reply": latest[:1500]}
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_PLAN_INTENT},
-             {"role": "user", "content": json.dumps(payload, ensure_ascii=True)}],
-            config.GROUNDED_MODEL, max_tokens=300, temperature=0.0, session=session,
-            label="gate:plan",
-        )
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        d = json.loads(m.group(0) if m else raw)
-        action = str(d.get("action") or "").lower()
-        if action in ("approve", "revise", "abandon"):
-            return {"action": action, "revision": str(d.get("revision") or "").strip()}
-    except Exception:
-        pass
-    return {"action": "revise", "revision": ""}
-
-
-async def _write_section(title: str, sections: list, idx: int, prior_recap: str,
-                         source: str, *, session=None) -> str:
-    """Write one section of the long document, aware of the whole outline. Returns Markdown, or '' on failure."""
-    sec = sections[idx]
-    outline_txt = "\n".join(
-        f"{i+1}. {s.get('heading','')}" + ("  <- WRITE THIS ONE" if i == idx else "")
-        for i, s in enumerate(sections))
-    parts = [
-        f"DOCUMENT TITLE: {title}",
-        f"FULL OUTLINE:\n{outline_txt}",
-        f"SECTION TO WRITE NOW:\n{sec.get('heading','')} — {sec.get('intent','')}",
-    ]
-    if (prior_recap or "").strip():
-        parts.append("PRECEDING SECTIONS ALREADY COVERED (continue from these, don't repeat):\n" + prior_recap)
-    if (source or "").strip():
-        # Relevance-FIT the source to THIS section (its heading+intent) instead of a blind
-        # head-truncation — so a section sees the source material that's actually about it,
-        # not just whatever happened to be in the first 24k chars (matters for a long paper
-        # with a big source where the relevant bits are deep in the document).
-        sec_source = _fit_audit_source(source, f"{sec.get('heading','')} {sec.get('intent','')}", 24000)
-        parts.append("SOURCE MATERIAL (assert only what this supports; never fabricate):\n" + sec_source)
-    try:
-        return (await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_SECTION_WRITER},
-             {"role": "user", "content": "\n\n".join(parts)}],
-            config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
-            temperature=config.WRITER_TEMPERATURE, session=session, label="section:write",
-        )).strip()
-    except Exception as e:
-        log.warning(f"[section] write failed for {sec.get('heading','')!r}: {e}")
-        return ""
-
-
-async def _present_outline(request: str, source: str, *, chat_id: str, filename: str = "",
-                           fmt: str = "docx", session=None, revised: bool = False,
-                           current_outline: str = "", change: str = "", revise_count: int = 0):
-    """Generate or revise an outline, persist it as the pending plan, and yield it for approval."""
-    plan = await _generate_outline(request, source, current_outline=current_outline,
-                                   change=change, session=session)
-    if not plan:
-        yield ("content", "I couldn't draft a clear outline for that — tell me a bit more "
-               "about the document you want and I'll plan it.")
-        return
-    plan["source"] = source or ""
-    plan["request"] = request or ""        # the ORIGINAL request, stable across revisions
-    plan["filename"] = filename or _slug(plan.get("title") or "document")
-    plan["fmt"] = fmt or "docx"
-    plan["created_at"] = time.time()       # TTL anchor so a never-approved plan expires
-    plan["revise_count"] = revise_count
-    if chat_id:
-        await memory_client._plan_store(chat_id, plan)   # awaited: the NEXT turn reads this
-    yield ("content", _render_outline(plan, revised=revised))
-
-
-async def _build_from_plan(plan: dict, messages, user_id: str, chat_id: str, headers, session=None):
-    """Build the approved long document section-by-section with live progress and per-section verification. Async generator of (kind, text)."""
-    title = plan.get("title") or "Document"
-    sections = plan.get("sections") or []
-    source = plan.get("source") or ""
-    filename = plan.get("filename") or _slug(title)
-    fmt = plan.get("fmt") or "docx"
-
-    yield ("content", f"📝 Writing **{title}** — {len(sections)} sections, one at a time.\n\n")
-    assembled, recap, prev_tail, failures = [], "", "", []
-    for i, sec in enumerate(sections):
-        heading = sec.get("heading") or f"Section {i+1}"
-        yield ("content", f"✍️ §{i+1} {heading}…\n")
-        # Hand the writer the prior headings AND a tail of the previous section's real prose,
-        # so it can actually pick up the thread instead of restating it.
-        prompt_recap = recap + (f"\n\nThe previous section ended:\n…{prev_tail}" if prev_tail else "")
-        section_md = await _write_section(title, sections, i, prompt_recap, source, session=session)
-        if not section_md:                      # one retry on an empty/failed generation
-            section_md = await _write_section(title, sections, i, prompt_recap, source, session=session)
-        if not section_md:
-            failures.append((i + 1, heading, "couldn't be generated"))
-            yield ("content", "   ⚠️ couldn't write this section\n")
-            continue
-        # A from-scratch section (no source) that cites sources we never had is a fabrication —
-        # the deterministic backstop, made source-aware here (the global guard is masked by the
-        # always-present date/user-text in grounding_source).
-        if not source.strip() and _has_citation_markers(section_md):
-            failures.append((i + 1, heading, "cited sources that weren't provided"))
-            yield ("content", "   ⚠️ cited unprovided sources — held back\n")
-            continue
-        # Per-section honesty pass. Force the audit when there's source to ground against;
-        # with no source, let the gate decide (a from-scratch essay isn't a grounding task).
-        status, checked = await _verified_or_blocked(
-            messages, section_md, source, force=bool(source.strip()), session=session)
-        if status != "ok":
-            failures.append((i + 1, heading, "made claims I couldn't verify against your sources"))
-            yield ("content", "   ⚠️ unverifiable claims — held back\n")
-            continue
-        section_md = checked
-        assembled.append(section_md)
-        prev_tail = section_md[-300:]
-        recap += f"- {heading}: {sec.get('intent','')}\n"
-        yield ("content", f"   ✓ {len(_WORD_RE.findall(section_md)):,} words\n")
-
-    if failures or not assembled:
-        detail = ("\n".join(f"- §{n} {h} — {why}" for n, h, why in failures)
-                  or "- the document came back empty")
-        yield ("content",
-               "\n\n⚠️ I held this back rather than ship something unverified:\n\n" + detail
-               + "\n\nYour outline is saved — add a source for those sections (or tell me to write "
-               "them more conservatively) and say **write it** to rebuild.")
-        return  # plan kept on purpose
-
-    full_doc = (f"# {title}\n\n" + "\n\n".join(assembled)).strip()
-    link = await _repackage_deliverable(full_doc, filename, fmt,
-                                        chat_id=chat_id, headers=headers, session=session)
-    if chat_id and not link:
-        # Export failed AFTER the doc verified — don't lose the verified bytes: store them as
-        # the deliverable so a 'export it as docx' (reformat path) recovers the file, no rebuild.
-        await memory_client._deliverable_store(chat_id, full_doc, filename, fmt)
-    if chat_id:
-        await memory_client._plan_clear(chat_id)
-        _track_task(asyncio.create_task(memory_client._memory_store(chat_id, "assistant", full_doc[:4000], session)))
-    words = len(_WORD_RE.findall(full_doc))
-    if link:
-        yield ("content", f"\n\n📄 **{title}** is ready — {len(assembled)} sections, {words:,} words. "
-               f"Download below.{link}")
-    else:
-        yield ("content", f"\n\n📄 **{title}** is written and saved ({words:,} words), but the file "
-               "export failed — say **export it as docx** and I'll produce the file.")
-
-
-# ── AgentState import (replaces scattered boolean flags) ────────────────
-from .agent_state import AgentState
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Phase helpers — regular async functions that return data, plus a few
-# async generators for streaming phases (plan dispatch, plain chat, longdoc).
-# ═══════════════════════════════════════════════════════════════════════════
-
 async def _gather_context(user_id, chat_id, session):
     """Parallel fetch: style profile, prior deliverable, last-active, pending plan.
     Returns (profile, prior_deliverable, gap_note, pending_plan)."""
@@ -682,103 +278,6 @@ async def _gather_context(user_id, chat_id, session):
             plan = results[idx]; idx += 1
     return profile, prior, _gap_note(active) if active else "", plan
 
-
-async def _dispatch_plan(messages, plan, chat_id, req_headers, session):
-    """Handle pending outline. Yields output if plan handled; caller detects via flag."""
-    if not plan:
-        return
-    created = float(plan.get("created_at") or 0)
-    age = (time.time() - created) if created else 0
-    revises = int(plan.get("revise_count") or 0)
-    if age > config.CHUNKED_PLAN_TTL_SECONDS or revises > config.CHUNKED_MAX_REVISES:
-        await memory_client._plan_clear(chat_id)
-        return
-    intent = await _classify_plan_intent(_last_user_text(messages), plan, session=session)
-    if intent["action"] == "approve":
-        async for kt in _build_from_plan(plan, messages, "user", chat_id, req_headers, session):
-            yield kt
-        return
-    if intent["action"] == "revise":
-        revision = intent.get("revision") or ""
-        if revision:
-            async for kt in _present_outline(
-                plan.get("request") or "", plan.get("source") or "",
-                chat_id=chat_id, filename=plan.get("filename") or "",
-                fmt=plan.get("fmt") or "docx", session=session, revised=True,
-                current_outline=_outline_for_prompt(plan), change=revision,
-                revise_count=revises + 1):
-                yield kt
-        else:
-            yield ("content", _render_outline(plan)
-                   + "\n\n*(Say \"write it\" to build, name a change, or \"never mind\" to drop it.)*")
-        return
-    await memory_client._plan_clear(chat_id)
-
-
-async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_work):
-    """Handle multi-turn edit. Returns (handled, output_or_directive, baseline).
-    If handled: output_or_directive is the response text, baseline is "".
-    If not handled: output_or_directive is the edit directive, baseline is the prior doc."""
-    if not (prior and prior.get("content")):
-        return False, "", ""
-
-    if _is_doc_status_request(_last_user_text(messages)):
-        return True, _doc_status(prior), ""
-
-    intent = await _classify_edit(_last_user_text(messages), prior, messages=messages, session=session)
-
-    if intent["action"] in ("rename", "reformat"):
-        fmt = intent.get("format") or prior.get("fmt") or "docx"
-        filename = intent.get("filename") or prior.get("filename") or "document"
-        link = await _repackage_deliverable(prior["content"], filename, fmt,
-                                            chat_id=chat_id, headers=req_headers, session=session)
-        verb = "Renamed" if intent["action"] == "rename" else f"Re-exported as {fmt.upper()}"
-        return True, (f"📄 {verb} — download below.{link}" if link
-                       else "I couldn't re-export that file — want me to try again?"), ""
-
-    if intent["action"] != "edit":
-        return False, "", ""
-
-    baseline = (prior.get("content") or "").strip()
-
-    # 1. Targeted in-place patches
-    revised = await _try_patch_edit(baseline, _last_user_text(messages), session=session)
-    patched = revised is not None
-
-    # 2. Full rewrite if patches aren't clean
-    if not patched:
-        revised = ""
-        try:
-            revised = (await fireworks.complete(
-                [{"role": "system", "content": _now_line() + "\n\n" + _edit_inject(prior)
-                  + "\n\nOutput ONLY the complete revised document — no commentary."},
-                 {"role": "user", "content": _last_user_text(messages)}],
-                config.GROUNDED_MODEL, max_tokens=config.DRAFT_MAX_TOKENS,
-                temperature=config.WRITER_TEMPERATURE, session=session, label="edit:write")).strip()
-        except Exception as e:
-            log.warning(f"[edit] directed revision failed, falling to normal flow: {e}")
-        if revised and not _same_doc(revised, baseline) and "?" in revised and len(revised) < 1200:
-            return True, revised, ""
-
-    # 3. Verify + re-export
-    if revised and (patched or _same_doc(revised, baseline)):
-        src = ((_user_source(messages) + "\n\n" + baseline).strip()
-               if _user_source(messages).strip() else baseline)
-        status, text = await _verified_or_blocked(messages, revised, src, force=True, session=session)
-        if status != "ok":
-            return True, text, ""
-        link = await _repackage_deliverable(text, prior.get("filename") or "document",
-                                            prior.get("fmt") or "docx",
-                                            chat_id=chat_id, headers=req_headers, session=session)
-        summary = await _summarize_correction(baseline, text, session=session)
-        output = ("📄 Updated — download below." + (("\n\n" + summary) if summary else "") + link) if link \
-                 else "I couldn't rebuild the file — want me to try again?"
-        _persist_turn(chat_id, messages, text, session)
-        return True, output, ""
-    # Fell through — inject prior doc as context for normal agent loop
-    return False, _edit_inject(prior), baseline
-
-
 def _build_source(messages, image_transcript, edit_baseline):
     """Assemble grounding source: user files/pastes + image transcript + prior doc."""
     src = _user_source(messages)
@@ -789,7 +288,6 @@ def _build_source(messages, image_transcript, edit_baseline):
         src = (src + "\n\n" + edit_baseline).strip() if src.strip() else edit_baseline
     return src
 
-
 def _source_coverage_note(messages, source: str) -> str:
     if not (config.SHOW_SOURCE_COVERAGE and (source or "").strip()):
         return ""
@@ -797,7 +295,6 @@ def _source_coverage_note(messages, source: str) -> str:
     if blocks:
         return f"\n\n_Checked against {blocks} attached source block{'s' if blocks != 1 else ''}._"
     return "\n\n_Checked against the source material you provided in chat._"
-
 
 async def _build_system_prompt(messages, user_id, chat_id, profile, extra, session):
     """Build system prompt, handling context overflow with memory recall.
@@ -838,7 +335,6 @@ async def _build_system_prompt(messages, user_id, chat_id, profile, extra, sessi
                      + "\n\n".join(blocks)})
     return scratch, recall_ctx, msg_for_verify
 
-
 async def _try_plain_chat(messages, scratch, user_source, chat_id, session, is_user_model, had_images):
     """Stream a simple answer if no tools/sources needed. Yields output if handled."""
     if not config.STREAM_SIMPLE_CHAT or is_user_model or had_images or user_source:
@@ -855,21 +351,6 @@ async def _try_plain_chat(messages, scratch, user_source, chat_id, session, is_u
     answer = "".join(streamed).strip()
     if answer:
         _persist_turn(chat_id, messages, answer, session)
-
-
-async def _try_longdoc(messages, user_source, chat_id, session, is_user_model, edit_baseline):
-    """Propose outline for long-document requests. Yields output if handled."""
-    if not (config.ENABLE_CHUNKED_WRITER and chat_id and not is_user_model and not edit_baseline):
-        return
-    if not _maybe_longdoc(messages):
-        return
-    ld = await _classify_longdoc(messages, session=session)
-    if not ld.get("longdoc"):
-        return
-    async for kt in _present_outline(_all_user_text(messages), user_source,
-                                      chat_id=chat_id, filename="", fmt="docx", session=session):
-        yield kt
-
 
 #═══════════════════════════════════════════════════════════════════════════
 # Agent loop — the heavy path, now driven by AgentState
@@ -1159,11 +640,9 @@ async def _agent_loop(
 
     yield ("content", "I could not complete a verified answer within the configured tool budget.")
 
-
 # ═══════════════════════════════════════════════════════════════════════════
 # run() — thin phase orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
-
 
 async def run(
     messages: list[dict], *,
@@ -1283,7 +762,6 @@ async def run(
                                   user_final_model, chat_id, req_headers, session):
         yield kt
 
-
 def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
     tool_outputs = []
     for m in scratch:
@@ -1314,7 +792,6 @@ def _build_regeneration_context(scratch: list[dict], source: str) -> list[dict]:
         return [
             {"role": "user", "content": last_user.strip()},
         ]
-
 
 async def _regenerate_with_user_model(
     scratch: list[dict], user_model: str, source: str, session

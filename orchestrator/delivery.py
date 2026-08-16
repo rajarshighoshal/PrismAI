@@ -9,6 +9,7 @@ import logging
 
 from . import memory_client, toolserver
 from .owui import _text_of
+from .verifier import _WORD_RE
 from .tools import _tool_path, _export_download
 
 log = logging.getLogger(__name__)
@@ -96,3 +97,17 @@ def _pending_prose_deliverable(pending) -> str:
         if e.get("tool") in ("export_docx", "export_pdf", "export_markdown")
     ]
     return max(docs, key=len) if docs else ""
+
+
+def _same_doc(a: str, b: str) -> bool:
+    """True when two texts are the same document — requires both similar length and high word overlap to avoid mistaking a summary for the document."""
+    a, b = (a or "").strip(), (b or "").strip()
+    if not a or not b:
+        return False
+    lo, hi = sorted((len(a), len(b)))
+    if lo / hi < 0.6:  # very different lengths -> one is a summary/note, not the doc
+        return False
+    wa, wb = set(_WORD_RE.findall(a.lower())), set(_WORD_RE.findall(b.lower()))
+    if not wa or not wb:
+        return False
+    return len(wa & wb) / min(len(wa), len(wb)) >= 0.6
