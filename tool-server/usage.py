@@ -36,21 +36,25 @@ def _asset(name: str) -> str:
 
 
 # ── Pricing ($/Mtok in,out) ────────────────────────────────────────────────────────
-# Fireworks published serverless rates (fireworks.ai/pricing, verified 2026-06);
-# OpenAI/Anthropic for the prose tiers. NOTE: Fireworks bills CACHED input at 50%, so
-# actual spend on cache-heavy workloads runs below token*rate here — the authoritative
-# dollars are the Fireworks bill (see /usage/fireworks). flash/oss/v3 are estimates.
+# DeepSeek rows are DIRECT peak rates (orchestrator's primary route; off-peak = half,
+# peak 01:00–04:00 + 06:00–10:00 UTC, effective 2026-08-16); others are Fireworks
+# serverless (fireworks.ai/pricing) and OpenAI/Anthropic list, all verified 2026-08.
+# NOTE: Fireworks bills CACHED input at 50%, so actual spend on cache-heavy workloads
+# runs below token*rate here — the authoritative dollars are the Fireworks bill (see
+# /usage/fireworks). flash/oss/v3 are estimates.
 # Override any of these via the USAGE_PRICES env (JSON); applied at query time.
 USAGE_PRICES: dict = {
-    "deepseek-v4-pro": (1.74, 3.48), "deepseek-v4-flash": (0.22, 0.88),
+    "deepseek-v4-pro": (1.32, 3.96), "deepseek-v4-flash": (0.44, 1.32),
     "glm-5p1": (1.40, 4.40), "glm-5": (1.40, 4.40),
     "kimi-k2p6": (0.95, 4.00), "kimi-k2p5": (0.95, 4.00), "kimi-k2-thinking": (0.95, 4.00),
-    "gpt-5.5": (1.25, 10.00), "claude-sonnet-4-6": (3.00, 15.00),
+    "gpt-5.5": (1.25, 10.00),
+    "gpt-5.6-sol": (5.00, 30.00), "gpt-5.6-terra": (2.00, 12.00), "gpt-5.6-luna": (0.20, 1.20),
+    "claude-sonnet-4-6": (3.00, 15.00), "claude-opus-4-8": (5.00, 25.00), "claude-opus-4-6": (5.00, 25.00),
     "qwen3-embedding": (0.02, 0.0),
     "deepseek-v3p1": (0.27, 1.10), "deepseek-v3p2": (0.27, 1.10),
     "gpt-oss-120b": (0.15, 0.60), "gpt-oss-20b": (0.05, 0.20),
     "mixtral-8x22b-instruct": (0.90, 0.90), "cogito-671b-v2-p1": (0.90, 0.90),
-    "v4-research-writing": (1.74, 3.48),
+    "v4-research-writing": (1.32, 3.96),
 }
 
 # Live-priced overrides from monthly update_prices.py cron job. The updater writes

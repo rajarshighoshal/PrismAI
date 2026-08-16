@@ -48,17 +48,26 @@ FIREWORKS_OTHER = {
 }
 
 # ── DeepSeek-direct ────────────────────────────────────────────────────────
-# These are typically cheaper than Fireworks-proxied.
+# PEAK rates, effective 2026-08-16 (api-docs.deepseek.com/quick_start/pricing).
+# Off-peak is exactly half (pro 0.66/1.98, flash 0.22/0.66); peak hours are
+# 01:00–04:00 + 06:00–10:00 UTC. The ledger is not time-of-day aware, so peak is
+# the conservative bound. v3p1 is no longer offered on the direct API.
 DEEPSEEK_DIRECT = {
-    "deepseek-v4-pro": (1.10, 2.20),
-    "deepseek-v4-flash": (0.14, 0.56),
-    "deepseek-v3p1": (0.18, 0.72),
+    "deepseek-v4-pro": (1.32, 3.96),
+    "deepseek-v4-flash": (0.44, 1.32),
 }
 
 # ── Premium prose tiers ────────────────────────────────────────────────────
+# OpenAI (platform.openai.com/docs/pricing) + Anthropic (docs.anthropic.com pricing),
+# verified 2026-08-16.
 PREMIUM = {
     "gpt-5.5": (1.25, 10.00),
+    "gpt-5.6-sol": (5.00, 30.00),
+    "gpt-5.6-terra": (2.00, 12.00),
+    "gpt-5.6-luna": (0.20, 1.20),
     "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-opus-4-6": (5.00, 25.00),
 }
 
 # ── Aliases ────────────────────────────────────────────────────────────────
@@ -105,6 +114,11 @@ def build_prices():
     else:
         prices.update(FIREWORKS_DEEPSEEK)
         logger.info("Falling back to hardcoded Fireworks prices")
+
+    # DeepSeek-direct overrides the Fireworks rates for those models: the
+    # orchestrator tries direct FIRST (Fireworks is the fallback), so the direct
+    # peak rate is the right ledger number for the dominant route.
+    prices.update(DEEPSEEK_DIRECT)
 
     # Premium & aliases
     prices.update(PREMIUM)
