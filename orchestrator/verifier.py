@@ -4,9 +4,10 @@ import logging
 import re
 
 from . import config, fireworks
-from .owui import _SOURCE_BLOCK_RE, _all_user_text, _last_user_text
+from .owui import _all_user_text, _last_user_text
 from .timectx import _now_line
-from .prompts import SYSTEM_FACT_AUDIT, SYSTEM_GATE, SYSTEM_CHANGE_SUMMARY
+from .prompts import SYSTEM_GATE, SYSTEM_CHANGE_SUMMARY
+from prism_core.audit import fact_audit as _core_fact_audit
 from prism_core.verifier import (
     WORD_RE as _WORD_RE,
     AUDIT_ERROR as _AUDIT_ERROR,
@@ -14,7 +15,6 @@ from prism_core.verifier import (
     has_citation_markers as _has_citation_markers,
     norm_token_str as _norm_token_str,
     claim_verbatim_in_source as _claim_verbatim_in_source,
-    fit_audit_source as _fit_audit_source,
 )
 
 log = logging.getLogger(__name__)
@@ -101,57 +101,18 @@ def _edit_directive(rewrite: bool) -> str:
 
 
 async def _fact_audit(full_request: str, source: str, candidate: str, *, session=None, raw_source=None):
-    """The single fact-integrity verifier. Sees REQUEST, SOURCE, and DRAFT side by side, flags only unsupported FACTS. Returns {unsupported, verdict} or {verdict:ERROR} when the auditor produces no usable verdict — FAILS CLOSED."""
-    if not candidate.strip():
-        return {"unsupported": [], "verdict": "CLEAN"}
-    fitted = _fit_audit_source(source, candidate, config.AUDIT_SOURCE_BUDGET)
-    # De-dup only: the source lives in SOURCE MATERIAL, so drop the identical <source>
-    # blocks from the request (no information lost). NO truncation — the auditor sees
-    # the whole request, the whole source, and the whole draft.
-    request = _SOURCE_BLOCK_RE.sub("", full_request).strip()
-    user = (
-        f"USER REQUEST (instructions; the FACTS are in SOURCE MATERIAL):\n{request}\n\n"
-        f"SOURCE MATERIAL:\n{fitted if fitted else '(none)'}\n\n"
-        f"DRAFT:\n{candidate}"
-    )
-    for attempt in range(2):  # one retry for a transient hiccup / formatting fluke
-        try:
-            raw, finish = await fireworks.complete(
-                [{"role": "system", "content": SYSTEM_FACT_AUDIT},
-                 {"role": "user", "content": user}],
-                config.HONESTY_MODEL,
-                max_tokens=config.AUDIT_MAX_TOKENS,
-                temperature=0.0,
-                reasoning_effort=config.AUDIT_REASONING_EFFORT,
-                session=session,
-                label="audit",
-                return_finish=True,
-            )
-            match = re.search(r"\{.*\}", raw, flags=re.S)
-            data = None
-            if match:
-                try:
-                    data = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    data = None  # truncated mid-object / malformed
-            if isinstance(data, dict) and data.get("verdict"):
-                if config.LOG_SOURCE_DIAG:
-                    source_norm = _norm_token_str(raw_source or fitted)
-                    flagged = data.get("unsupported") or []
-                    false_pos = sum(1 for f in flagged if _claim_verbatim_in_source(f, source_norm))
-                    log.info(f"[audit-diag] reasoning={config.AUDIT_REASONING_EFFORT} audit_src_chars={len(fitted)} "
-                             f"verdict={data.get('verdict')} flagged={len(flagged)} verbatim_false_pos={false_pos}")
-                return data
-            # No usable verdict. If truncated, a retry won't help (same input, same cap) ->
-            # fail closed now; otherwise retry once for a transient garble.
-            if finish == "length":
-                log.warning("[audit] verdict truncated/unparseable (finish=length) -> FAIL CLOSED")
-                return {"verdict": _AUDIT_ERROR, "reason": "truncated"}
-            log.warning(f"[audit] no parseable verdict (attempt {attempt + 1}/2)")
-        except Exception as e:
-            log.warning(f"[audit] call failed (attempt {attempt + 1}/2): {type(e).__name__}: {e}")
-    log.warning("[audit] no usable verdict after retry -> FAIL CLOSED")
-    return {"verdict": _AUDIT_ERROR, "reason": "no_verdict"}
+    """The single fact-integrity verifier — the audit itself lives in prism_core.audit
+    (provider-injected, publishable); this wrapper wires PrismAI's configured auditor
+    model + provider client in. Returns {unsupported, verdict} or {verdict:ERROR} when
+    the auditor produces no usable verdict — FAILS CLOSED."""
+    return await _core_fact_audit(
+        full_request, source, candidate,
+        complete_fn=fireworks.complete,
+        model=config.HONESTY_MODEL,
+        max_tokens=config.AUDIT_MAX_TOKENS,
+        reasoning_effort=config.AUDIT_REASONING_EFFORT,
+        source_budget=config.AUDIT_SOURCE_BUDGET,
+        session=session, raw_source=raw_source, diag=config.LOG_SOURCE_DIAG)
 
 
 async def _refine_facts(full_request: str, source: str, candidate: str, unsupported,

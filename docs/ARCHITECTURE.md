@@ -65,7 +65,7 @@ The repo is split into a channel-neutral core and the OWUI-facing service:
 
 | File | Role |
 |---|---|
-| `prism_core/` | channel-neutral, provider-agnostic package (stdlib only; publish-ready): `verifier.py` (verbatim backstop, source-fit, fail-closed sentinel), `messages.py` (generic message helpers) |
+| `prism_core/` | channel-neutral, provider-agnostic package (stdlib only; MIT-licensed, own `pyproject.toml`, publish-ready): `audit.py` (the provider-injected fact audit + its prompt), `verifier.py` (verbatim backstop, source-fit, fail-closed sentinel, `<source>` delimiter), `messages.py` (generic message helpers) |
 | `orchestrator/` | the OWUI channel adapter + turn engine (one of two deployables) |
 | `orchestrator/app.py` | FastAPI shell, OpenAI-compatible endpoints |
 | `orchestrator/pipeline.py` | entry + streaming crash guard |

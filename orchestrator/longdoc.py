@@ -10,7 +10,8 @@ import logging
 from . import config, fireworks, memory_client
 from .owui import _last_user_text, _all_user_text
 from .prompts import SYSTEM_LONGDOC_GATE, SYSTEM_OUTLINE, SYSTEM_PLAN_INTENT, SYSTEM_SECTION_WRITER
-from .verifier import _verified_or_blocked, _fit_audit_source, _has_citation_markers, _WORD_RE
+from .verifier import _verified_or_blocked, _has_citation_markers, _WORD_RE
+from prism_core.verifier import fit_audit_source as _fit_audit_source
 from .delivery import _repackage_deliverable, _track_task
 
 log = logging.getLogger(__name__)
