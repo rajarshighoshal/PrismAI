@@ -62,12 +62,18 @@ def _providers(model: str):
     """Ordered (base_url, api_key, provider_model, is_deepseek_direct) to try. For deepseek
     models with a DeepSeek key configured: DeepSeek-direct first (same model name, just
     drop the 'accounts/fireworks/models/' prefix), Fireworks as the fallback. Everything
-    else — and the no-key case — is Fireworks only, identical to before."""
+    else — and the no-key case — is Fireworks only. A configured spare-tire provider
+    (FALLBACK_BASE_URL + mapped model) is appended last; unset/unmapped = unchanged."""
     fw = (config.FIREWORKS_BASE_URL, config.FIREWORKS_API_KEY, model, False)
     if (config.ENABLE_DEEPSEEK_DIRECT and config.DEEPSEEK_API_KEY
             and "deepseek" in (model or "")):
-        return [(config.DEEPSEEK_BASE_URL, config.DEEPSEEK_API_KEY, model.split("/")[-1], True), fw]
-    return [fw]
+        chain = [(config.DEEPSEEK_BASE_URL, config.DEEPSEEK_API_KEY, model.split("/")[-1], True), fw]
+    else:
+        chain = [fw]
+    spare_model = config.FALLBACK_MODEL_MAP.get(model)
+    if config.FALLBACK_BASE_URL and config.FALLBACK_API_KEY and spare_model:
+        chain.append((config.FALLBACK_BASE_URL, config.FALLBACK_API_KEY, spare_model, False))
+    return chain
 
 
 def _effort_for(label: str, explicit) -> str:

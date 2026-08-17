@@ -1567,6 +1567,24 @@ async def _run_tests():
     check("provider: non-deepseek model -> Fireworks only even with a DeepSeek key",
           [p[3] for p in fireworks._providers("accounts/fireworks/models/kimi-k2p6")] == [False])
 
+    # ── Spare-tire hop: config-driven, model-mapped, appended LAST; inert by default ──
+    _fb = (config.FALLBACK_BASE_URL, config.FALLBACK_API_KEY, dict(config.FALLBACK_MODEL_MAP))
+    config.FALLBACK_BASE_URL, config.FALLBACK_API_KEY = "", ""
+    check("provider: no spare configured -> chain unchanged",
+          len(fireworks._providers("accounts/fireworks/models/deepseek-v4-pro")) == 2)
+    config.FALLBACK_BASE_URL, config.FALLBACK_API_KEY = "https://spare.example/v1", "spkey"
+    check("provider: spare configured but model unmapped -> chain unchanged",
+          len(fireworks._providers("accounts/fireworks/models/deepseek-v4-pro")) == 2)
+    config.FALLBACK_MODEL_MAP = {"accounts/fireworks/models/deepseek-v4-pro": "deepseek/deepseek-v4-pro",
+                                 "accounts/fireworks/models/glm-5p2": "z-ai/glm-5p2"}
+    _chain = fireworks._providers("accounts/fireworks/models/deepseek-v4-pro")
+    check("provider: mapped deepseek model -> spare appended last with mapped ID",
+          len(_chain) == 3 and _chain[2] == ("https://spare.example/v1", "spkey", "deepseek/deepseek-v4-pro", False))
+    _chain = fireworks._providers("accounts/fireworks/models/glm-5p2")
+    check("provider: mapped non-deepseek model -> Fireworks then spare",
+          [p[2] for p in _chain] == ["accounts/fireworks/models/glm-5p2", "z-ai/glm-5p2"])
+    config.FALLBACK_BASE_URL, config.FALLBACK_API_KEY, config.FALLBACK_MODEL_MAP = _fb[0], _fb[1], _fb[2]
+
     # ── Reasoning policy: MAX for substantive roles, fast for classifiers (label-based) ──
     _saved_re = config.REASONING_EFFORT
     config.REASONING_EFFORT = "max"
