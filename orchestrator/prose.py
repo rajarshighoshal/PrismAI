@@ -16,20 +16,46 @@ from .prompts import SYSTEM_VOICE_REGISTER, _PROSE_POLISH_SYS, _VOICE_REGISTER, 
 log = logging.getLogger(__name__)
 
 
+def _client_for_model(model: str):
+    """Route a configured prose model to its provider client by ID shape. A Fireworks
+    path (accounts/…) goes to the Fireworks client (the single-bill path: deepseek /
+    glm / kimi / qwen / …); gpt-* to OpenAI, claude-* to Anthropic, gemini-* to Gemini —
+    the latter three only when that provider is usable, else None so callers fall back."""
+    m = (model or "").strip().lower()
+    if not m:
+        return None
+    if m.startswith("accounts/"):
+        return fireworks if config.FIREWORKS_API_KEY else None
+    if m.startswith("gpt-"):
+        return openai_client if openai_client.available() else None
+    if m.startswith("claude-"):
+        return anthropic_client if anthropic_client.available() else None
+    if m.startswith("gemini-"):
+        return gemini if gemini.available() else None
+    return None
+
+
+# Legacy voice aliases (existing envs, traces, and the agent's learned choices use them).
+_VOICE_ALIASES = {
+    "gpt-5.5": lambda: config.OPENAI_PROSE_MODEL_PREMIUM,
+    "opus": lambda: config.ANTHROPIC_PROSE_MODEL,
+    "sonnet": lambda: config.ANTHROPIC_STANDARD_MODEL,
+}
+
+
 def _prose_provider(voice):
-    """Map the agent-chosen polish voice to (client, model), honoring availability
-    with graceful fallback. None if no provider is usable (stay on the open draft)."""
-    if voice == "gpt-5.5" and openai_client.available():
-        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
-    if voice == "opus" and anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if voice == "sonnet" and anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_STANDARD_MODEL
-    # requested provider unavailable — fall back to any usable prose model
-    if anthropic_client.available():
-        return anthropic_client, config.ANTHROPIC_PROSE_MODEL
-    if openai_client.available():
-        return openai_client, config.OPENAI_PROSE_MODEL_PREMIUM
+    """Map the polish voice — an alias OR a full model ID — to (client, model), honoring
+    availability with graceful fallback. None if no provider is usable (stay on the open draft)."""
+    alias = _VOICE_ALIASES.get(voice)
+    requested = alias() if alias else voice
+    client = _client_for_model(requested)
+    if client is not None:
+        return client, requested
+    # requested provider unusable — fall back to any usable prose model
+    for cand in (config.ANTHROPIC_PROSE_MODEL, config.OPENAI_PROSE_MODEL_PREMIUM):
+        client = _client_for_model(cand)
+        if client is not None:
+            return client, cand
     if gemini.available():
         return gemini, config.GEMINI_PROSE_MODEL
     return None
@@ -68,14 +94,17 @@ async def _classify_voice_register(request, candidate, *, session=None) -> str:
 
 
 async def _voice_pass(candidate, register, *, session=None):
-    """Optional sonnet voice-only pass at a register (warm/formal). Never alters facts."""
-    if not anthropic_client.available():
+    """Optional voice-only pass at a register (warm/formal). Never alters facts.
+    The provider follows config.VOICE_MODEL — any served model (Fireworks path,
+    gpt-*, claude-*), so the voice tier no longer depends on one vendor's account."""
+    client = _client_for_model(config.VOICE_MODEL)
+    if client is None:
         return candidate
     sys = _VOICE_PASS_SYS.replace("{register}", _VOICE_REGISTER.get(register, _VOICE_REGISTER["formal"]))
     try:
-        out = await anthropic_client.complete(
+        out = await client.complete(
             [{"role": "system", "content": sys}, {"role": "user", "content": f"DRAFT:\n{candidate}"}],
-            config.ANTHROPIC_STANDARD_MODEL,
+            config.VOICE_MODEL,
             max_tokens=config.AGENT_MAX_TOKENS, temperature=config.WRITER_TEMPERATURE, session=session,
             label="voice")
         return out.strip() if (out and out.strip()) else candidate

@@ -44,6 +44,11 @@ ANTHROPIC_STANDARD_MODEL = os.getenv("ANTHROPIC_STANDARD_MODEL", "claude-sonnet-
 # picks this via a tool (that confused it); the orchestrator just applies it.
 AUTO_POLISH_MODEL = os.getenv("AUTO_POLISH_MODEL", "gpt-5.5")
 
+# Voice pass: model-driven provider routing — any served model ID works (a Fireworks
+# path like accounts/fireworks/models/glm-5p2 keeps the voice tier on the single
+# Fireworks bill; gpt-*/claude-* route to their own clients).
+VOICE_MODEL = os.getenv("VOICE_MODEL", ANTHROPIC_STANDARD_MODEL)
+
 # tool-server (same docker network) — verification + export primitives.
 TOOL_SERVER_URL = os.getenv("TOOL_SERVER_URL", "http://owui-tool-server:8001").rstrip("/")
 
