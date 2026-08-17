@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "prism-core"
+name = "prismai"
 version = "0.1.0"
 description = "Provider-agnostic honesty gate for LLM answers: fact-integrity audit with a verbatim backstop and fail-closed semantics"
 readme = "README.md"
