@@ -716,6 +716,32 @@ async def _run_tests():
     _oc.available, _oc.complete = _oc_avail, _oc_complete
     config.ENABLE_OPENAI_PROSE = False
 
+    # Model-driven prose routing: a full model ID (any provider) must route to the
+    # right client — the Fireworks path keeps the prose tiers on the single bill.
+    from orchestrator import prose as _prose
+    import orchestrator.openai_client as _oc
+    _oc_avail = _oc.available
+    _oc.available = lambda: True
+    _saved_pm = (config.OPENAI_PROSE_MODEL_PREMIUM, config.ANTHROPIC_PROSE_MODEL,
+                 config.VOICE_MODEL, config.FIREWORKS_API_KEY)
+    config.FIREWORKS_API_KEY = config.FIREWORKS_API_KEY or "test-key"
+    _glm = "accounts/fireworks/models/glm-5p2"
+    check("prose routing: Fireworks model path routes to the fireworks client",
+          _prose._client_for_model(_glm) is fireworks)
+    check("prose routing: legacy alias 'gpt-5.5' resolves to the configured premium model",
+          _prose._prose_provider("gpt-5.5") == (_oc, config.OPENAI_PROSE_MODEL_PREMIUM))
+    config.OPENAI_PROSE_MODEL_PREMIUM = _glm
+    check("prose routing: premium tier pointed at Fireworks still honors the 'gpt-5.5' alias",
+          _prose._prose_provider("gpt-5.5") == (fireworks, _glm))
+    check("prose routing: a full model ID as the voice routes directly",
+          _prose._prose_provider(_glm) == (fireworks, _glm))
+    config.VOICE_MODEL = _glm
+    check("prose routing: voice pass follows VOICE_MODEL to Fireworks",
+          _prose._client_for_model(config.VOICE_MODEL) is fireworks)
+    (config.OPENAI_PROSE_MODEL_PREMIUM, config.ANTHROPIC_PROSE_MODEL,
+     config.VOICE_MODEL, config.FIREWORKS_API_KEY) = _saved_pm
+    _oc.available = _oc_avail
+
     # If a model tries factual output with no source, the gate pushes it back
     # into the tool loop instead of showing the unverified draft.
     _reset()
