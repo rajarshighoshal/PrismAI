@@ -239,10 +239,13 @@ SYSTEM_EDIT_INTENT = (
     "message is below, with the recent conversation for context — follow-ups are often "
     "anaphoric ('also add…', 'connect it…') and only make sense against the turns before. "
     "Decide what they want now, relative to that document. Return JSON "
-    "only: {\"action\": \"rename\"|\"reformat\"|\"edit\"|\"new\", \"filename\": string, "
+    "only: {\"action\": \"rename\"|\"reformat\"|\"edit\"|\"voice\"|\"new\", \"filename\": string, "
     "\"format\": \"docx\"|\"pdf\"|\"md\"}.\n"
     "- edit: any request to change the document's CONTENT — update/revise/fix/correct it, "
     "change a fact, figure, name, or date, add or remove text, shorten, expand, or reword.\n"
+    "- voice: keep the CONTENT identical, change only the TONE/STYLE — 'make it warmer', "
+    "'more human', 'less stiff', 'more formal', 'sound nicer', 'flow better'. Only when the "
+    "user is happy with WHAT it says and wants a different HOW.\n"
     "- rename: keep the content identical, change only the file NAME -> put it in filename.\n"
     "- reformat: keep the content identical, change only the file TYPE -> put it in format.\n"
     "- new: a genuinely different, unrelated document or task.\n"
@@ -284,17 +287,6 @@ SYSTEM_REQUEST_GATE = (
 # SYSTEM_FACT_AUDIT lives in prism_core.audit (the publishable core owns its own
 # prompt); re-exported here so existing imports keep working.
 from prism_core.audit import SYSTEM_FACT_AUDIT  # noqa: F401
-
-SYSTEM_VOICE_REGISTER = (
-    "Pick the voice register for a finished written deliverable — the touch that makes "
-    "it read like a person wrote it. Return JSON only: "
-    "{\"register\": \"warm\"|\"formal\"|\"none\"}.\n"
-    "- warm: personal writing where a human voice helps — emails, personal statements, "
-    "bios, notes, messages, recommendation or motivation letters.\n"
-    "- formal: academic or professional writing — cover letters, research/project/class "
-    "reports, formal letters, documentation, proposals.\n"
-    "- none: code, data/tables, or short factual answers that need no register pass."
-)
 
 SYSTEM_CHANGE_SUMMARY = (
     "You are shown a BEFORE and AFTER version of a piece of writing that an honesty "

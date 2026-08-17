@@ -10,6 +10,7 @@ from .owui import _last_user_text, _unwrap_owui, _user_source
 from prism_core.messages import _text_of
 from .timectx import _now_line
 from .prompts import SYSTEM_EDIT_INTENT, SYSTEM_EDIT_PATCH
+from .prose import _voice_pass
 from .verifier import _verified_or_blocked, _summarize_correction, _WORD_RE
 from .delivery import _persist_turn, _repackage_deliverable, _same_doc
 
@@ -29,7 +30,7 @@ async def _classify_edit_once(payload, *, session=None) -> dict:
         )
         data = json.loads(re.search(r"\{.*\}", raw, flags=re.S).group(0))
         a = str(data.get("action", "new")).lower()
-        if a in ("rename", "reformat", "edit"):
+        if a in ("rename", "reformat", "edit", "voice"):
             return {"action": a, "filename": (data.get("filename") or "").strip(),
                     "format": (data.get("format") or "").strip().lower()}
     except Exception:
@@ -143,6 +144,29 @@ async def _dispatch_edit(messages, prior, chat_id, req_headers, session, show_wo
         verb = "Renamed" if intent["action"] == "rename" else f"Re-exported as {fmt.upper()}"
         return True, (f"📄 {verb} — download below.{link}" if link
                        else "I couldn't re-export that file — want me to try again?"), ""
+
+    if intent["action"] == "voice":
+        # On-demand voice route: the user is happy with the CONTENT and asked for a
+        # different TONE ("make it more human", "warmer", "more formal"). Run the voice
+        # pass on the stored document, verify (facts must not move), re-export.
+        req = _last_user_text(messages).lower()
+        register = ("formal" if any(c in req for c in ("formal", "professional", "polished", "corporate"))
+                    else "warm")
+        voiced = await _voice_pass(prior["content"], register, session=session)
+        if not voiced or not voiced.strip() or voiced.strip() == prior["content"].strip():
+            return True, "I couldn't give it a different voice this time — want me to try again?", ""
+        src = ((_user_source(messages) + "\n\n" + prior["content"]).strip()
+               if _user_source(messages).strip() else prior["content"])
+        status, text = await _verified_or_blocked(messages, voiced, src, force=True, session=session)
+        if status != "ok":
+            return True, text, ""
+        link = await _repackage_deliverable(text, prior.get("filename") or "document",
+                                            prior.get("fmt") or "docx",
+                                            chat_id=chat_id, headers=req_headers, session=session)
+        output = (f"📄 Same content, {register} voice — download below.{link}" if link
+                  else "I couldn't rebuild the file — want me to try again?")
+        _persist_turn(chat_id, messages, text, session)
+        return True, output, ""
 
     if intent["action"] != "edit":
         return False, "", ""
