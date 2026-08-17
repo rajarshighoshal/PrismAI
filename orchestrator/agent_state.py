@@ -26,7 +26,6 @@ class AgentState:
 
     # ── Polish configuration ─────────────────────────────────────────
     polish_voice: Optional[str] = None       # e.g. "gpt-5.5", "opus", "sonnet"
-    polish_voice_pass: Optional[str] = None  # e.g. "warm", "formal", "none"
 
     # ── Flow control flags (one-shot nudges) ─────────────────────────
     budget_note_added: bool = False   # tool budget exhausted note injected?

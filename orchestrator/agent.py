@@ -25,7 +25,7 @@ from .prompts import (
 # existing tests (agent._VISION_CACHE, agent._split_vision_output) working unchanged.
 from .vision import _read_images, _split_vision_output, _VISION_CACHE  # noqa: F401
 # Prose polish + voice pass live in their own module; imported for use in the agent loop.
-from .prose import _prose_provider, _prose_polish_messages, _classify_voice_register, _voice_pass  # noqa: F401
+from .prose import _prose_provider, _prose_polish_messages  # noqa: F401
 # Tool layer (schemas, guard gate, execution, result shaping) lives in its own module.
 from .tools import (  # noqa: F401
     _budgeted_tools, _tool_status, _tool_path, _execute_tool, _tool_allowed,
@@ -502,9 +502,6 @@ async def _agent_loop(
                            await _progress_note("drafted", messages, session=session))
                 if not edit_baseline:
                     st.polish_voice = st.polish_voice or config.AUTO_POLISH_MODEL
-                    if st.polish_voice_pass is None:
-                        st.polish_voice_pass = await _classify_voice_register(
-                            _all_user_text(messages), candidate, session=session)
 
         substantial = len(candidate) >= config.POLISH_MIN_CHARS
         visible_progress = bool(st.pending_exports and substantial)
@@ -538,14 +535,6 @@ async def _agent_loop(
                         candidate = polished.strip()
             except Exception as e:
                 log.warning(f"[prose_polish] {pmodel} failed, keeping open-model draft: {e}")
-
-        # Voice pass (long-form only)
-        if (not streamed_live and st.polish_voice_pass and st.polish_voice_pass != "none"
-                and not is_clar and len(candidate) >= config.POLISH_VOICE_MIN_CHARS):
-            if config.SHOW_WORK:
-                yield ("content" if visible_progress else "reasoning",
-                       await _progress_note("voice", messages, detail=st.polish_voice_pass, session=session))
-            candidate = await _voice_pass(candidate, st.polish_voice_pass, session=session)
 
         if visible_progress:
             if config.SHOW_WORK:

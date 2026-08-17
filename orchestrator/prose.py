@@ -4,14 +4,12 @@ Split out of the agent god-module (part of the in-progress prism_core). Chooses 
 provider (OpenAI / Anthropic / Gemini) with graceful fallback, builds the polish request,
 classifies a voice register, and runs the optional voice-only pass. No agent-runtime deps.
 """
-import json
 import logging
-import re
 
 from . import config, fireworks, gemini, openai_client, anthropic_client, prompt_security
 from .owui import _all_user_text
 from .timectx import _now_line
-from .prompts import SYSTEM_VOICE_REGISTER, _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS
+from .prompts import _PROSE_POLISH_SYS, _VOICE_REGISTER, _VOICE_PASS_SYS
 
 log = logging.getLogger(__name__)
 
@@ -76,21 +74,6 @@ def _prose_polish_messages(messages, candidate, source):
         {"role": "system", "content": _PROSE_POLISH_SYS + "\n\n" + _now_line()},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
-
-
-async def _classify_voice_register(request, candidate, *, session=None) -> str:
-    """Pick the voice-pass register (warm/formal/none) for an exported deliverable from the document itself."""
-    try:
-        raw = await fireworks.complete(
-            [{"role": "system", "content": SYSTEM_VOICE_REGISTER},
-             {"role": "user", "content": f"REQUEST:\n{request[:1500]}\n\nDELIVERABLE (excerpt):\n{candidate[:1500]}"}],
-            config.GROUNDING_GATE_MODEL, max_tokens=30, temperature=0.0,
-            session=session, label="gate:voice")
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        reg = str(json.loads(m.group(0) if m else raw).get("register", "none")).lower()
-        return reg if reg in ("warm", "formal") else "none"
-    except Exception:
-        return "none"
 
 
 async def _voice_pass(candidate, register, *, session=None):

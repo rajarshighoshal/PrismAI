@@ -1286,6 +1286,52 @@ async def _run_tests():
     check("edit/no-repolish: the edited file still ships",
           _calls["post"] and "doctoral position" in _calls["post"][0][1]["markdown"])
 
+    # On-demand voice route: a tone-only ask ("make it more human") on a delivered doc
+    # goes through the voice pass on VOICE_MODEL + verify + re-export — NOT a rewrite.
+    _reset()
+    prior_doc = ("Dear Committee, my work spans ML engineering and parallel algorithms across "
+                 "industry and research. " * 4)
+    _deliverable_holder[:] = [{"content": prior_doc, "filename": "letter", "fmt": "docx"}]
+    _edit_intent_queue.append({"action": "voice", "filename": "", "format": ""})
+    _saved_vm = config.VOICE_MODEL
+    config.VOICE_MODEL = "accounts/fireworks/models/glm-5p2"
+    _post_queue.append([{"status": "success", "filename": "letter.docx",
+                         "download_url": "/api/v1/files/v/content/letter.docx"}])
+    ev = await _collect([{"role": "user", "content": "content is fine, but make the letter sound more human"}],
+                        request_headers={"x-openwebui-chat-id": "voice1"})
+    check("voice route: tone-only ask fires the voice pass on VOICE_MODEL",
+          "voice" in _calls.get("labels", [])
+          and "accounts/fireworks/models/glm-5p2" in _calls.get("complete_models", []))
+    check("voice route: the voiced file is re-exported, with NO rewrite call",
+          _calls["post"] and _calls["post"][0][1]["markdown"] == "completion"
+          and "edit:write" not in _calls.get("labels", []))
+    config.VOICE_MODEL = _saved_vm
+
+    # The automatic voice pass is gone: a fresh export polishes but is NOT voiced unless
+    # the user asks (the register classifier call gate:voice must not fire).
+    _reset()
+    import orchestrator.openai_client as _oc3
+    _oc3_avail, _oc3_complete = _oc3.available, _oc3.complete
+    _oc3.available = lambda: True
+    async def _fake_prose3(messages, model, *, max_tokens, temperature=None, session=None, label=""):
+        _calls.setdefault("prose", []).append(model)
+        return "[polished] " + messages[-1]["content"].split("DRAFT TO POLISH:")[-1].strip()
+    _oc3.complete = _fake_prose3
+    config.ENABLE_OPENAI_PROSE = True
+    letter = ("Dear Hiring Team, I am applying for the data analyst role. Over two years I "
+              "built dashboards and ran experiments to inform decisions. " * 4)
+    _post_queue.append([{"status": "success", "filename": "cl.docx", "download_url": "/api/v1/files/p/content/cl.docx"}])
+    _chat_queue.extend([
+        _chat_tools(_tool_call("export_docx", {"markdown": letter, "filename": "cl"})),
+        _chat_content("Done — your letter is ready."),
+    ])
+    _gate_queue.append(False)
+    await _collect([{"role": "user", "content": "Write a cover letter and export as docx. Facts: 2 years as a data analyst."}])
+    check("voice route: no automatic voice pass on fresh exports (gate:voice never fires)",
+          "gate:voice" not in _calls.get("labels", []) and "voice" not in _calls.get("labels", []))
+    _oc3.available, _oc3.complete = _oc3_avail, _oc3_complete
+    config.ENABLE_OPENAI_PROSE = False
+
     # COLLABORATE: on an ambiguous edit the writer may ASK instead of guess — the
     # question ships straight to the user (no export, no reconstruction), and the chat
     # keeps the document stored for their answer.
