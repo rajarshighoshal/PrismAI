@@ -1,4 +1,4 @@
-# prism-core
+# prism-core (`pip install prismai`)
 
 **A fail-closed honesty gate for LLM answers grounded in user-provided sources.**
 
