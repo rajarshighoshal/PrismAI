@@ -281,39 +281,9 @@ SYSTEM_REQUEST_GATE = (
     "brainstorming, code, and general knowledge."
 )
 
-SYSTEM_FACT_AUDIT = (
-    "You are a fact-integrity verifier for an assistant's written DRAFT. The writing can "
-    "be anything — a message, email, resume, letter, bio, summary, or a research, "
-    "project, or class report. The TYPE does not matter; you check only that it invents "
-    "no FACTS.\n"
-    "The user's own statements are authoritative for their own facts, two rules follow: "
-    "(1) users type with TYPOS — a draft claim that is a cleaned-up spelling/grammar of "
-    "something the user stated is SUPPORTED (match meaning, not spelling); (2) when the "
-    "user's CURRENT statement conflicts with an older uploaded document, the user's "
-    "statement WINS — people's situations change after their files were written.\n"
-    "You are given the USER REQUEST (which mixes facts the user states with instructions "
-    "about what to write), SOURCE MATERIAL (uploaded documents, retrieved sources, prior "
-    "context), and the DRAFT.\n"
-    "Flag every VERIFIABLE FACTUAL claim in the DRAFT not supported by the user's stated "
-    "facts, the SOURCE, or genuine common knowledge:\n"
-    "- about the user: credentials, employers, titles, years of experience, education, "
-    "metrics, revenue, team sizes, awards, or specific past projects/events/experiences "
-    "asserted as having happened;\n"
-    "- about the world: statistics, dates, names, quantities, citations, study findings, "
-    "technical or historical facts;\n"
-    "- any invented backstory or event presented as real.\n"
-    "CRITICAL: an INSTRUCTION to include or 'emphasize' something is NOT evidence it is "
-    "true — 'emphasize my 8 years of leadership' does not make '8 years of leadership' a "
-    "supported fact.\n"
-    "NEVER flag content that cannot be true or false: motivation, interest, enthusiasm, "
-    "intent ('eager to', 'drawn to', 'committed to learning', 'hope to contribute'), "
-    "opinions, framing, aspirations, tone, structure, and hedged or forward-looking "
-    "statements. Generic, plausible interest in a role, topic, field, or collaboration "
-    "is fine even if unstated. Genuine common knowledge needs no source. Facts the user "
-    "DID give (and reasonable paraphrase) are supported — never flag them.\n"
-    "Output strict JSON only: {\"unsupported\": [\"exact phrase\", ...], \"verdict\": "
-    "\"FABRICATION\" if any unsupported factual claim exists, else \"CLEAN\"}."
-)
+# SYSTEM_FACT_AUDIT lives in prism_core.audit (the publishable core owns its own
+# prompt); re-exported here so existing imports keep working.
+from prism_core.audit import SYSTEM_FACT_AUDIT  # noqa: F401
 
 SYSTEM_VOICE_REGISTER = (
     "Pick the voice register for a finished written deliverable — the touch that makes "

@@ -8,6 +8,7 @@ wrapping. Pure functions: regex + string work only.
 import re
 
 from prism_core.messages import _text_of, _same_message_source
+from prism_core.verifier import SOURCE_BLOCK_RE as _SOURCE_BLOCK_RE
 
 _USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
 
@@ -28,8 +29,6 @@ def _last_user_text(messages) -> str:
         if m.get("role") == "user":
             return _unwrap_owui(_text_of(m.get("content")).strip())
     return ""
-
-_SOURCE_BLOCK_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S | re.I)
 
 def _owui_source_blocks(text: str) -> list[str]:
     """OpenWebUI injects an attached file's text (paperclip upload) into the chat

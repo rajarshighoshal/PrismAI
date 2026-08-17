@@ -17,6 +17,11 @@ import re
 # Whole-token matcher shared by normalization and the verbatim backstop.
 WORD_RE = re.compile(r"[a-z0-9]+")
 
+# PrismAI's source-block delimiter convention: attached/retrieved material travels
+# inside <source ...>...</source> blocks. The channel adapter (e.g. the OpenWebUI
+# adapter) parses them out; the audit strips their duplicates from the request.
+SOURCE_BLOCK_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S | re.I)
+
 # The auditor could NOT return a usable verdict (call failed / empty / unparseable /
 # truncated). This is NOT 'clean' — the can't-lie layer FAILS CLOSED on it.
 AUDIT_ERROR = "ERROR"

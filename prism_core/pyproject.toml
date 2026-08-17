@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prism-core"
+version = "0.1.0"
+description = "Provider-agnostic honesty gate for LLM answers: fact-integrity audit with a verbatim backstop and fail-closed semantics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Rajarshi Ghoshal"}]
+keywords = ["llm", "hallucination", "grounding", "verification", "guardrails"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/rajarshighoshal/PrismAI"
+
+[tool.hatch.build.targets.wheel]
+include = ["*.py"]
+
+# The project root IS the package directory; remap its contents under the
+# prism_core/ prefix so `import prism_core.audit` works after install.
+[tool.hatch.build.targets.wheel.sources]
+"" = "prism_core"
+
+[tool.hatch.build.targets.sdist]
+include = ["*.py", "README.md", "LICENSE", "pyproject.toml"]
