@@ -1,4 +1,5 @@
 """Orchestrator configuration — all env-driven, with defaults mirroring the router_fn behavior."""
+import json
 import os
 
 
@@ -19,6 +20,19 @@ FIREWORKS_BASE_URL = os.getenv(
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 ENABLE_DEEPSEEK_DIRECT = _flag("ENABLE_DEEPSEEK_DIRECT", "true")
+
+# Spare-tire provider: any OpenAI-compatible endpoint (OpenRouter, Together, Groq, …)
+# tried ONLY after the primary chain (DeepSeek-direct -> Fireworks) has failed. Model
+# IDs differ per provider, so they are mapped explicitly via FALLBACK_MODEL_MAP (JSON
+# object, e.g. {"accounts/fireworks/models/deepseek-v4-pro": "deepseek/deepseek-v4-pro"});
+# unmapped models skip the spare — a wrong-ID call is worse than no spare. Fully inert
+# until URL + key are set.
+FALLBACK_BASE_URL = os.getenv("FALLBACK_BASE_URL", "").rstrip("/")
+FALLBACK_API_KEY = os.getenv("FALLBACK_API_KEY", "")
+try:
+    FALLBACK_MODEL_MAP = json.loads(os.getenv("FALLBACK_MODEL_MAP", "{}"))
+except Exception:
+    FALLBACK_MODEL_MAP = {}
 
 # Google Gemini API (legacy, kept for fallback).
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
