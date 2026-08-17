@@ -99,8 +99,7 @@ The repo is split into a channel-neutral core and the OWUI-facing service:
 | gates/classifiers (verify? voice? work?) + honesty audit | deepseek-v4-flash |
 | edit-intent gate (a wrong verdict drops the user's doc) | deepseek-v4-pro, 'new' must win twice |
 | vision | kimi-k2p6 |
-| export polish | gpt-5.5 |
-| voice pass | claude-sonnet-4-6 |
+| export polish / voice pass | model-driven: any served model ID routed by shape (`accounts/…` → Fireworks, `gpt-*` → OpenAI, `claude-*` → Anthropic) — env-pinned (`AUTO_POLISH_MODEL`, `OPENAI_PROSE_MODEL_PREMIUM`, `VOICE_MODEL`), so the prose tiers can ride the single Fireworks bill |
 | refine (fix flagged facts) | same model that wrote the prose |
 
 ## Debugging a live turn
