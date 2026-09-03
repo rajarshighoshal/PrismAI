@@ -20,8 +20,9 @@ Case schema (JSONL):
 
 Live runs need provider keys in env (FIREWORKS_API_KEY / DEEPSEEK_API_KEY). Cases that
 need file export or deliverable memory also need a reachable tool-server
-(TOOL_SERVER_URL) — they SKIP (not fail) when it is down. Persistence is off:
-chat_id is empty and style memory is disabled, so a bake-off writes nothing.
+(TOOL_SERVER_URL) — they SKIP (not fail) when it is down. Style memory is disabled,
+but each case uses a non-empty chat ID so stored deliverable source can be scored.
+The runner has no cleanup step; use only synthetic or redacted evaluation inputs.
 """
 from __future__ import annotations
 

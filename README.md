@@ -1,9 +1,9 @@
 # PrismAI
 
-An agentic orchestrator for OpenWebUI — an OpenAI-compatible service that drives a
-model-driven tool-calling loop over open-weight models, verifies its own output
-before showing it, and polishes formal deliverables with the writer model best
-suited to each task.
+An agentic orchestrator for OpenWebUI. It drives a model-directed tool-calling
+loop over open-weight models, verifies formal deliverables before export, and can
+openly correct streamed answers when later verification finds a problem. It also
+polishes formal deliverables with the writer model best suited to each task.
 
 The name: a *prism* splits one input into the right paths. Each task is handled by
 the model strongest at it — reasoning, grounding, perception, and writing — rather
@@ -14,10 +14,11 @@ than one model doing everything.
 - **Agentic tool loop** — an open-weight model (DeepSeek / GLM / Kimi via Fireworks)
   decides which tools to call (web search, URL fetch, citation lookup, grounding
   verification, file export) and chains them until it can answer.
-- **Verification before display** — every deliverable passes an honesty audit (which
-  catches claims about the user they never actually made) and a source-grounding
-  check before it is shown. Unsupported drafts are revised or withheld, never
-  surfaced as confident fact.
+- **Verification at delivery boundaries.** The delivery path applies an honesty
+  audit and source-grounding check to formal deliverables before export. With
+  optimistic chat streaming enabled, provisional text may appear before
+  verification; any later correction is explicit and the evaluation basket can
+  retain that earlier exposure as a separate diagnostic.
 - **Model-selected prose polish** — for writing that matters (cover letters,
   statements, research prose, important email), the agent picks the writer model
   that fits the piece, with an optional final voice pass. Polished output still
@@ -29,6 +30,16 @@ than one model doing everything.
   their content.
 - **Untrusted-content handling** — text returned by tools (web pages, search results)
   is treated as data, not instructions, to resist prompt injection.
+
+## Engineering case study
+
+The real-use evaluation basket once scored only the assistant transcript. That
+missed the stored source content used to generate a document and made a simple
+post-correction score blind to unsupported text that had already streamed. The
+[release-gate case study](evals/prismai_basket/CASE_STUDY_RELEASE_GATE.md)
+explains how the runner was changed to score the exact post-correction segment
+plus stored source content while preserving earlier user-visible exposure as a
+separate, non-blocking signal.
 
 ## Components
 
